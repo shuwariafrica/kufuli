@@ -18,18 +18,15 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-package kufuli.tests
+// Placeholders: the node backend is unimplemented, so these are NOT real crypto.
+package kufuli.unsafe
 
-import scala.reflect.TypeTest
+import boilerplate.Slice
 
-import boilerplate.effect.EffIO
-import cats.effect.IO
+private[unsafe] def aesBlockEncrypt(key: Array[Byte], src: Slice, dst: Slice): Unit =
+  val _ = key
+  val _ = src.copyInto(dst)
 
-object support:
-  def expectRight[E <: Throwable, A](label: String)(e: EffIO[E, A])(using TypeTest[Throwable, E]): IO[A] =
-    e.either.flatMap {
-      case Right(a)  => IO.pure(a)
-      case Left(err) => IO.raiseError(new AssertionError(s"$label: unexpected error $err"))
-    }
-  def check(cond: Boolean, label: String): IO[Unit] =
-    if cond then IO.unit else IO.raiseError(new AssertionError(label))
+private[unsafe] def chacha20Keystream(key: Array[Byte], dst: Slice, nonce: Slice, counter: Int): Unit =
+  val _ = (key, nonce, counter)
+  val _ = Slice.of(Array.fill[Byte](dst.length)(0x42)).copyInto(dst)

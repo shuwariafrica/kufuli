@@ -18,9 +18,7 @@ concurrency:
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  JDK_RELEASE: 21
   JDK_CURRENT: 25
-  NODE_LTS: 22
   SBT_OPTS: >-
     -Xmx10G
     -Xms6G
@@ -118,9 +116,9 @@ jobs:
             runner: ubuntu-24.04-arm
             dockerImage: shuwariafrica/el10-jdk:25
             link: dynamic
-          # scala-native's musl stack-guard handling (upstream #4934, unreleased as of 0.5.12)
-          # SIGSEGVs static binaries at the first new-thread creation (backtrace in
-          # SCALA_NATIVE_ISSUES.md §3); dynamic musl passes. Best-effort until the fix ships.
+          # Dynamic musl passes. The fully-static musl lanes hit scala-native#4934 (a static-musl
+          # new-thread SIGSEGV, unreleased as of 0.5.12) and are commented out below until it ships;
+          # the `Verify static linkage` step stays and lies dormant until they return.
           - target: linux-musl-x86_64
             runner: ubuntu-24.04
             dockerImage: shuwariafrica/alpine-jdk:25
@@ -131,16 +129,16 @@ jobs:
             dockerImage: shuwariafrica/alpine-jdk:25
             link: dynamic
             continueOnError: true
-          - target: linux-musl-x86_64-static
-            runner: ubuntu-24.04
-            dockerImage: shuwariafrica/alpine-jdk:25
-            link: static
-            continueOnError: true
-          - target: linux-musl-aarch64-static
-            runner: ubuntu-24.04-arm
-            dockerImage: shuwariafrica/alpine-jdk:25
-            link: static
-            continueOnError: true
+          # - target: linux-musl-x86_64-static
+          #   runner: ubuntu-24.04
+          #   dockerImage: shuwariafrica/alpine-jdk:25
+          #   link: static
+          #   continueOnError: true
+          # - target: linux-musl-aarch64-static
+          #   runner: ubuntu-24.04-arm
+          #   dockerImage: shuwariafrica/alpine-jdk:25
+          #   link: static
+          #   continueOnError: true
     runs-on: ${{ matrix.runner }}
     continue-on-error: ${{ matrix.continueOnError == true }}
     timeout-minutes: 45
@@ -161,7 +159,39 @@ jobs:
       - name: Execute Tests
         id: tests
         shell: bash
-        run: ./project/scripts/run-sbt.sh "kufuli-native/test"
+        # Only kufuli-tests carries native test sources; linking that one binary exercises every
+        # module's native code and builds aws-lc once. The kufuli-native aggregate links a test
+        # binary per module, and five concurrent cold aws-lc builds exhaust the macOS process limit.
+        run: ./project/scripts/run-sbt.sh "kufuli-testsNative/test"
+
+      - name: Verify vendored native linkage
+        # A mis-rebind onto stock OpenSSL fails at link, so a linked binary already proves the shim
+        # resolved against aws-lc; this asserts the dialect-only symbols (and libargon2) as defence in
+        # depth. Link-time, so it runs even when the musl-static runtime SIGSEGVs (SN #4934).
+        if: always() && steps.tests.conclusion != 'skipped'
+        shell: bash
+        run: |
+          if ! command -v nm >/dev/null 2>&1; then
+            echo "::error::nm (binutils) not found for the linkage-symbol assertion"; exit 1
+          fi
+          bin=$(find target/out -type f -name 'kufuli-tests-test' 2>/dev/null | sort -V | tail -1)
+          if [ -z "$bin" ]; then
+            echo "::error::no Native test binary located for the linkage-symbol assertion"; exit 1
+          fi
+          echo "--- $bin"
+          syms=$(nm "$bin" 2>/dev/null || true)
+          missing=""
+          # aws-lc BoringSSL-dialect symbols stock OpenSSL does not export, plus libargon2's entry.
+          # Here-string, not `echo "$syms" | grep`: grep -q closes the pipe on its first match, and
+          # under `set -o pipefail` echo's resulting SIGPIPE fails the test for a symbol that IS present.
+          for s in EVP_AEAD_CTX_seal HKDF_extract EVP_marshal_public_key EVP_PKEY_CTX_kem_set_params argon2id_hash_raw; do
+            grep -qw "$s" <<<"$syms" || missing="$missing $s"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::$bin is missing vendored symbols:$missing (aws-lc mis-rebind onto stock OpenSSL, or libargon2 unprovisioned?)"
+            exit 1
+          fi
+          echo "OK: aws-lc dialect symbols and libargon2 are linked into $bin"
 
       - name: Package Artefacts
         if: matrix.link == 'dynamic'
@@ -226,7 +256,7 @@ jobs:
 
       - name: Execute Tests
         shell: bash
-        run: ./project/scripts/run-sbt.sh "kufuli-native/test"
+        run: ./project/scripts/run-sbt.sh "kufuli-testsNative/test"
 
       - name: Package Artefacts
         shell: bash
@@ -280,7 +310,7 @@ jobs:
 
       - name: Execute Tests
         shell: bash
-        run: ./project/scripts/run-sbt.sh "kufuli-native/test"
+        run: ./project/scripts/run-sbt.sh "kufuli-testsNative/test"
 
       - name: Package Artefacts
         shell: bash
@@ -438,3 +468,5 @@ jobs:
 
       - name: Submit Dependency Graph
         uses: scalacenter/sbt-dependency-submission@v3
+        with:
+          configs-ignore: it test scalafix

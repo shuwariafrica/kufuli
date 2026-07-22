@@ -60,7 +60,6 @@ import cats.effect.Resource
 
 private[kufuli] object jca:
 
-  // -- effect wrappers: every provider call is guarded so an anomaly is a sanitised defect --
   private def op[A](thunk: => A): UEffIO[A] = EffIO.liftF(guard(IO(thunk)))
   private def blockingOp[A](thunk: => A): UEffIO[A] = EffIO.liftF(guard(IO.blocking(thunk)))
   private def opE[E <: Throwable, A](thunk: => Either[E, A]): EffIO[E, A] = EffIO.lift(guard(IO(thunk)))
@@ -72,7 +71,6 @@ private[kufuli] object jca:
       case _: InvalidKeySpecException           => Left(if notOnCurve then InvalidKey.NotOnCurve else InvalidKey.Malformed)
       case _: java.security.InvalidKeyException => Left(if notOnCurve then InvalidKey.NotOnCurve else InvalidKey.Malformed)
 
-  // -- key object plumbing --
   private def kf(alg: String): KeyFactory = KeyFactory.getInstance(alg)
   private def parsePub(alg: String, spki: Array[Byte]): JPublicKey = kf(alg).generatePublic(new X509EncodedKeySpec(spki))
   private def parsePriv(alg: String, pkcs8: Array[Byte]): JPrivateKey = kf(alg).generatePrivate(new PKCS8EncodedKeySpec(pkcs8))
@@ -90,7 +88,6 @@ private[kufuli] object jca:
     m.init(new SecretKeySpec(key, name))
     m.doFinal(data)
 
-  // ============================== Random =========================================================
   private val rng = new SecureRandom()
   private[kufuli] val random: Random = new Random:
     def bytes(n: Int): UEffIO[Slice] = op { val b = new Array[Byte](n); rng.nextBytes(b); Slice.of(b) }
@@ -100,7 +97,6 @@ private[kufuli] object jca:
       val _ = Slice.of(b).copyInto(dst)
     }
 
-  // ============================== AEAD ===========================================================
   // AES-GCM and ChaCha20-Poly1305 are JCA AEAD ciphers (output is ct || tag). AES-CBC-HMAC-SHA2 is
   // the RFC 7518 composite (encrypt-then-MAC); the shared box layout hands this tier its whole
   // ciphertext (ct || tag) back on open.
@@ -171,7 +167,6 @@ private[kufuli] object jca:
   private def aeadChaCha(spec: AeadSpec[ChaCha20Poly1305]): Aead[ChaCha20Poly1305] =
     aeadAead(spec, "ChaCha20-Poly1305", "ChaCha20", gcm = false)
 
-  // ============================== record engines (Ciphering) =====================================
   final private class GcmEngine[A <: AeadAlgorithm](kb: Array[Byte], spec: AeadSpec[A], cipherName: String, keyAlg: String, gcm: Boolean)
       extends Cipher.Engine[A]:
     private val jk = new SecretKeySpec(kb, keyAlg)
@@ -203,12 +198,10 @@ private[kufuli] object jca:
       def engine(key: SecretKey[ChaCha20Poly1305]): Resource[IO, Cipher.Engine[ChaCha20Poly1305]] =
         Resource.eval(IO(new GcmEngine(key.read(_.toArray), spec, "ChaCha20-Poly1305", "ChaCha20", gcm = false)))
 
-  // ============================== MAC ============================================================
   private def macOf[H <: MacAlgorithm](name: String): Mac[H] = new Mac[H]:
     def sign(key: SecretKey[H], data: Slice): UEffIO[Signature[H]] =
       op(Signature.unsafe[H](key.read(k => hmac(name, k.toArray, data.toArray))))
 
-  // ============================== signatures =====================================================
   private def pssParams(hash: Sha2): java.security.spec.PSSParameterSpec =
     val (h, mgf, len) = hash match
       case _: Sha256.type => ("SHA-256", MGF1ParameterSpec.SHA256, 32)
@@ -286,7 +279,6 @@ private[kufuli] object jca:
       if sg.verify(sig.repr) then Right(()) else Left(SignatureRejected)
     }
 
-  // ============================== agreement ======================================================
   private def agreementOf[A <: AgreementAlgorithm](name: String, keyAlg: String): Agreement[A] = new Agreement[A]:
     def agree(priv: PrivateKey[A], pub: PublicKey[A]): UEffIO[SharedSecret] = op {
       priv.read { s =>
@@ -297,7 +289,6 @@ private[kufuli] object jca:
       }
     }
 
-  // ============================== KEM (ML-KEM) ===================================================
   // ML-KEM public keys travel raw on the wire; store the standard SPKI and convert at the edges.
   private def mlkemOid(spec: KemSpec[?]): Array[Byte] = spec match
     case _: MlKem768.type  => Array[Byte](0x60, 0x86.toByte, 0x48, 0x01, 0x65, 0x03, 0x04, 0x04, 0x02)
@@ -324,7 +315,6 @@ private[kufuli] object jca:
       }
     }
 
-  // ============================== wrap ===========================================================
   private def wrapAes[W <: WrapAlgorithm](cipherName: String): Wrap[W] = new Wrap[W]:
     def wrap(kek: SecretKey[W], target: Slice): UEffIO[Slice] = op {
       kek.read { k =>
@@ -342,7 +332,6 @@ private[kufuli] object jca:
       }
     }
 
-  // ============================== KDF (RFC 5869 HKDF, RFC 8018 PBKDF2) ============================
   private[kufuli] val kdf: Kdf = new Kdf:
     def extract(hash: Sha2, salt: Slice, ikm: Slice): UEffIO[Prk] = op {
       val name = hmacName(hash)
@@ -392,7 +381,6 @@ private[kufuli] object jca:
       Slice.of(out.take(length))
     }
 
-  // ============================== hashing ========================================================
   private def hashOf[D <: HashAlgorithm](name: String): Hash[D] = new Hash[D]:
     def digest(data: Slice): UEffIO[Digest] = op(Digest.unsafe(MessageDigest.getInstance(name).digest(data.toArray)))
   private def hashingOf[D <: HashAlgorithm](name: String): Hashing[D] = new Hashing[D]:
@@ -405,7 +393,6 @@ private[kufuli] object jca:
           case _                       => Digest.unsafe(Array.emptyByteArray)
     })
 
-  // ============================== OAEP ===========================================================
   private def oaepSpec(hash: Sha2): OAEPParameterSpec =
     val (h, mgf) = hash match
       case _: Sha256.type => ("SHA-256", MGF1ParameterSpec.SHA256)
@@ -427,7 +414,6 @@ private[kufuli] object jca:
       }
     }
 
-  // ============================== key lifecycles =================================================
   private[kufuli] val edKeys: EdKeys = new EdKeys:
     def generate: UEffIO[KeyPair[PublicKey[Ed25519], PrivateKey[Ed25519]]] = op {
       val kp = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
@@ -554,7 +540,7 @@ private[kufuli] object jca:
     }
     def raw(key: PublicKey[K]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(mlkemRaw(keyBytes(key.repr))))
 
-  // -- capability bundles: the JVM platform table wires each companion into exactly these --
+  // Capability bundles the JVM platform table wires each companion into.
   private[kufuli] trait RandomDefault:
     given Random = random
   private[kufuli] trait AeadUniversal:

@@ -18,11 +18,8 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-// kufuli.unsafe — the expert floor: raw block/keystream/header-protection primitives that trade
-// away misuse-resistance (every invariant is the caller's). The package ships only in the
-// synchronous artifacts (module-level absence in the browser). The primitive bodies below are
-// placeholders with the final Slice-speaking shape; the platform passes (K-2' aws-lc, K-3' node,
-// and JVM/JCA) replace them with real AES-ECB blocks and ChaCha20 keystreams.
+// The expert floor: raw primitives with no misuse-resistance - every invariant is the caller's.
+// Absent from the browser artifact.
 package kufuli.unsafe
 
 import boilerplate.Slice
@@ -39,7 +36,7 @@ object AesBlock:
       new AesBlock:
         def encrypt(src: Slice, dst: Slice): Unit =
           require(src.length == 16 && dst.length >= 16, "AES block is 16 bytes")
-          val _ = src.copyInto(dst)
+          aesBlockEncrypt(key, src, dst)
     )
 
 /** Raw ChaCha20 keystream (the QUIC ChaCha header-protection primitive). */
@@ -52,8 +49,7 @@ object ChaCha20:
       new ChaCha20Stream:
         def keystream(dst: Slice, nonce: Slice, counter: Int): Unit =
           require(nonce.length == 12, "ChaCha20 nonce must be 12 bytes")
-          val filler = Slice.of(Array.fill[Byte](dst.length)(0x42))
-          val _ = filler.copyInto(dst)
+          chacha20Keystream(key, dst, nonce, counter)
     )
 
 /** QUIC header protection: the 5-byte mask from a 16-byte ciphertext sample (RFC 9001 section 5.4).
@@ -81,6 +77,9 @@ object HeaderProtection:
         new HeaderProtection:
           def mask(sample: Slice, out: Slice): Unit =
             require(sample.length >= 16 && out.length >= 5, "sample 16 bytes; mask 5 bytes")
-            stream.keystream(out.take(5), sample.slice(4, 16), counter = 0)
+            // RFC 9001 section 5.4.4.
+            val counter =
+              (sample(0) & 0xff) | ((sample(1) & 0xff) << 8) | ((sample(2) & 0xff) << 16) | ((sample(3) & 0xff) << 24)
+            stream.keystream(out.take(5), sample.slice(4, 16), counter)
       )
 end HeaderProtection

@@ -18,9 +18,7 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-// Node Argon2id provider: a byte-faithful stub (deterministic, input-sensitive) until the
-// node:crypto (>= 24.7) pass (K-3') replaces the body. The PHC codec and verify decision above it
-// are real, so the login flow round-trips against this stub.
+// The node Argon2id provider is a deterministic stub, NOT real crypto - the node backend is unimplemented.
 package kufuli.password
 
 import boilerplate.Slice

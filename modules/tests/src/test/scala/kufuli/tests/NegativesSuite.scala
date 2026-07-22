@@ -24,9 +24,8 @@ import scala.compiletime.testing.typeChecks
 
 import kufuli.*
 
-// Structural misuse rejection, cross-module (the opaque tags are abstract here, so these hold on
-// every unit independent of instance presence). Each assert is a design safety guarantee; a failure
-// means the type system stopped enforcing it.
+// The opaque tags are abstract here, so these compile-time rejections hold on every unit
+// independent of instance presence.
 class NegativesSuite extends munit.FunSuite:
   def aeadKey: SecretKey[AesGcm256] = ???
   def aeadKey128: SecretKey[AesGcm128] = ???

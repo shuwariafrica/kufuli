@@ -24,9 +24,8 @@ import boilerplate.Slice
 
 import kufuli.*
 
-// Pure value-layer checks over the shared code: the wire codecs (base64url, PEM), the RFC 8446
-// nonce XOR and HkdfLabel byte layouts, the ECDSA DER codec, and parse-time validation. Backend
-// independent, so identical on every artifact including the browser.
+// Backend-independent value-layer checks over the shared code, so identical on every artifact
+// including the browser.
 class PureChecksSuite extends munit.FunSuite:
 
   test("nonce derivation (RFC 8446 s5.3): self-inverse; sequence lands big-endian in the low bytes") {

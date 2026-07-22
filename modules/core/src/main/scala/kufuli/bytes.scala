@@ -24,14 +24,14 @@ import scala.annotation.tailrec
 
 import boilerplate.Slice
 
-/** RFC 4648 section 5 base64url, UNPADDED — the JOSE and web-token alphabet. `decode` is strict:
+/** RFC 4648 section 5 base64url, UNPADDED - the JOSE and web-token alphabet. `decode` is strict:
   * padding, `+`, `/`, any non-alphabet character, or an impossible length (4k+1) is [[Malformed]].
   */
 object Base64Url:
   def encode(bytes: Array[Byte]): String = Base64.encode(bytes, Base64.urlAlphabet, pad = false)
   def decode(text: String): Either[Malformed, Array[Byte]] = Base64.decode(text, Base64.urlInverse, padded = false)
 
-/** RFC 4648 section 4 standard base64 (padded) — private plumbing (PEM bodies). */
+/** RFC 4648 section 4 standard base64 (padded) - private plumbing (PEM bodies). */
 private[kufuli] object Base64:
   private[kufuli] val urlAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
   private[kufuli] val stdAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -140,7 +140,7 @@ object PEM:
 end PEM
 
 /** Shared, bounded DER handling for key encodings. The shared layer only PEEKS the
-  * AlgorithmIdentifier of an SPKI/PKCS#8 blob to dispatch to a key family — full validation and
+  * AlgorithmIdentifier of an SPKI/PKCS#8 blob to dispatch to a key family - full validation and
   * construction is backend work on the whole blob (JCA KeySpec, WebCrypto importKey, aws-lc
   * EVP_parse_*). A wire parser over untrusted bytes: every read is bounds-checked, lengths accept
   * only definite short/1/2-byte long forms, and no recursion occurs.

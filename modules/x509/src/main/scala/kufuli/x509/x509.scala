@@ -18,12 +18,9 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-// kufuli.x509 — TLS-profile path validation over the core operation families. Scope is the
-// TLS-client/server need: parse, verify the chain's signatures to trust anchors (through the core
-// Verifier seam), check the validity window, match SAN/hostname per RFC 6125, enforce basic
-// constraints and EKU by purpose, and verify a stapled OCSP response. NOT policy trees, CRL, or
-// live OCSP. Times are explicit epoch seconds (the cross-platform floor: no java.time). Anchor
-// sourcing, staple/CRL transport, and certificate selection are consumer concerns, permanently.
+// Scope is RFC 5280 TLS-profile path validation: NOT policy trees, CRL, or live OCSP. Times are
+// explicit epoch seconds (no java.time - the cross-platform floor). Anchor sourcing, staple/CRL
+// transport, and certificate selection are consumer concerns.
 package kufuli.x509
 
 import scala.annotation.tailrec
@@ -396,8 +393,7 @@ object CertPath:
         }
 end CertPath
 
-// The path-validation engine, over the core Verifier seam (summoned by the cert's signature
-// algorithm). Full name-constraint enforcement and the broad corpus are the K-5 pass.
+// The path-validation engine, over the core Verifier seam. Name constraints are not enforced.
 private object engine:
   private def bytesEq(a: Array[Byte], b: Array[Byte]): Boolean = Slice.of(a).contentEquals(Slice.of(b))
   private def derBytes(c: Certificate): Array[Byte] = Array.from(c.der.iterator)
@@ -511,8 +507,10 @@ object OCSP:
     case Good
     case Revoked(at: Long)
     case Unknown
-  // Bounded parse of the OCSPResponse: responseStatus + the first single-response certStatus. Full
-  // signature/nonce/issuer-binding verification is the K-5 corpus.
+
+  /** Parses the OCSP response status only - the response signature, nonce, and issuer binding are
+    * NOT verified.
+    */
   def verifyStapled(response: Array[Byte], leaf: Certificate, issuer: Certificate, at: Long): EffIO[PathInvalid, OCSP.Status] =
     val _ = (leaf, issuer, at)
     val status = parseStatus(response)

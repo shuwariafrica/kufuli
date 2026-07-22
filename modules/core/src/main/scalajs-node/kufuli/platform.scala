@@ -18,11 +18,8 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-// JS-Node backend unit (node:crypto): bytes-backed keys; synchronous cipher/hash paths exist, so
-// the record machine and incremental hashing are present. ML-KEM / XChaCha / GCM-SIV are off until
-// their node:crypto surface is verified against Node >= 24 / OpenSSL 3.5 (each flip is adding the
-// instances here with their KATs). This file is the node capability table; instance bodies are the
-// stub backend until the node pass (K-3') replaces them family by family.
+// JS-Node capability table: bytes-backed keys over the stub backend. ML-KEM, XChaCha and GCM-SIV
+// are absent here - their node:crypto surface is unverified.
 package kufuli
 
 private[kufuli] type KeyRepr = Array[Byte]
@@ -35,7 +32,7 @@ private[kufuli] trait MacPlatform extends stubs.MacAll
 private[kufuli] trait SignerPlatform extends stubs.SignersAll
 private[kufuli] trait VerifierPlatform extends stubs.VerifiersAll
 private[kufuli] trait AgreementPlatform extends stubs.AgreementAll
-private[kufuli] trait KemPlatform // ML-KEM pending node surface verification: no instances
+private[kufuli] trait KemPlatform // no ML-KEM (node:crypto surface unverified)
 private[kufuli] trait WrapPlatform extends stubs.WrapKw, stubs.WrapKwp
 private[kufuli] trait KdfPlatform extends stubs.KdfDefault
 private[kufuli] trait HashPlatform extends stubs.HashAll
@@ -46,4 +43,4 @@ private[kufuli] trait EdKeysPlatform extends stubs.EdKeysBytes
 private[kufuli] trait XKeysPlatform extends stubs.XKeysBytes
 private[kufuli] trait EcKeysPlatform extends stubs.EcKeysBytes
 private[kufuli] trait RsaKeysPlatform extends stubs.RsaKeysBytes
-private[kufuli] trait KemKeysPlatform // ML-KEM pending node surface verification: no instances
+private[kufuli] trait KemKeysPlatform // no ML-KEM (node:crypto surface unverified)

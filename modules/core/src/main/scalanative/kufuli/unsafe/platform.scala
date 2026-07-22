@@ -18,18 +18,22 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-package kufuli.tests
+package kufuli.unsafe
 
-import scala.reflect.TypeTest
+import scala.scalanative.unsigned.*
 
-import boilerplate.effect.EffIO
-import cats.effect.IO
+import boilerplate.Slice
 
-object support:
-  def expectRight[E <: Throwable, A](label: String)(e: EffIO[E, A])(using TypeTest[Throwable, E]): IO[A] =
-    e.either.flatMap {
-      case Right(a)  => IO.pure(a)
-      case Left(err) => IO.raiseError(new AssertionError(s"$label: unexpected error $err"))
-    }
-  def check(cond: Boolean, label: String): IO[Unit] =
-    if cond then IO.unit else IO.raiseError(new AssertionError(label))
+import kufuli.awslcffi
+
+private[unsafe] def aesBlockEncrypt(key: Array[Byte], src: Slice, dst: Slice): Unit =
+  require(
+    awslcffi.kufuli_aes_block_encrypt(dst.unsafePtr, src.unsafePtr, Slice.of(key).unsafePtr, key.length.toCSize) == 1,
+    "aes block"
+  )
+
+private[unsafe] def chacha20Keystream(key: Array[Byte], dst: Slice, nonce: Slice, counter: Int): Unit =
+  require(
+    awslcffi.kufuli_chacha20_keystream(dst.unsafePtr, dst.length.toCSize, Slice.of(key).unsafePtr, nonce.unsafePtr, counter.toUInt) == 1,
+    "chacha20 keystream"
+  )

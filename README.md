@@ -11,7 +11,8 @@ them, nonce-misuse-resistant AEADs (XChaCha20-Poly1305, AES-256-GCM-SIV) and fir
 remove the classic footguns.
 
 > Status: under active development. The public API below is complete and verified on all four
-> platforms; the cryptographic backends are still being implemented and are not yet production-ready.
+> platforms; the JVM and Native backends are implemented, the JS (node and browser) backends are in
+> progress.
 
 ## Install
 

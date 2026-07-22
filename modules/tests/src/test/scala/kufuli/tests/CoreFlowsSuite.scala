@@ -26,9 +26,8 @@ import boilerplate.effect.*
 import kufuli.*
 import kufuli.tests.support.*
 
-// Round-trip flows over the operation families. These run on every artifact (browser included):
-// only ops present on all four backends are exercised (AES-GCM, HMAC, Ed/EC signatures, X25519
-// agreement, AES-KW, hashing, keyring rotation), and no key export is attempted.
+// Runs on every artifact, browser included, so it exercises only the ops common to all four
+// backends and never attempts a key export.
 class CoreFlowsSuite extends munit.CatsEffectSuite:
 
   test("AES-GCM-256 seal/open with authenticated header; re-heading refuses") {

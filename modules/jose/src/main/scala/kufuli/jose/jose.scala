@@ -34,7 +34,7 @@ import kufuli.*
 
 sealed abstract class JoseError(message: String) extends Exception(message) with NoStackTrace derives CanEqual
 
-/** A JSON value carried in a JWT's custom claims (nested objects included — DPoP's `cnf`). */
+/** A JSON value carried in a JWT's custom claims (nested objects included - DPoP's `cnf`). */
 enum JoseValue derives CanEqual:
   case Str(value: String)
   case Num(value: Double)
@@ -215,7 +215,7 @@ object JWT:
 
   extension (jwt: JWT) def compact: String = jwt
 
-  /** Routing data of an UNVERIFIED token: issuer, `kid`, and the alg name ONLY — the multi-tenant
+  /** Routing data of an UNVERIFIED token: issuer, `kid`, and the alg name ONLY - the multi-tenant
     * OIDC step that selects the key set BEFORE verification. Deliberately excludes the subject and
     * every other claim, so nothing from `peek` can be mistaken for a verification result.
     */
@@ -343,7 +343,7 @@ object JWT:
   end checkClaims
 
   /** Verify against a JWKS at explicit time `now`: the token's `kid` (or the sole key) selects the
-    * JWK, whose key arm must match the header algorithm — a mismatch is [[UnknownKey]],
+    * JWK, whose key arm must match the header algorithm - a mismatch is [[UnknownKey]],
     * indistinguishable from an absent key. Symmetric algs never verify via a public-key set.
     */
   def verify(token: String, keys: JWKS, policy: Policy, now: Long)(using
@@ -524,13 +524,12 @@ object JWKS:
   given CanEqual[JWKS, JWKS] = CanEqual.derived
   def of(keys: JWK*): JWKS = JWKS(keys.toList)
 
-/** RFC 7638 thumbprint: the digest of the canonical JWK members. SHA-256 is the RFC's choice and
-  * the no-argument default; the explicit-spec overload serves `x5t`-class digests (the ONE place
-  * Sha1 is admissible — it is excluded from every signing/KDF position by construction).
-  */
 private def canonJson(fields: List[(String, String)]): Slice =
   Slice.of(fields.map((k, v) => s"\"$k\":$v").mkString("{", ",", "}").getBytes("UTF-8"))
 extension (pub: PublicKey[Ed25519])
+  /** RFC 7638 JWK thumbprint (SHA-256 default). The explicit-spec overload admits Sha1 for
+    * x5t-class digests - the only position Sha1 is allowed.
+    */
   @targetName("thumbprintEd")
   def thumbprint(using EdKeys, Hash[Sha256]): EffIO[KeyNotExportable, Digest] = pub.thumbprint(Sha256)
   @targetName("thumbprintEdSpec")
@@ -553,11 +552,11 @@ extension (pub: PublicKey[Rsa])
   def thumbprint[D <: HashAlgorithm](spec: HashSpec[D])(using k: RsaKeys, h: Hash[D]): EffIO[KeyNotExportable, Digest] =
     pub.components.flatMap(c => spec.digest(canonJson(JWK.canonicalRsa(c))))
 
-/** COSE_Key (RFC 9052/9053) import — the passkey-server key seam: WebAuthn credential public keys
+/** COSE_Key (RFC 9052/9053) import - the passkey-server key seam: WebAuthn credential public keys
   * arrive as COSE, not JWK. Parse yields the same import arms as SPKI/JWK; verification then uses
-  * the ordinary ops. The WebAuthn CEREMONY (attestation formats, authenticator data, challenge
-  * binding) is mlinzi's, permanently — this is the key-import boundary. The supported subset is
-  * OKP/Ed25519 and EC2/P-256, the WebAuthn credential-key algorithms.
+  * the ordinary ops. The WebAuthn ceremony (attestation formats, authenticator data, challenge
+  * binding) is out of scope - this is the key-import boundary. The supported subset is OKP/Ed25519
+  * and EC2/P-256, the WebAuthn credential-key algorithms.
   */
 object COSEKey:
   // Bounded CBOR reader over the COSE_Key map subset: an immutable cursor over the bytes, every
@@ -645,8 +644,7 @@ object COSEKey:
         else EffIO.fail(InvalidKey.Unsupported)
 end COSEKey
 
-// ---- JWE — design shapes RETAINED, implementation DEFERRED (no consumer in any v1 profile;
-// trigger: the first one). `zip` stays off by default; Alg/Enc nest in the noun. ----
+/** Not implemented: the shapes compile but the operations return placeholder values. */
 opaque type JWE = String
 object JWE:
   enum Alg derives CanEqual:
@@ -660,8 +658,6 @@ object JWE:
   case object DecryptionFailed extends DecryptionFailed
   sealed abstract class UntrustedAlgorithm private[jose] () extends Rejected("alg/enc not in the allowlist")
   case object UntrustedAlgorithm extends UntrustedAlgorithm
-  // JWE ships no v1 implementation (DEFERRED); the shapes stay design-verified with placeholder
-  // bodies. The parameter discards go when the real bodies land.
   def seal[C <: EcCurve](pt: Slice, recipient: PublicKey[C], alg: Alg, enc: Enc): UEffIO[JWE] =
     val _ = (pt, recipient, alg, enc)
     EffIO.succeed("eyJ.design.jwe")

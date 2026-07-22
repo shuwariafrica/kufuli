@@ -18,27 +18,51 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-// Native Argon2id provider: a byte-faithful stub (deterministic, input-sensitive) until the
-// libargon2 pass (K-2') replaces the body. The PHC codec and verify decision above it are real,
-// so the login flow round-trips against this stub.
 package kufuli.password
+
+import scala.scalanative.unsafe.*
+import scala.scalanative.unsigned.*
 
 import boilerplate.Slice
 import boilerplate.effect.EffIO
 import boilerplate.effect.UEffIO
+import cats.effect.IO
+
+import kufuli.guard
+
+@extern
+private[password] object argon2ffi:
+  def argon2id_hash_raw(
+    tCost: CUnsignedInt,
+    mCost: CUnsignedInt,
+    parallelism: CUnsignedInt,
+    pwd: Ptr[Byte],
+    pwdLen: CSize,
+    salt: Ptr[Byte],
+    saltLen: CSize,
+    hash: Ptr[Byte],
+    hashLen: CSize): CInt = extern
+end argon2ffi
 
 private[password] trait Argon2Platform:
   given Argon2 = new Argon2:
     def hash(password: Slice, salt: Slice, params: Argon2Params): UEffIO[Array[Byte]] =
-      EffIO.suspend(stubArgon2(password, salt, params))
-
-private def stubArgon2(password: Slice, salt: Slice, params: Argon2Params): Array[Byte] =
-  val marker = Array[Byte](params.iterations.toByte, params.parallelism.toByte, (params.memoryKib / 1024).toByte)
-  val h = Seq(password.toArray, salt.toArray, marker).flatten
-    .foldLeft(0xcbf29ce484222325L)((acc, b) => (acc ^ (b & 0xff)) * 0x100000001b3L)
-  Array.tabulate(32) { i =>
-    val z0 = h + i + 0x9e3779b97f4a7c15L
-    val z1 = (z0 ^ (z0 >>> 30)) * 0xbf58476d1ce4e5b9L
-    val z2 = (z1 ^ (z1 >>> 27)) * 0x94d049bb133111ebL
-    ((z2 ^ (z2 >>> 31)) & 0xff).toByte
-  }
+      EffIO.liftF(guard(IO.blocking {
+        val out = new Array[Byte](32)
+        val rc = argon2ffi.argon2id_hash_raw(
+          params.iterations.toUInt,
+          params.memoryKib.toUInt,
+          params.parallelism.toUInt,
+          password.unsafePtr,
+          password.length.toCSize,
+          salt.unsafePtr,
+          salt.length.toCSize,
+          Slice.of(out).unsafePtr,
+          32.toCSize
+        )
+        // Inputs are pre-validated, so a non-zero return is an anomaly; guard sanitises the raise so
+        // the password never surfaces.
+        if rc != 0 then throw new IllegalStateException("argon2id primitive failed unexpectedly") // scalafix:ok DisableSyntax.throw
+        out
+      }))
+end Argon2Platform

@@ -1,3 +1,5 @@
+import WycheproofPlugin.autoImport.*
+
 scalaVersion := scala3
 organization := "africa.shuwari"
 startYear := Some(2026)
@@ -50,7 +52,10 @@ val kufuli =
       Seq(WebCryptoAxis),
       (p: Project) => p.settings(jsSettings ++ jsBrowserSettings("kufuli") ++ coreStubDir)
     )
-    .snxPlatform(Seq(scala3), NativePlatformPlugin.schemeSettings ++ coreStubDir ++ coreDirectDir)
+    .snxPlatform(
+      Seq(scala3),
+      NativePlatformPlugin.schemeSettings ++ coreDirectDir ++ NativePlatformPlugin.exportCrypto ++ NativePlatformPlugin.provisionAwsLc
+    )
 
 val `kufuli-jose` =
   projectMatrix
@@ -65,7 +70,7 @@ val `kufuli-jose` =
     .snxPlatform(
       Seq(scala3),
       Seq.empty[VirtualAxis],
-      (p: Project) => p.settings(NativePlatformPlugin.schemeSettings).dependsOn(kufuli.native(scala3))
+      (p: Project) => p.settings(NativePlatformPlugin.schemeSettings ++ NativePlatformPlugin.provisionAwsLc).dependsOn(kufuli.native(scala3))
     )
 
 val `kufuli-password` =
@@ -86,7 +91,11 @@ val `kufuli-password` =
     .snxPlatform(
       Seq(scala3),
       Seq.empty[VirtualAxis],
-      (p: Project) => p.settings(NativePlatformPlugin.schemeSettings).dependsOn(kufuli.native(scala3))
+      (p: Project) =>
+        p.settings(
+          NativePlatformPlugin.schemeSettings ++ NativePlatformPlugin.provisionAwsLc ++
+            NativePlatformPlugin.exportArgon2 ++ NativePlatformPlugin.provisionArgon2
+        ).dependsOn(kufuli.native(scala3))
     )
 
 val `kufuli-x509` =
@@ -102,7 +111,7 @@ val `kufuli-x509` =
     .snxPlatform(
       Seq(scala3),
       Seq.empty[VirtualAxis],
-      (p: Project) => p.settings(NativePlatformPlugin.schemeSettings).dependsOn(kufuli.native(scala3))
+      (p: Project) => p.settings(NativePlatformPlugin.schemeSettings ++ NativePlatformPlugin.provisionAwsLc).dependsOn(kufuli.native(scala3))
     )
 
 // Capability-gated test source sets: `scala` runs on all four platforms; `extended` (jvm/native/
@@ -119,13 +128,15 @@ val `kufuli-tests` =
     .settings(
       libraryDependencies += munit % Test,
       libraryDependencies += `munit-cats-effect` % Test,
+      libraryDependencies += jsoniter % Test,
       testFrameworks += new TestFramework("munit.Framework")
     )
     .jvmPlatform(
       Seq(scala3),
       Seq.empty[VirtualAxis],
       (p: Project) =>
-        p.settings(testDir("extended") ++ testDir("pq") ++ testDir("jvm-kat"))
+        p.enablePlugins(WycheproofPlugin)
+          .settings(wycheproofSettings ++ testDir("extended") ++ testDir("pq") ++ testDir("kat"))
           .dependsOn(kufuli.jvm(scala3), `kufuli-jose`.jvm(scala3), `kufuli-x509`.jvm(scala3), `kufuli-password`.jvm(scala3))
     )
     .jsPlatform(
@@ -146,7 +157,11 @@ val `kufuli-tests` =
       Seq(scala3),
       Seq.empty[VirtualAxis],
       (p: Project) =>
-        p.settings(NativePlatformPlugin.testLinkSettings ++ testDir("extended") ++ testDir("pq"))
+        p.enablePlugins(WycheproofPlugin)
+          .settings(
+            wycheproofSettings ++ NativePlatformPlugin.testLinkSettings ++ NativePlatformPlugin.provisionAwsLc ++
+              NativePlatformPlugin.provisionArgon2 ++ testDir("extended") ++ testDir("pq") ++ testDir("kat")
+          )
           .dependsOn(
             kufuli.native(scala3),
             `kufuli-jose`.native(scala3),
@@ -217,6 +232,17 @@ def jsBrowserSettings(base: String): List[Setting[?]] = List(
 
 def testDir(name: String): List[Setting[?]] = List(
   Test / unmanagedSourceDirectories += (Test / sourceDirectory).value / name
+)
+
+// p1363 gives raw r||s signatures (kufuli's Signature form); ML-KEM decaps is covered in RealBackendSuite.
+def wycheproofSettings: List[Setting[?]] = List(
+  wycheproofTargetPackage := "kufuli.tests.wycheproof",
+  wycheproofVectorFiles := Seq(
+    "aes_gcm_test.json",
+    "chacha20_poly1305_test.json",
+    "ecdsa_secp256r1_sha256_p1363_test.json",
+    "ed25519_test.json"
+  )
 )
 
 def baseCompilerOptions = List(
@@ -301,3 +327,15 @@ def publishSettings: List[Setting[?]] = List(
 
 addCommandAlias("format", "scalafixAll; scalafmtAll; scalafmtSbt; headerCreateAll")
 addCommandAlias("check", "scalafixAll --check; scalafmtCheckAll; scalafmtSbtCheck; headerCheckAll")
+
+lazy val showConfigurations = taskKey[Unit]("Shows all configurations")
+
+lazy val inAnyProjectAndConfiguration = ScopeFilter(inAnyProject, inAnyConfiguration)
+
+showConfigurations := Def.uncached {
+  val configs = configuration.all(inAnyProjectAndConfiguration).value.toSet
+
+  configs.filter(_.isPublic).foreach { c =>
+    println(s"${c.name} - ${c.description}")
+  }
+} // No .value here!

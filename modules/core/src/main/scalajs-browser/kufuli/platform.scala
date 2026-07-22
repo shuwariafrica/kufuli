@@ -23,11 +23,10 @@
 // async-only (no record Cipher, no incremental Hashing) and lacks ChaCha / AES-KWP / ML-KEM.
 // Public keys may be live CryptoKey handles; generated keys are non-extractable, so the
 // handle-backed lifecycle makes `extractable=false` real (typed export failure) while imported
-// keys export what the caller supplied. This file is the browser capability table; every absence
-// below is a compile fact. Instance bodies are the stub backend until the WebCrypto pass (K-3').
+// keys export what the caller supplied. Instance bodies are the stub backend.
 package kufuli
 
-/** Stands in for `org.scalajs.dom.CryptoKey` until the WebCrypto pass wires the real handle. */
+// Placeholder for a browser WebCrypto CryptoKey handle.
 final class CryptoKeyHandle
 
 private[kufuli] type KeyRepr = Array[Byte] | CryptoKeyHandle

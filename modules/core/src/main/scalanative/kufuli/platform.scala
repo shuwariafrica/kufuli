@@ -20,29 +20,28 @@
  */
 // Native backend unit (aws-lc): bytes-backed keys; the primary platform carries the fullest set.
 // XChaCha20-Poly1305 and AES-256-GCM-SIV are aws-lc EVP_AEADs; ML-KEM is FIPS 203 in aws-lc. This
-// file is the Native capability table; instance bodies are the stub backend until the aws-lc pass
-// (K-2') replaces them family by family.
+// file is the Native capability table; instance bodies are the real aws-lc backend (`awslc.scala`).
 package kufuli
 
 private[kufuli] type KeyRepr = Array[Byte]
 private[kufuli] def keyRepr(bytes: Array[Byte]): KeyRepr = bytes
 private[kufuli] def keyBytes(r: KeyRepr): Array[Byte] = r
 
-private[kufuli] trait RandomPlatform extends stubs.RandomDefault
-private[kufuli] trait AeadPlatform extends stubs.AeadUniversal, stubs.AeadChaCha, stubs.AeadMisuseResistant
-private[kufuli] trait MacPlatform extends stubs.MacAll
-private[kufuli] trait SignerPlatform extends stubs.SignersAll
-private[kufuli] trait VerifierPlatform extends stubs.VerifiersAll
-private[kufuli] trait AgreementPlatform extends stubs.AgreementAll
-private[kufuli] trait KemPlatform extends stubs.KemAll
-private[kufuli] trait WrapPlatform extends stubs.WrapKw, stubs.WrapKwp
-private[kufuli] trait KdfPlatform extends stubs.KdfDefault
-private[kufuli] trait HashPlatform extends stubs.HashAll
-private[kufuli] trait HashingPlatform extends stubs.HashingSync
-private[kufuli] trait CipheringPlatform extends stubs.CipheringUniversal, stubs.CipheringChaCha, stubs.CipheringMisuseResistant
-private[kufuli] trait OaepPlatform extends stubs.OaepDefault
-private[kufuli] trait EdKeysPlatform extends stubs.EdKeysBytes
-private[kufuli] trait XKeysPlatform extends stubs.XKeysBytes
-private[kufuli] trait EcKeysPlatform extends stubs.EcKeysBytes
-private[kufuli] trait RsaKeysPlatform extends stubs.RsaKeysBytes
-private[kufuli] trait KemKeysPlatform extends stubs.KemKeysAll
+private[kufuli] trait RandomPlatform extends awslc.RandomDefault
+private[kufuli] trait AeadPlatform extends awslc.AeadUniversal, awslc.AeadChaCha, awslc.AeadMisuseResistant
+private[kufuli] trait MacPlatform extends awslc.MacAll
+private[kufuli] trait SignerPlatform extends awslc.SignersAll
+private[kufuli] trait VerifierPlatform extends awslc.VerifiersAll
+private[kufuli] trait AgreementPlatform extends awslc.AgreementAll
+private[kufuli] trait KemPlatform extends awslc.KemAll
+private[kufuli] trait WrapPlatform extends awslc.WrapKw, awslc.WrapKwp
+private[kufuli] trait KdfPlatform extends awslc.KdfDefault
+private[kufuli] trait HashPlatform extends awslc.HashAll
+private[kufuli] trait HashingPlatform extends awslc.HashingSync
+private[kufuli] trait CipheringPlatform extends awslc.CipheringUniversal, awslc.CipheringChaCha, awslc.CipheringMisuseResistant
+private[kufuli] trait OaepPlatform extends awslc.OaepDefault
+private[kufuli] trait EdKeysPlatform extends awslc.EdKeysBytes
+private[kufuli] trait XKeysPlatform extends awslc.XKeysBytes
+private[kufuli] trait EcKeysPlatform extends awslc.EcKeysBytes
+private[kufuli] trait RsaKeysPlatform extends awslc.RsaKeysBytes
+private[kufuli] trait KemKeysPlatform extends awslc.KemKeysAll

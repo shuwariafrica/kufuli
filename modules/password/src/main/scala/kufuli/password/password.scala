@@ -41,7 +41,7 @@ object Argon2Params:
   val default: Argon2Params = Argon2Params(65536, 3, 4) // RFC 9106 second recommendation
   val sensitive: Argon2Params = Argon2Params(2097152, 1, 4) // RFC 9106 first recommendation
 
-  /** Params may come from configuration — data, so Either, not require. */
+  /** Params may come from configuration - data, so Either, not require. */
   def of(memoryKib: Int, iterations: Int, parallelism: Int): Either[InvalidParams, Argon2Params] =
     if iterations >= 1 && parallelism >= 1 && parallelism <= 255 && memoryKib >= 8 * parallelism
     then Right(Argon2Params(memoryKib, iterations, parallelism))
@@ -52,7 +52,7 @@ opaque type PasswordHash = String
 object PasswordHash:
   private[password] def unsafe(s: String): PasswordHash = s
 
-  /** Parse a stored PHC string — the public constructor that makes the login flow writable.
+  /** Parse a stored PHC string - the public constructor that makes the login flow writable.
     * Corruption surfaces HERE, never inside `verify`.
     */
   def of(stored: String): Either[MalformedHash, PasswordHash] =
@@ -131,7 +131,7 @@ extension (pw: Array[Byte])
     }
 end extension
 
-// The 99% case arrives as a String; the encoding is pinned (UTF-8, no normalisation — RFC 8265
+// The 99% case arrives as a String; the encoding is pinned (UTF-8, no normalisation - RFC 8265
 // OpaqueString is the caller's concern and is documented, not silently applied).
 extension (pw: String)
   @targetName("hashString")

@@ -42,7 +42,8 @@ modules/
   tests/      Cross-platform test suites (see below).
 
 project/
-  NativePlatformPlugin.scala   Host detection and native linking wiring.
+  KufuliNative.scala           The aws-lc and libargon2 vendored-build recipes.
+  NativePlatformPlugin.scala   Native test-interface eviction, aws-lc/argon2 provisioning, static test linking.
   WebCryptoAxis.scala          The virtual axis distinguishing the browser JS row from Node.
   WycheproofPlugin.scala       Embeds Wycheproof JSON vectors as generated Scala source.
 

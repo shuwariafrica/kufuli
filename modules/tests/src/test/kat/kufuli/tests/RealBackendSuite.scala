@@ -27,46 +27,16 @@ import boilerplate.effect.*
 
 import kufuli.*
 import kufuli.jose.*
-import kufuli.password.*
 import kufuli.tests.support.*
 import kufuli.x509 as x5
 
-// JVM behavioural KATs against the real JCA / BouncyCastle backends: RFC test vectors for the
-// primitives, a cross-implementation Argon2id vector (OpenSSL 3.5), JOSE flows, and a real EC
-// certificate chain. Exact-value vectors need the real backend, so this suite is JVM-only; the
-// cross-platform round-trips live in CoreFlowsSuite.
-class KatSuite extends munit.CatsEffectSuite:
+class RealBackendSuite extends munit.CatsEffectSuite:
 
   private def hex(b: Array[Byte]): String = b.map(x => f"$x%02x").mkString
-  private def hb(s: String): Array[Byte] = s.grouped(2).map(Integer.parseInt(_, 16).toByte).toArray
 
-  test("HKDF-SHA256 (RFC 5869) test case 1: PRK and OKM") {
-    for
-      prk <- HKDF.extract(Sha256, Slice.of(hb("000102030405060708090a0b0c")), Slice.of(Array.fill(22)(0x0b.toByte))).absolve
-      prkHex <- prk.use(s => hex(s.toArray)).absolve
-      _ <- check(prkHex == "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5", "PRK")
-      okm <- HKDF.expand(Sha256, prk, Slice.of(hb("f0f1f2f3f4f5f6f7f8f9")), 42).absolve
-      _ <- check(hex(okm.toArray) == "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865", "OKM")
-    yield ()
-  }
+  private val now = 1_700_000_000L
 
-  test("PBKDF2-HMAC-SHA256 (RFC 7914 s11): password/salt/4096") {
-    for
-      dk <- PBKDF2.derive(Sha256, Slice.of("password".getBytes), Slice.of("salt".getBytes), 4096, 32).absolve
-      _ <- check(hex(dk.toArray) == "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a", "PBKDF2 dk")
-    yield ()
-  }
-
-  test("Argon2id via BouncyCastle == OpenSSL 3.5 reference (pass=password, salt=16x02, m=512, t=3, p=1)") {
-    val a = summon[Argon2]
-    val params = Argon2Params.of(512, 3, 1).toOption.get
-    for
-      out <- a.hash(Slice.of("password".getBytes), Slice.of(Array.fill(16)(0x02.toByte)), params).absolve
-      _ <- check(hex(out) == "cc9ddc55720b3a3446d2641d4c4e40418be3e2f401943b12f1ed3f243ed52170", "argon2id vector")
-    yield ()
-  }
-
-  test("AES-GCM-256, ChaCha20-Poly1305, and AES-256-CBC-HS512 seal/open + tamper") {
+  test("AEAD: AES-GCM-256, ChaCha20-Poly1305, AES-256-CBC-HS512 seal/open + tamper") {
     for
       g <- AesGcm256.generate.absolve
       gbox <- g.seal(Slice.of("gcm".getBytes), Slice.of("aad".getBytes)).absolve
@@ -85,7 +55,7 @@ class KatSuite extends munit.CatsEffectSuite:
     yield ()
   }
 
-  test("ECDSA P-256: verify-corpus round-trip + DER<->raw; RSA-PSS/PKCS1/OAEP") {
+  test("signatures: ECDSA P-256 verify + DER<->raw; RSA-PSS/PKCS1/OAEP") {
     for
       p <- P256.generate.absolve
       sig <- p.privateKey.sign(Slice.of("m".getBytes)).absolve
@@ -107,7 +77,7 @@ class KatSuite extends munit.CatsEffectSuite:
     yield ()
   }
 
-  test("ML-KEM-768 (JCA JEP 496) encapsulate/decapsulate; sizes") {
+  test("ML-KEM-768 (FIPS 203): encapsulate/decapsulate agree; wire sizes") {
     for
       kp <- MlKem768.generate.absolve
       enc <- kp.publicKey.encapsulate.absolve
@@ -120,11 +90,11 @@ class KatSuite extends munit.CatsEffectSuite:
     yield ()
   }
 
-  test("AES-KW / AES-KWP wrap and unwrap (SP 800-38F)") {
+  test("key wrap: AES-KW / AES-KWP wrap and unwrap (SP 800-38F)") {
     for
       kw <- AesKw256.generate.absolve
       kwp <- AesKwp256.generate.absolve
-      target <- AesGcm256.generate.absolve // 32 bytes: a multiple of 8, so plain KW accepts it
+      target <- AesGcm256.generate.absolve
       w1 <- kw.wrap(target).either
       u1 <- kw.unwrap(w1.toOption.get, AesGcm256).either
       _ <- check(u1.isRight, "KW unwrap")
@@ -134,14 +104,18 @@ class KatSuite extends munit.CatsEffectSuite:
     yield ()
   }
 
-  private val now = 1_700_000_000L
-
-  test("JOSE: ES256/EdDSA/HS256 sign+verify; expiry/audience/allowlist rejections; JWK; peek") {
+  test("jose: ES256/EdDSA/HS256 sign+verify; expiry/audience/allowlist rejections; JWK; peek") {
     for
       p <- P256.generate.absolve
       jwk <- expectRight("jwk")(JWK.of("k1", p.publicKey))
       jwks = JWKS.of(jwk)
-      claims = JWT.Claims.empty.subject("alice").issuer("iss").audience("api").expiresIn(1.hour).id("jti").claim("htm", JoseValue.Str("POST"))
+      claims = JWT.Claims.empty
+                 .subject("alice")
+                 .issuer("iss")
+                 .audience("api")
+                 .expiresIn(1.hour)
+                 .id("jti")
+                 .claim("htm", JoseValue.Str("POST"))
       tok <- JWT.sign(claims, ES256, "k1", now)(p.privateKey).absolve
       policy = JWT.Policy("api", Set(ES256, EdDSA)).issuer("iss").skew(60)
       v <- JWT.verify(tok.compact, jwks, policy, now).either
@@ -153,8 +127,10 @@ class KatSuite extends munit.CatsEffectSuite:
       _ <- check(aud.isLeft, "audience mismatch rejected")
       alg <- JWT.verify(tok.compact, jwks, JWT.Policy("api", Set(EdDSA)), now).either
       _ <- check(alg.isLeft, "algorithm not allowlisted rejected")
-      _ <-
-        check(JWT.peek(tok.compact).exists(u => u.issuer.contains("iss") && u.kid.contains("k1") && u.algorithm == "ES256"), "peek routing")
+      _ <- check(
+             JWT.peek(tok.compact).exists(u => u.issuer.contains("iss") && u.kid.contains("k1") && u.algorithm == "ES256"),
+             "peek routing"
+           )
       ed <- Ed25519.generate.absolve
       edJwk <- expectRight("ed jwk")(JWK.of("e1", ed.publicKey))
       edTok <- JWT.sign(JWT.Claims.empty.audience("api").expiresIn(1.hour), EdDSA, "e1", now)(ed.privateKey).absolve
@@ -169,7 +145,7 @@ class KatSuite extends munit.CatsEffectSuite:
 
   // Nested custom claims must survive sign -> verify verbatim: DPoP binds `cnf.jkt` and OIDC
   // back-channel logout carries a nested `events` object.
-  test("JOSE: nested + array custom claims round-trip through sign/verify (jsoniter)") {
+  test("jose: nested + array custom claims round-trip through sign/verify (jsoniter)") {
     val cnf = JoseValue.Obj(Map("jkt" -> JoseValue.Str("NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs")))
     val events = JoseValue.Obj(Map("http://schemas.openid.net/event/backchannel-logout" -> JoseValue.Obj(Map.empty)))
     val claims = JWT.Claims.empty
@@ -196,30 +172,6 @@ class KatSuite extends munit.CatsEffectSuite:
       _ <- check(got.flatMap(_.get("z")).contains(JoseValue.Null), "null claim")
     yield ()
     end for
-  }
-
-  test("password: Argon2id login flow (PHC parse, verify, policy rehash)") {
-    for
-      stored <- "correct horse".hash(Argon2Params.interactive).absolve
-      parsed = PasswordHash.of(stored.value)
-      _ <- check(parsed.isRight, "PHC parses")
-      good <- "correct horse".verify(parsed.toOption.get, Argon2Params.interactive).absolve
-      _ <- check(good match
-                   case PasswordCheck.Verified(None) => true;
-                   case _                            => false
-                 ,
-                 "correct password, no rehash"
-           )
-      bad <- "wrong".verify(parsed.toOption.get, Argon2Params.interactive).absolve
-      _ <- check(bad == PasswordCheck.Rejected, "wrong password rejected")
-      rehash <- "correct horse".verify(parsed.toOption.get, Argon2Params.default).absolve
-      _ <- check(rehash match
-                   case PasswordCheck.Verified(Some(_)) => true;
-                   case _                               => false
-                 ,
-                 "stronger policy -> rehash"
-           )
-    yield ()
   }
 
   private val caPem =
@@ -272,4 +224,4 @@ Pv/5JMnVs9fgK3Whg6g=
     yield ()
     end for
   }
-end KatSuite
+end RealBackendSuite

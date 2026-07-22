@@ -18,18 +18,21 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-package kufuli.tests
+package kufuli.unsafe
 
-import scala.reflect.TypeTest
+import javax.crypto.Cipher
+import javax.crypto.spec.ChaCha20ParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
-import boilerplate.effect.EffIO
-import cats.effect.IO
+import boilerplate.Slice
 
-object support:
-  def expectRight[E <: Throwable, A](label: String)(e: EffIO[E, A])(using TypeTest[Throwable, E]): IO[A] =
-    e.either.flatMap {
-      case Right(a)  => IO.pure(a)
-      case Left(err) => IO.raiseError(new AssertionError(s"$label: unexpected error $err"))
-    }
-  def check(cond: Boolean, label: String): IO[Unit] =
-    if cond then IO.unit else IO.raiseError(new AssertionError(label))
+private[unsafe] def aesBlockEncrypt(key: Array[Byte], src: Slice, dst: Slice): Unit =
+  val cipher = Cipher.getInstance("AES/ECB/NoPadding")
+  cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"))
+  val _ = Slice.of(cipher.doFinal(src.take(16).toArray)).copyInto(dst)
+
+private[unsafe] def chacha20Keystream(key: Array[Byte], dst: Slice, nonce: Slice, counter: Int): Unit =
+  // A fresh instance each call: JCA rejects re-initialising its ChaCha20 engine with a repeated key+nonce.
+  val cipher = Cipher.getInstance("ChaCha20")
+  cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "ChaCha20"), new ChaCha20ParameterSpec(nonce.toArray, counter))
+  val _ = Slice.of(cipher.doFinal(new Array[Byte](dst.length))).copyInto(dst)

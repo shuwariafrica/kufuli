@@ -18,11 +18,8 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-// Byte-faithful stub backend for the platforms whose real provider is not yet wired (Native via
-// aws-lc, Node via node:crypto, Browser via WebCrypto). The instances are deterministic and
-// sensitive to every input byte, so every round-trip is a real byte equality and every tamper
-// check a real rejection; the platform passes replace these bodies one family at a time. The op
-// seam (the family typeclasses) is identical to a real backend.
+// Deterministic, input-sensitive stub backend for node and browser: round-trips are real byte
+// equalities and tamper checks real rejections, over the same op seam as a real backend.
 package kufuli
 
 import java.util.concurrent.atomic.AtomicLong
@@ -42,7 +39,7 @@ private[kufuli] object stubs:
     val b = (a ^ (a >>> 27)) * 0x94d049bb133111ebL
     b ^ (b >>> 31)
 
-  /** Deterministic `len` bytes sensitive to every input byte. */
+  // Deterministic `len` bytes sensitive to every input byte.
   private[kufuli] def mix(len: Int)(parts: Slice*): Array[Byte] =
     val seed = parts.foldLeft(0xcbf29ce484222325L) { (h, s) =>
       (0 until s.length).foldLeft(h)((h2, i) => (h2 ^ (s(i) & 0xff)) * 0x100000001b3L)
@@ -61,13 +58,13 @@ private[kufuli] object stubs:
   private val seq = new AtomicLong(0)
   private def longBytes(l: Long): Array[Byte] = Array.tabulate(8)(i => (l >>> (56 - 8 * i)).toByte)
 
-  /** Deterministic-but-distinct bytes per call: probe generation (no ambient randomness). */
+  // Deterministic-but-distinct bytes per call (no ambient randomness).
   private def fresh(tag: String)(len: Int): Array[Byte] =
     mix(len)(Slice.of(tag.getBytes), Slice.of(longBytes(seq.incrementAndGet())))
 
-  // Ciphertext = plaintext ++ tag where the tag mixes key, nonce, aad, and payload — so
+  // Ciphertext = plaintext ++ tag where the tag mixes key, nonce, aad, and payload - so
   // round-trips are real byte equalities and ANY input difference (tampered ciphertext, wrong
-  // key/nonce/aad — including the authenticated box header) fails authentication.
+  // key/nonce/aad - including the authenticated box header) fails authentication.
   private def sealBytes[A <: AeadAlgorithm](spec: AeadSpec[A])(key: SecretKey[A], nonce: Array[Byte], aad: Slice, pt: Slice): Array[Byte] =
     val tag = key.read(k => mix(spec.tagLength)(k, Slice.of(nonce), aad, pt))
     val out = new Array[Byte](pt.length + spec.tagLength)
@@ -211,7 +208,7 @@ private[kufuli] object stubs:
       val _ = Slice.of(fresh("fill")(dst.length)).copyInto(dst)
     }
 
-  // -- key lifecycle stubs: pub == priv bytes; imports validate byte-faithfully; exports emit
+  // Key lifecycle stubs: pub == priv bytes; imports validate byte-faithfully; exports emit
   // REAL encodings (RFC 8410 templates for Ed/X, Der-built SPKI/PKCS#8 for EC/RSA) so the shared
   // peek round-trips executed blobs. Validation conventions: a 0xFF-led point is "off-curve"; an
   // all-zero X25519 point is a weak point. `handleBacked = true` models WebCrypto: GENERATED keys
@@ -398,7 +395,7 @@ private[kufuli] object stubs:
     }
     def raw(key: PublicKey[K]) = EffIO.succeed(IArray.from(keyBytes(key.repr)))
 
-  // -- composable instance bundles (per-unit platform traits extend exactly their backend's set) --
+  // Composable instance bundles: each per-unit platform trait extends exactly its backend's set.
 
   private[kufuli] trait AeadUniversal:
     given Aead[AesGcm128] = aead(AesGcm128)
