@@ -18,25 +18,56 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-// The node Argon2id provider is a deterministic stub, NOT real crypto - the node backend is unimplemented.
+// Node Argon2id provider over `crypto.argon2` (Node >= 24.7); memory-hard, so it runs on node's
+// async threadpool.
 package kufuli.password
+
+import scala.scalajs.js
+import scala.scalajs.js.annotation.JSImport
+import scala.scalajs.js.typedarray.Int8Array
+import scala.scalajs.js.typedarray.Uint8Array
+import scala.scalajs.js.typedarray.byteArray2Int8Array
+import scala.scalajs.js.typedarray.int8Array2ByteArray
 
 import boilerplate.Slice
 import boilerplate.effect.EffIO
 import boilerplate.effect.UEffIO
+import boilerplate.nullable.option
+import cats.effect.IO
+
+import kufuli.guard
+
+private[password] object nodeArgon2:
+  @js.native
+  @JSImport("node:crypto", JSImport.Default)
+  private[password] object crypto extends js.Object:
+    def argon2(algorithm: String, options: js.Any, callback: js.Function2[js.Error | Null, Uint8Array, Unit]): Unit = js.native
+
+  private[password] def u8(a: Array[Byte]): Uint8Array =
+    val i8 = byteArray2Int8Array(a)
+    new Uint8Array(i8.buffer, i8.byteOffset, i8.length)
+  private[password] def ba(u: Uint8Array): Array[Byte] =
+    int8Array2ByteArray(new Int8Array(u.buffer, u.byteOffset, u.length))
+end nodeArgon2
 
 private[password] trait Argon2Platform:
   given Argon2 = new Argon2:
     def hash(password: Slice, salt: Slice, params: Argon2Params): UEffIO[Array[Byte]] =
-      EffIO.suspend(stubArgon2(password, salt, params))
-
-private def stubArgon2(password: Slice, salt: Slice, params: Argon2Params): Array[Byte] =
-  val marker = Array[Byte](params.iterations.toByte, params.parallelism.toByte, (params.memoryKib / 1024).toByte)
-  val h = Seq(password.toArray, salt.toArray, marker).flatten
-    .foldLeft(0xcbf29ce484222325L)((acc, b) => (acc ^ (b & 0xff)) * 0x100000001b3L)
-  Array.tabulate(32) { i =>
-    val z0 = h + i + 0x9e3779b97f4a7c15L
-    val z1 = (z0 ^ (z0 >>> 30)) * 0xbf58476d1ce4e5b9L
-    val z2 = (z1 ^ (z1 >>> 27)) * 0x94d049bb133111ebL
-    ((z2 ^ (z2 >>> 31)) & 0xff).toByte
-  }
+      EffIO.liftF(guard(IO.async_[Array[Byte]] { cb =>
+        nodeArgon2.crypto.argon2(
+          "argon2id",
+          js.Dynamic.literal(
+            message = nodeArgon2.u8(password.toArray),
+            nonce = nodeArgon2.u8(salt.toArray),
+            parallelism = params.parallelism,
+            tagLength = 32,
+            memory = params.memoryKib,
+            passes = params.iterations
+          ),
+          (err, out) =>
+            err.option match
+              case None    => cb(Right(nodeArgon2.ba(out)))
+              case Some(e) => cb(Left(js.JavaScriptException(e)))
+        )
+      }))
+end Argon2Platform

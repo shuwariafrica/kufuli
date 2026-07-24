@@ -18,15 +18,29 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-// Placeholders: the node backend is unimplemented, so these are NOT real crypto.
 package kufuli.unsafe
 
 import boilerplate.Slice
 
-private[unsafe] def aesBlockEncrypt(key: Array[Byte], src: Slice, dst: Slice): Unit =
-  val _ = key
-  val _ = src.copyInto(dst)
+import kufuli.nodecrypto.ba
+import kufuli.nodecrypto.crypto
+import kufuli.nodecrypto.u8
 
+// A raw AES block via one-block CBC with a zero IV - node's ECB needs a null IV, which lint forbids.
+private[unsafe] def aesBlockEncrypt(key: Array[Byte], src: Slice, dst: Slice): Unit =
+  val cipher = crypto.createCipheriv(s"aes-${key.length * 8}-cbc", u8(key), u8(new Array[Byte](16)))
+  val _ = cipher.setAutoPadding(false)
+  val out = ba(cipher.update(u8(src.take(16).toArray))) ++ ba(cipher.`final`())
+  val _ = Slice.of(out).copyInto(dst)
+
+// node's `chacha20` IV is a 32-bit little-endian counter followed by the 96-bit nonce (RFC 8439).
 private[unsafe] def chacha20Keystream(key: Array[Byte], dst: Slice, nonce: Slice, counter: Int): Unit =
-  val _ = (key, nonce, counter)
-  val _ = Slice.of(Array.fill[Byte](dst.length)(0x42)).copyInto(dst)
+  val iv = new Array[Byte](16)
+  iv(0) = counter.toByte
+  iv(1) = (counter >>> 8).toByte
+  iv(2) = (counter >>> 16).toByte
+  iv(3) = (counter >>> 24).toByte
+  val _ = nonce.copyInto(Slice.of(iv).drop(4))
+  val cipher = crypto.createCipheriv("chacha20", u8(key), u8(iv))
+  val out = ba(cipher.update(u8(new Array[Byte](dst.length)))) ++ ba(cipher.`final`())
+  val _ = Slice.of(out).copyInto(dst)

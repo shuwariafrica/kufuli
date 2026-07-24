@@ -27,16 +27,15 @@ initialize := {
 formattingSettings
 
 def scala3 = "3.8.4"
-val boilerplate: ModuleID = "africa.shuwari" %% "boilerplate" % "0.10.0"
-val boilerplateEffect: ModuleID = "africa.shuwari" %% "boilerplate-effect" % "0.10.0"
+val boilerplate: ModuleID = "africa.shuwari" %% "boilerplate" % "0.11.0"
+val boilerplateEffect: ModuleID = "africa.shuwari" %% "boilerplate-effect" % "0.11.0"
 val jsoniter: ModuleID = "com.github.plokhotnyuk.jsoniter-scala" %% "jsoniter-scala-core" % "2.39.1"
-val bouncycastle: ModuleID = "org.bouncycastle" % "bcprov-jdk18on" % "1.84"
-val munit: ModuleID = "org.scalameta" %% "munit" % "1.3.0"
+val bouncycastle: ModuleID = "org.bouncycastle" % "bcprov-jdk18on" % "1.85"
+val munit: ModuleID = "org.scalameta" %% "munit" % "1.3.4"
 val `munit-cats-effect`: ModuleID = "org.typelevel" %% "munit-cats-effect" % "2.2.0"
 
-// The JVM row wires the real JCA backend (`scalajvm`); the other three rows share the byte-faithful
-// stub backend (`scala-stub`). `kufuli.unsafe` ships only in the synchronous artifacts, so
-// `scala-direct` joins every row except the browser (module-level absence there).
+def stubPublishGuard: List[Setting[?]] = List(publish / skip := true)
+
 val kufuli =
   projectMatrix
     .in(file("modules/core"))
@@ -46,11 +45,11 @@ val kufuli =
     .settings(description := "Cross-platform cryptographic primitives, recipes, and rotation for Scala 3 on cats-effect")
     .settings(libraryDependencies ++= Seq(boilerplate, boilerplateEffect))
     .jvmPlatform(Seq(scala3), coreDirectDir)
-    .jsPlatform(Seq(scala3), jsSettings ++ jsNodeSourceDirs ++ coreStubDir ++ coreDirectDir)
+    .jsPlatform(Seq(scala3), jsSettings ++ jsNodeSourceDirs ++ coreDirectDir)
     .jsPlatform(
       Seq(scala3),
       Seq(WebCryptoAxis),
-      (p: Project) => p.settings(jsSettings ++ jsBrowserSettings("kufuli") ++ coreStubDir)
+      (p: Project) => p.settings(jsSettings ++ jsBrowserSettings("kufuli") ++ coreStubDir ++ stubPublishGuard)
     )
     .snxPlatform(
       Seq(scala3),
@@ -143,7 +142,8 @@ val `kufuli-tests` =
       Seq(scala3),
       Seq.empty[VirtualAxis],
       (p: Project) =>
-        p.settings(jsSettings ++ testDir("extended") ++ testDir("node"))
+        p.enablePlugins(WycheproofPlugin)
+          .settings(jsSettings ++ wycheproofSettings ++ testDir("extended") ++ testDir("pq") ++ testDir("kat") ++ testDir("node"))
           .dependsOn(kufuli.js(scala3), `kufuli-jose`.js(scala3), `kufuli-x509`.js(scala3), `kufuli-password`.js(scala3))
     )
     .jsPlatform(

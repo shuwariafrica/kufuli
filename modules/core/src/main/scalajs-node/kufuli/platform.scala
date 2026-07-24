@@ -18,29 +18,28 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-// JS-Node capability table: bytes-backed keys over the stub backend. ML-KEM, XChaCha and GCM-SIV
-// are absent here - their node:crypto surface is unverified.
+// XChaCha and GCM-SIV are deliberately absent from this table: node:crypto does not expose them.
 package kufuli
 
 private[kufuli] type KeyRepr = Array[Byte]
 private[kufuli] def keyRepr(bytes: Array[Byte]): KeyRepr = bytes
 private[kufuli] def keyBytes(r: KeyRepr): Array[Byte] = r
 
-private[kufuli] trait RandomPlatform extends stubs.RandomDefault
-private[kufuli] trait AeadPlatform extends stubs.AeadUniversal, stubs.AeadChaCha
-private[kufuli] trait MacPlatform extends stubs.MacAll
-private[kufuli] trait SignerPlatform extends stubs.SignersAll
-private[kufuli] trait VerifierPlatform extends stubs.VerifiersAll
-private[kufuli] trait AgreementPlatform extends stubs.AgreementAll
-private[kufuli] trait KemPlatform // no ML-KEM (node:crypto surface unverified)
-private[kufuli] trait WrapPlatform extends stubs.WrapKw, stubs.WrapKwp
-private[kufuli] trait KdfPlatform extends stubs.KdfDefault
-private[kufuli] trait HashPlatform extends stubs.HashAll
-private[kufuli] trait HashingPlatform extends stubs.HashingSync
-private[kufuli] trait CipheringPlatform extends stubs.CipheringUniversal, stubs.CipheringChaCha
-private[kufuli] trait OaepPlatform extends stubs.OaepDefault
-private[kufuli] trait EdKeysPlatform extends stubs.EdKeysBytes
-private[kufuli] trait XKeysPlatform extends stubs.XKeysBytes
-private[kufuli] trait EcKeysPlatform extends stubs.EcKeysBytes
-private[kufuli] trait RsaKeysPlatform extends stubs.RsaKeysBytes
-private[kufuli] trait KemKeysPlatform // no ML-KEM (node:crypto surface unverified)
+private[kufuli] trait RandomPlatform extends node.RandomDefault
+private[kufuli] trait AeadPlatform extends node.AeadUniversal, node.AeadChaCha
+private[kufuli] trait MacPlatform extends node.MacAll
+private[kufuli] trait SignerPlatform extends node.SignersAll
+private[kufuli] trait VerifierPlatform extends node.VerifiersAll
+private[kufuli] trait AgreementPlatform extends node.AgreementAll
+private[kufuli] trait KemPlatform extends node.KemAll
+private[kufuli] trait WrapPlatform extends node.WrapKw, node.WrapKwp
+private[kufuli] trait KdfPlatform extends node.KdfDefault
+private[kufuli] trait HashPlatform extends node.HashAll
+private[kufuli] trait HashingPlatform extends node.HashingSync
+private[kufuli] trait CipheringPlatform extends node.CipheringUniversal, node.CipheringChaCha
+private[kufuli] trait OaepPlatform extends node.OaepDefault
+private[kufuli] trait EdKeysPlatform extends node.EdKeysBytes
+private[kufuli] trait XKeysPlatform extends node.XKeysBytes
+private[kufuli] trait EcKeysPlatform extends node.EcKeysBytes
+private[kufuli] trait RsaKeysPlatform extends node.RsaKeysBytes
+private[kufuli] trait KemKeysPlatform extends node.KemKeysAll

@@ -453,7 +453,7 @@ object Digest:
     if Set(20, 28, 32, 48, 64).contains(bytes.length) then Right(bytes.clone) else Left(Malformed)
   extension (d: Digest)
     def bytes: IArray[Byte] = IArray.from(d: Array[Byte])
-    def hex: String = (d: Array[Byte]).map(b => f"$b%02x").mkString
+    def hex: String = (d: Array[Byte]).map(b => f"${b & 0xff}%02x").mkString
 
     /** Constant-time over equal lengths (a length mismatch is not itself secret). */
     def constantTimeEquals(o: Digest): Boolean = Slice.of(d).constantTimeEquals(Slice.of(o))

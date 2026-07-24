@@ -32,7 +32,7 @@ import kufuli.x509 as x5
 
 class RealBackendSuite extends munit.CatsEffectSuite:
 
-  private def hex(b: Array[Byte]): String = b.map(x => f"$x%02x").mkString
+  private def hex(b: Array[Byte]): String = b.map(x => f"${x & 0xff}%02x").mkString
 
   private val now = 1_700_000_000L
 
