@@ -46,7 +46,7 @@ object PathInvalid:
   case object BadSignature extends BadSignature
   sealed abstract class NameMismatch private[x509] () extends PathInvalid("hostname does not match SAN")
   case object NameMismatch extends NameMismatch
-  sealed abstract class ConstraintViolated private[x509] () extends PathInvalid("basic constraints / KU / EKU violated")
+  sealed abstract class ConstraintViolated private[x509] () extends PathInvalid("basic constraints / path length / EKU violated")
   case object ConstraintViolated extends ConstraintViolated
 end PathInvalid
 
@@ -60,6 +60,7 @@ final private[x509] case class Parsed(
   notAfter: Long,
   sanDns: List[String],
   isCa: Boolean,
+  maxPathLen: Option[Int],
   ekus: List[String],
   sigScheme: Option[SigScheme],
   signature: Array[Byte]
@@ -113,7 +114,7 @@ private[x509] object X509:
     val days = era.toLong * 146097 + doe - 719468
     days * 86400 + hh * 3600 + mm * 60 + ss
 
-  private def parseTime(s: String, generalized: Boolean): Option[Long] =
+  private[x509] def parseTime(s: String, generalized: Boolean): Option[Long] =
     val digits = s.takeWhile(_ != 'Z')
     val base = if generalized then digits else digits // both YY.. or YYYY..
     def at(i: Int, n: Int) = base.substring(i, i + n).toIntOption
@@ -169,6 +170,7 @@ private[x509] object X509:
         notAfter = fields.notAfter,
         sanDns = ext.sanDns,
         isCa = ext.isCa,
+        maxPathLen = ext.maxPathLen,
         ekus = ext.ekus,
         sigScheme = sigScheme(s.slice(sigOid.contentOff, sigOid.next)),
         signature = s.slice(sigBits.contentOff + 1, sigBits.next).toArray
@@ -242,11 +244,12 @@ private[x509] object X509:
 
   // Named for the same reason as TbsFields: sanDns and ekus are both List[String], so a positional
   // slip would type-check and silently swap the hostname evidence with the EKU evidence.
-  private type Extensions = (sanDns: List[String], isCa: Boolean, ekus: List[String])
+  private type Extensions = (sanDns: List[String], isCa: Boolean, maxPathLen: Option[Int], ekus: List[String])
 
   private def extensions(s: Slice, exts: Option[Der.Tlv]): Extensions =
+    val empty: Extensions = (sanDns = Nil, isCa = false, maxPathLen = None, ekus = Nil)
     exts match
-      case None      => (sanDns = Nil, isCa = false, ekus = Nil)
+      case None      => empty
       case Some(seq) =>
         @tailrec def go(pos: Int, acc: Extensions): Extensions =
           if pos >= seq.next then acc
@@ -266,13 +269,19 @@ private[x509] object X509:
                       case Left(_)      => acc
                       case Right(octet) =>
                         val value = s.slice(octet.contentOff, octet.next)
-                        if eq(oidSlice, oidSan) then (sanDns = parseSan(value), isCa = acc.isCa, ekus = acc.ekus)
+                        if eq(oidSlice, oidSan) then
+                          (sanDns = parseSan(value), isCa = acc.isCa, maxPathLen = acc.maxPathLen, ekus = acc.ekus)
                         else if eq(oidSlice, oidBasicConstraints) then
-                          (sanDns = acc.sanDns, isCa = parseBasicConstraints(value), ekus = acc.ekus)
-                        else if eq(oidSlice, oidEku) then (sanDns = acc.sanDns, isCa = acc.isCa, ekus = parseEku(value))
+                          val (ca, plen) = parseBasicConstraints(value)
+                          (sanDns = acc.sanDns, isCa = ca, maxPathLen = plen, ekus = acc.ekus)
+                        else if eq(oidSlice, oidEku) then
+                          (sanDns = acc.sanDns, isCa = acc.isCa, maxPathLen = acc.maxPathLen, ekus = parseEku(value))
                         else acc
+                    end match
                 go(ext.next, updated)
-        go(seq.contentOff, (sanDns = Nil, isCa = false, ekus = Nil))
+        go(seq.contentOff, empty)
+    end match
+  end extensions
 
   private def parseSan(value: Slice): List[String] =
     // GeneralNames ::= SEQUENCE OF GeneralName; dNSName is context [2] IA5String.
@@ -290,13 +299,28 @@ private[x509] object X509:
                 go(t.next, name)
         go(seq.contentOff, Nil)
 
-  private def parseBasicConstraints(value: Slice): Boolean =
+  // BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }.
+  private def parseBasicConstraints(value: Slice): (Boolean, Option[Int]) =
     Der.read(value, 0, 0x30) match
-      case Left(_)    => false
+      case Left(_)    => (false, None)
       case Right(seq) =>
-        if seq.contentOff < seq.next && (value(seq.contentOff) & 0xff) == 0x01 then
-          Der.read(value, seq.contentOff, 0x01).toOption.exists(b => (value(b.contentOff) & 0xff) != 0x00)
-        else false
+        val (ca, afterCa) =
+          if seq.contentOff < seq.next && (value(seq.contentOff) & 0xff) == 0x01 then
+            Der.read(value, seq.contentOff, 0x01) match
+              case Right(b) => ((value(b.contentOff) & 0xff) != 0x00, b.next)
+              case Left(_)  => (false, seq.contentOff)
+          else (false, seq.contentOff)
+        val pathLen =
+          if ca && afterCa < seq.next && (value(afterCa) & 0xff) == 0x02 then
+            Der.read(value, afterCa, 0x02).toOption.flatMap(t => smallInteger(value, t))
+          else None
+        (ca, pathLen)
+
+  // A small non-negative DER INTEGER (pathLenConstraint is 0..a handful); reject negative/oversize.
+  private def smallInteger(s: Slice, t: Der.Tlv): Option[Int] =
+    val raw = s.slice(t.contentOff, t.next).toArray
+    if raw.isEmpty || raw.length > 4 || (raw(0) & 0x80) != 0 then None
+    else Some(raw.foldLeft(0)((a, b) => (a << 8) | (b & 0xff)))
 
   private def parseEku(value: Slice): List[String] =
     Der.read(value, 0, 0x30) match
@@ -427,13 +451,20 @@ private object engine:
     if expired then EffIO.fail(PathInvalid.Expired)
     else
       val leaf = path.head
-      // CA basic-constraints on every issuer (all but the leaf)
+      // CA basic-constraints (cA TRUE) and pathLenConstraint on every issuer (all but the leaf).
       val issuers = path.tail
       if issuers.exists(c => !c.parsed.isCa) then EffIO.fail(PathInvalid.ConstraintViolated)
+      else if pathLenExceeded(issuers) then EffIO.fail(PathInvalid.ConstraintViolated)
       else if !ekuAllows(leaf.parsed.ekus, purpose) then EffIO.fail(PathInvalid.ConstraintViolated)
       else if !nameOk(leaf, hostname, purpose) then EffIO.fail(PathInvalid.NameMismatch)
       else verifyChain(path)
   end validate
+
+  // A CA's pathLenConstraint bounds the number of intermediate CA certs that may follow it toward
+  // the leaf. Self-issued intermediates are counted here - a conservative over-count relative to
+  // RFC 5280 section 6.1.4, which excludes them (rare in the TLS profile).
+  private def pathLenExceeded(issuers: List[Certificate]): Boolean =
+    issuers.zipWithIndex.exists((c, i) => c.parsed.maxPathLen.exists(_ < i))
 
   private def ekuAllows(ekus: List[String], purpose: PathPurpose): Boolean =
     if ekus.isEmpty then true // no EKU restriction
@@ -508,17 +539,21 @@ object OCSP:
     case Revoked(at: Long)
     case Unknown
 
-  /** Parses the OCSP response status only - the response signature, nonce, and issuer binding are
-    * NOT verified.
+  /** Parses the first single-response certStatus (Good/Revoked/Unknown) from a stapled OCSP
+    * response. The response signature, producer identity, nonce, and certID-to-leaf binding are NOT
+    * verified, so a `Good` result is advisory and MUST NOT be trusted on its own until that binding
+    * lands - a forged staple can claim any status. It exists so a genuine `Revoked` staple is
+    * honoured.
     */
   def verifyStapled(response: Array[Byte], leaf: Certificate, issuer: Certificate, at: Long): EffIO[PathInvalid, OCSP.Status] =
     val _ = (leaf, issuer, at)
-    val status = parseStatus(response)
-    status match
+    parseStatus(response) match
       case Some(s) => EffIO.succeed(s)
       case None    => EffIO.fail(PathInvalid.MalformedChain)
 
-  // OCSPResponse ::= SEQUENCE { responseStatus ENUMERATED (0x0a), responseBytes [0] ... }.
+  // OCSPResponse ::= SEQUENCE { responseStatus ENUMERATED, responseBytes [0] EXPLICIT ResponseBytes }.
+  // A responseStatus other than successful(0) carries no body; anything else is descended to the
+  // first SingleResponse's certStatus. Structural deviation is Malformed (None).
   private def parseStatus(response: Array[Byte]): Option[OCSP.Status] =
     if response.isEmpty then None
     else
@@ -526,9 +561,54 @@ object OCSP:
       (for
         outer <- Der.read(s, 0, 0x30)
         respStatus <- Der.read(s, outer.contentOff, 0x0a)
-      yield
-        val code = if respStatus.contentLen > 0 then s(respStatus.contentOff) & 0xff else 6
-        // 0 = successful; a successful response with a Good single status is the common staple.
-        if code == 0 then OCSP.Status.Good else OCSP.Status.Unknown
-      ).toOption
+        code = if respStatus.contentLen > 0 then s(respStatus.contentOff) & 0xff else -1
+        status <- if code != 0 then Right(OCSP.Status.Unknown) else certStatus(s, respStatus.next)
+      yield status).toOption
+
+  // OCSPResponse -> responseBytes [0] -> ResponseBytes { OID, OCTET STRING } -> BasicOCSPResponse ->
+  // tbsResponseData (ResponseData) -> responses -> first SingleResponse -> certStatus. The OCTET
+  // STRING content is DER in place, so the inner reads continue over the same slice.
+  private def certStatus(s: Slice, afterStatus: Int): Either[InvalidKey, OCSP.Status] =
+    for
+      rb <- Der.read(s, afterStatus, 0xa0) // responseBytes [0] EXPLICIT
+      rbSeq <- Der.read(s, rb.contentOff, 0x30) // ResponseBytes
+      oid <- Der.read(s, rbSeq.contentOff, 0x06) // responseType OID
+      octet <- Der.read(s, oid.next, 0x04) // response OCTET STRING (DER BasicOCSPResponse)
+      basic <- Der.read(s, octet.contentOff, 0x30) // BasicOCSPResponse
+      tbs <- Der.read(s, basic.contentOff, 0x30) // tbsResponseData (ResponseData)
+      responses <- toResponses(s, tbs)
+      single <- Der.read(s, responses.contentOff, 0x30) // first SingleResponse
+      certId <- Der.read(s, single.contentOff, 0x30) // certID
+      status <- statusTag(s, certId.next, single.next)
+    yield status
+
+  // ResponseData ::= SEQUENCE { version [0] OPTIONAL, responderID CHOICE([1] byName/[2] byKey),
+  // producedAt GeneralizedTime, responses SEQUENCE OF SingleResponse, ... }.
+  private def toResponses(s: Slice, tbs: Der.Tlv): Either[InvalidKey, Der.Tlv] =
+    def tagAt(off: Int): Int = if off < tbs.next then s(off) & 0xff else -1
+    val afterVersion =
+      if tagAt(tbs.contentOff) == 0xa0 then Der.read(s, tbs.contentOff, 0xa0).map(_.next)
+      else Right(tbs.contentOff)
+    afterVersion.flatMap { av =>
+      val rid = tagAt(av)
+      (if rid == 0xa1 || rid == 0xa2 then Der.read(s, av, rid).map(_.next) else Left(InvalidKey.Malformed))
+        .flatMap(ar => Der.read(s, ar, 0x18).flatMap(pa => Der.read(s, pa.next, 0x30)))
+    }
+
+  // CertStatus ::= CHOICE { good [0] IMPLICIT NULL, revoked [1] IMPLICIT RevokedInfo,
+  // unknown [2] IMPLICIT UnknownInfo }. RevokedInfo's first field is revocationTime GeneralizedTime.
+  private def statusTag(s: Slice, off: Int, end: Int): Either[InvalidKey, OCSP.Status] =
+    if off >= end then Left(InvalidKey.Malformed)
+    else
+      (s(off) & 0xff) match
+        case 0x80 => Right(OCSP.Status.Good)
+        case 0x82 => Right(OCSP.Status.Unknown)
+        case 0xa1 =>
+          Der.read(s, off, 0xa1).flatMap { info =>
+            Der.read(s, info.contentOff, 0x18).flatMap { t =>
+              val str = new String(s.slice(t.contentOff, t.next).toArray, "US-ASCII")
+              X509.parseTime(str, generalized = true).map(e => OCSP.Status.Revoked(e)).toRight(InvalidKey.Malformed)
+            }
+          }
+        case _ => Left(InvalidKey.Malformed)
 end OCSP
