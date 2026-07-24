@@ -152,8 +152,16 @@ object JWT:
   case object AudienceMismatch extends AudienceMismatch
   sealed abstract class UntrustedAlgorithm private[jose] () extends Rejected("algorithm not in the allowlist")
   case object UntrustedAlgorithm extends UntrustedAlgorithm
-  sealed abstract class UnknownKey private[jose] () extends Rejected("no usable key for this token")
+  sealed abstract class UnknownKey private[jose] () extends Rejected("no key for the token's kid")
   case object UnknownKey extends UnknownKey
+  sealed abstract class KeyAlgorithmMismatch private[jose] () extends Rejected("key does not match the token's algorithm")
+  case object KeyAlgorithmMismatch extends KeyAlgorithmMismatch
+  sealed abstract class MissingExpiry private[jose] () extends Rejected("token carries no expiry")
+  case object MissingExpiry extends MissingExpiry
+  sealed abstract class TypeMismatch private[jose] () extends Rejected("header typ mismatch")
+  case object TypeMismatch extends TypeMismatch
+  sealed abstract class MissingHeaderKey private[jose] () extends Rejected("no jwk in the protected header")
+  case object MissingHeaderKey extends MissingHeaderKey
 
   /** Claim set under construction: start from [[Claims.empty]] and refine with the withers
     * (`Claims.empty.subject("u").audience("api").expiresIn(1.hour).id(jti)`). `custom` claims
@@ -188,27 +196,35 @@ object JWT:
     end extension
   end Claims
 
-  /** Audience and the algorithm allowlist are the checks whose omission is an exploit:
-    * constructor-required. Optional checks refine by wither ([[Policy.issuer]], [[Policy.skew]]);
-    * [[Policy.unaudienced]] is the deliberate, NAMED opt-out for audience-free internal tokens.
+  /** Audience and the algorithm allowlist are constructor-required - omitting either is an exploit.
+    * A token carrying no `exp` is rejected by default (a never-expiring bearer token is a standing
+    * credential). Optional checks refine by wither ([[Policy.issuer]], [[Policy.skew]]);
+    * [[Policy.unaudienced]] and [[Policy.unexpiring]] are the named opt-outs, for audience-free
+    * internal tokens and for tokens whose freshness the caller enforces another way (e.g. a DPoP
+    * `iat` window).
     */
   final case class Policy(
     audience: Option[String],
     algorithms: Set[JWSAlg],
     requiredIssuer: Option[String],
-    clockSkew: Long
+    clockSkew: Long,
+    requireExpiry: Boolean
   )
   object Policy:
     def apply(audience: String, algorithms: Set[JWSAlg]): Policy =
       require(algorithms.nonEmpty, "the algorithm allowlist cannot be empty")
-      Policy(Some(audience), algorithms, None, 0L)
+      Policy(Some(audience), algorithms, None, 0L, true)
     def unaudienced(algorithms: Set[JWSAlg]): Policy =
       require(algorithms.nonEmpty, "the algorithm allowlist cannot be empty")
-      Policy(None, algorithms, None, 0L)
+      Policy(None, algorithms, None, 0L, true)
     given CanEqual[Policy, Policy] = CanEqual.derived
     extension (p: Policy)
       def issuer(value: String): Policy = p.copy(requiredIssuer = Some(value))
       def skew(seconds: Long): Policy = p.copy(clockSkew = seconds)
+
+      /** The named opt-out from expiry-by-default: accept a token that carries no `exp`. */
+      def unexpiring: Policy = p.copy(requireExpiry = false)
+  end Policy
 
   final case class Verified(
     subject: Option[String],
@@ -285,9 +301,44 @@ object JWT:
     val (input, bytes) = signingInput(headerJson(alg, None), payloadJson(claims, at))
     m.sign(key, bytes).map(assemble(input, _))
 
+  /** Sign with the verification key embedded in the protected header (`jwk`, canonical members
+    * only) plus an explicit header `typ` - the self-keyed profile (DPoP, RFC 9449). `headerKey` is
+    * the public half, type-bound to the signing family, so a cross-family embed does not compile;
+    * embedding a different key of the same family is self-defeating, since the token then fails
+    * verification under its own header key.
+    */
+  def sign(claims: Claims, alg: JWSAlg.Asymmetric[Ed25519], typ: String, headerKey: PublicKey[Ed25519], at: Long)(
+    key: PrivateKey[Ed25519]
+  )(using s: Signer[Ed25519], ks: EdKeys): EffIO[KeyNotExportable, JWT] =
+    headerKey.raw.flatMap(x => signWithHeader(claims, alg, typ, Json.obj(JWK.canonicalEd(x)), at)(key))
+
+  @targetName("signHeaderEc")
+  def sign[C <: EcCurve](claims: Claims, alg: JWSAlg.Asymmetric[C], typ: String, headerKey: PublicKey[C], at: Long)(
+    key: PrivateKey[C]
+  )(using s: Signer[C], ks: EcKeys[C], spec: EcSpec[C]): EffIO[KeyNotExportable, JWT] =
+    val crv = spec.fieldLength match
+      case 32 => "P-256"
+      case 48 => "P-384"
+      case _  => "P-521"
+    headerKey.sec1.flatMap(s1 => signWithHeader(claims, alg, typ, Json.obj(JWK.canonicalEc(crv, s1, spec.fieldLength)), at)(key))
+
+  @targetName("signHeaderRsa")
+  def sign(claims: Claims, alg: JWSAlg.Asymmetric[Rsa], typ: String, headerKey: PublicKey[Rsa], at: Long)(
+    key: PrivateKey[Rsa]
+  )(using s: Signer[Rsa], ks: RsaKeys): EffIO[KeyNotExportable, JWT] =
+    headerKey.components.flatMap(c => signWithHeader(claims, alg, typ, Json.obj(JWK.canonicalRsa(c)), at)(key))
+
+  private def signWithHeader[K <: SignatureAlgorithm](claims: Claims, alg: JWSAlg.Asymmetric[K], typ: String, jwkJson: String, at: Long)(
+    key: PrivateKey[K]
+  )(using s: Signer[K]): UEffIO[JWT] =
+    val header = Json.obj(List("alg" -> Json.str(alg.name), "jwk" -> jwkJson, "typ" -> Json.str(typ)))
+    val (input, bytes) = signingInput(header, payloadJson(claims, at))
+    s.sign(key, bytes, alg.scheme).map(assemble(input, _))
+
   final private case class Parsed(
     algName: String,
     kid: Option[String],
+    header: Map[String, JoseValue],
     payload: Map[String, JoseValue],
     input: Slice,
     signature: Array[Byte]
@@ -309,7 +360,7 @@ object JWT:
           val kid = header.get("kid") match
             case Some(JoseValue.Str(k)) => Some(k)
             case _                      => None
-          Parsed(algName, kid, payload, Slice.of(s"$h.$p".getBytes("US-ASCII")), sb)
+          Parsed(algName, kid, header, payload, Slice.of(s"$h.$p".getBytes("US-ASCII")), sb)
       case _ => Left(Malformed)
 
   private def claimString(p: Map[String, JoseValue], name: String): Option[String] =
@@ -331,7 +382,8 @@ object JWT:
     val auds = claimAudiences(p)
     val exp = claimLong(p, "exp")
     val nbf = claimLong(p, "nbf")
-    if exp.exists(_ < now - policy.clockSkew) then Left(Expired)
+    if policy.requireExpiry && exp.isEmpty then Left(MissingExpiry)
+    else if exp.exists(_ < now - policy.clockSkew) then Left(Expired)
     else if nbf.exists(_ > now + policy.clockSkew) then Left(NotYetValid)
     else if policy.requiredIssuer.exists(i => !claimString(p, "iss").contains(i)) then Left(IssuerMismatch)
     else if policy.audience.exists(a => !auds.contains(a)) then Left(AudienceMismatch)
@@ -352,8 +404,9 @@ object JWT:
   end checkClaims
 
   /** Verify against a JWKS at explicit time `now`: the token's `kid` (or the sole key) selects the
-    * JWK, whose key arm must match the header algorithm - a mismatch is [[UnknownKey]],
-    * indistinguishable from an absent key. Symmetric algs never verify via a public-key set.
+    * JWK - no key for the kid is [[UnknownKey]] (the JWKS refresh-on-miss lever); a key whose arm
+    * does not match the header algorithm is [[KeyAlgorithmMismatch]] (never worth a refetch).
+    * Symmetric algs never verify via a public-key set - also [[KeyAlgorithmMismatch]].
     */
   def verify(token: String, keys: JWKS, policy: Policy, now: Long)(using
     ed: Verifier[Ed25519],
@@ -372,7 +425,7 @@ object JWT:
           jwk match
             case None    => EffIO.fail(UnknownKey)
             case Some(j) => verifyArm(parsed, alg, j.key).flatMap(_ => EffIO.from(checkClaims(parsed, policy, now)))
-        case Some(_) => EffIO.fail(UnknownKey)
+        case Some(_) => EffIO.fail(KeyAlgorithmMismatch)
     }
 
   private def verifyArm(parsed: Parsed, alg: JWSAlg.Asymmetric[?], key: ImportedPublicKey)(using
@@ -393,11 +446,50 @@ object JWT:
         Signature.fromRaw(P521)(parsed.signature).map(s => p521.verify(k, parsed.input, s, ES512.scheme)).left.map(_ => Malformed)
       case (a @ (PS256 | RS256), ImportedPublicKey.OfRsa(k)) =>
         Signature.fromRaw(Rsa)(parsed.signature).map(s => rsa.verify(k, parsed.input, s, a.scheme)).left.map(_ => Malformed)
-      case _ => Left(UnknownKey)
+      case _ => Left(KeyAlgorithmMismatch)
     outcome match
       case Left(r)  => EffIO.fail(r)
       case Right(v) => v.mapError(_ => BadSignature: Rejected)
   end verifyArm
+
+  /** Verify a token under the key carried in its own protected header (`jwk`), enforcing the
+    * required header `typ` - the self-keyed profile (DPoP, RFC 9449). Success proves possession of
+    * the embedded key's private half and nothing more, so the key is returned for the caller to
+    * bind to an external trust statement (for DPoP, the RFC 7638 thumbprint against the access
+    * token's `cnf.jkt`) - a [[Verified]] on its own is not an identity. An unusable embedded key is
+    * [[Malformed]] (attacker-supplied token material whose import detail feeds no verifier
+    * decision); a symmetric algorithm never verifies here ([[KeyAlgorithmMismatch]]).
+    */
+  def verifyWithHeaderKey(token: String, typ: String, policy: Policy, now: Long)(using
+    ed: Verifier[Ed25519],
+    p256: Verifier[P256],
+    p384: Verifier[P384],
+    p521: Verifier[P521],
+    rsa: Verifier[Rsa],
+    edK: EdKeys,
+    p256K: EcKeys[P256],
+    rsaK: RsaKeys
+  ): EffIO[Rejected, (Verified, JWK)] =
+    EffIO.from(parse(token)).flatMap { parsed =>
+      policy.algorithms.find(_.name == parsed.algName) match
+        case None                            => EffIO.fail(UntrustedAlgorithm)
+        case Some(alg: JWSAlg.Asymmetric[?]) =>
+          val typOk = parsed.header.get("typ") match
+            case Some(JoseValue.Str(t)) => t == typ
+            case _                      => false
+          if !typOk then EffIO.fail(TypeMismatch)
+          else
+            parsed.header.get("jwk") match
+              case Some(JoseValue.Obj(fields)) =>
+                JWK
+                  .parse(Json.value(JoseValue.Obj(fields)))
+                  .mapError(_ => Malformed: Rejected)
+                  .flatMap(jwk =>
+                    verifyArm(parsed, alg, jwk.key).flatMap(_ => EffIO.from(checkClaims(parsed, policy, now))).map(v => (v, jwk))
+                  )
+              case _ => EffIO.fail(MissingHeaderKey)
+        case Some(_) => EffIO.fail(KeyAlgorithmMismatch)
+    }
 
   /** Single-key verification for the fixed-key deployment (no JWKS indirection). */
   def verify[K <: SignatureAlgorithm](token: String, alg: JWSAlg.Asymmetric[K], key: PublicKey[K], policy: Policy, now: Long)(using
@@ -405,7 +497,7 @@ object JWT:
   ): EffIO[Rejected, Verified] =
     EffIO.from(parse(token)).flatMap { parsed =>
       if !policy.algorithms.exists(_.name == parsed.algName) then EffIO.fail(UntrustedAlgorithm)
-      else if parsed.algName != alg.name then EffIO.fail(UnknownKey)
+      else if parsed.algName != alg.name then EffIO.fail(KeyAlgorithmMismatch)
       else
         EffIO.from(sigOf(alg, parsed.signature)).flatMap { s =>
           v.verify(key, parsed.input, s, alg.scheme)
@@ -420,7 +512,7 @@ object JWT:
   ): EffIO[Rejected, Verified] =
     EffIO.from(parse(token)).flatMap { parsed =>
       if !policy.algorithms.exists(_.name == parsed.algName) then EffIO.fail(UntrustedAlgorithm)
-      else if parsed.algName != alg.name then EffIO.fail(UnknownKey)
+      else if parsed.algName != alg.name then EffIO.fail(KeyAlgorithmMismatch)
       else
         m.sign(key, parsed.input).flatMap { computed =>
           // through the same constant-time discipline as core MAC verify

@@ -22,6 +22,7 @@ package kufuli.tests
 
 import boilerplate.Slice
 import boilerplate.effect.*
+import cats.syntax.all.*
 
 import kufuli.*
 import kufuli.jose.*
@@ -104,19 +105,33 @@ nDMs9Kp6zwtMzwY2stmLBVOUBGMX780=
     yield ()
   }
 
-  test("X25519 small-order peer: import passes (non-zero) but agree yields no shared secret") {
-    // An order-8 point (RFC 7748 section 6.1 / libsodium blocklist); its scalar product is all-zero.
-    val smallOrder = "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"
-      .grouped(2)
-      .map(Integer.parseInt(_, 16).toByte)
-      .toArray
+  test("X25519 small-order points are rejected at import (full blocklist, non-canonical, and SPKI)") {
+    // The seven low-order Curve25519 points (RFC 7748 section 6.1). The shared import rejects each as
+    // WeakPoint on every backend, so the degenerate peer is no longer constructible through the public
+    // API and `agree` stays total. Byte 31's high bit is masked, catching a non-canonical encoding.
+    val blocklist = List(
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "0100000000000000000000000000000000000000000000000000000000000000",
+      "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+      "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+      "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+    )
+    def hex(h: String): Array[Byte] = h.grouped(2).map(Integer.parseInt(_, 16).toByte).toArray
+    val order8 = hex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800")
+    val order8HighBit = order8.updated(31, 0x80.toByte) // non-canonical: byte 31 top bit set, masked away
+    val xSpki = hex("302a300506032b656e032100") ++ order8 // RFC 8410 X25519 SubjectPublicKeyInfo
     for
-      kp <- X25519.generate.absolve
-      peer <- expectRight("import small-order")(PublicKey.fromRaw(X25519)(Slice.of(smallOrder)))
-      // `agree` is declared total; a small-order peer forces the backend to reject the all-zero output,
-      // surfacing as a raised defect rather than a wrong (predictable all-zero) shared secret.
-      result <- kp.privateKey.agree(peer).absolve.attempt
-      _ <- check(result.isLeft, s"small-order agree must not yield a shared secret, got ${result.map(_ => "<secret>")}")
+      _ <- blocklist.traverse_ { h =>
+             PublicKey.fromRaw(X25519)(Slice.of(hex(h))).either.flatMap { r =>
+               check(r.swap.toOption.contains(InvalidKey.WeakPoint), s"fromRaw($h) -> WeakPoint, got $r")
+             }
+           }
+      hb <- PublicKey.fromRaw(X25519)(Slice.of(order8HighBit)).either
+      _ <- check(hb.swap.toOption.contains(InvalidKey.WeakPoint), s"non-canonical order-8 (high bit) -> WeakPoint, got $hb")
+      sp <- PublicKey.fromSpki(Slice.of(xSpki)).either
+      _ <- check(sp.swap.toOption.contains(InvalidKey.WeakPoint), s"SPKI-wrapped order-8 -> WeakPoint, got $sp")
     yield ()
   }
 

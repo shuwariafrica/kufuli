@@ -295,6 +295,30 @@ object PublicKey:
   private[kufuli] def unsafe[A <: Algorithm](r: KeyRepr): PublicKey[A] = r
   extension [A <: Algorithm](k: PublicKey[A]) private[kufuli] def repr: KeyRepr = k
 
+  // The seven low-order Curve25519 points (RFC 7748 section 6.1) whose scalar product is all-zero;
+  // rejecting them at the shared import keeps a small-order peer unconstructible through the public
+  // surface, so `agree` stays total. Byte 31's top bit is masked (the u-coordinate ignores it, RFC
+  // 7748 section 5), so a non-canonical encoding of a blocklisted point cannot slip past.
+  private val x25519LowOrder: List[IArray[Byte]] =
+    List(
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "0100000000000000000000000000000000000000000000000000000000000000",
+      "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+      "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+      "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+    ).map(h => IArray.from(h.grouped(2).map(b => Integer.parseInt(b, 16).toByte)))
+
+  private def isX25519LowOrder(point: Array[Byte]): Boolean =
+    point.length == 32 && x25519LowOrder.exists(entry =>
+      (0 until 31).forall(i => point(i) == entry(i)) && (point(31) & 0x7f) == (entry(31) & 0x7f)
+    )
+
+  private def x25519SpkiLowOrder(der: Slice): Boolean =
+    val bytes = der.toArray
+    bytes.length >= 32 && isX25519LowOrder(bytes.takeRight(32))
+
   // PARSE names the encoding. Imports are effectful and typed: real validation (on-curve,
   // small-order, full-encoding) is backend work - and what makes `agree` TOTAL.
   def fromRaw(alg: Ed25519)(bytes: Slice)(using k: EdKeys): EffIO[InvalidKey, PublicKey[Ed25519]] =
@@ -303,7 +327,8 @@ object PublicKey:
   @targetName("fromRawX")
   def fromRaw(alg: X25519)(bytes: Slice)(using k: XKeys): EffIO[InvalidKey, PublicKey[X25519]] =
     val _ = alg
-    k.fromRaw(bytes)
+    if isX25519LowOrder(bytes.toArray) then EffIO.fail(InvalidKey.WeakPoint)
+    else k.fromRaw(bytes)
 
   /** ML-KEM encapsulation key from the wire (the hybrid KeyShare carries it verbatim). */
   @targetName("fromRawKem")
@@ -332,8 +357,10 @@ object PublicKey:
     rsa: RsaKeys
   ): EffIO[InvalidKey, ImportedPublicKey] =
     EffIO.from(Der.peekSpki(der)).flatMap {
-      case Der.Alg.Ed     => ed.fromSpki(der).map(ImportedPublicKey.Ed(_))
-      case Der.Alg.X      => x.fromSpki(der).map(ImportedPublicKey.X(_))
+      case Der.Alg.Ed => ed.fromSpki(der).map(ImportedPublicKey.Ed(_))
+      case Der.Alg.X  =>
+        if x25519SpkiLowOrder(der) then EffIO.fail(InvalidKey.WeakPoint)
+        else x.fromSpki(der).map(ImportedPublicKey.X(_))
       case Der.Alg.EcP256 => p256.fromSpki(der).map(ImportedPublicKey.EcP256(_))
       case Der.Alg.EcP384 => p384.fromSpki(der).map(ImportedPublicKey.EcP384(_))
       case Der.Alg.EcP521 => p521.fromSpki(der).map(ImportedPublicKey.EcP521(_))
