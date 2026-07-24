@@ -47,7 +47,7 @@ class E2ESuite extends munit.CatsEffectSuite:
   private def derive(secret: Slice, label: String): IO[SecretKey[AesGcm256]] =
     HKDF.expandLabelKey(Sha256, Prk.unsafe(secret.toArray), label, Slice.empty, AesGcm256).absolve
 
-  test("emile-shaped E2E: hybrid agree -> extract -> expandLabel -> records both ways -> HP mask -> key update") {
+  test("TLS/QUIC-shaped E2E: hybrid agree -> extract -> expandLabel -> records both ways -> HP mask -> key update") {
     for
       xc <- X25519.generate.absolve
       xs <- X25519.generate.absolve

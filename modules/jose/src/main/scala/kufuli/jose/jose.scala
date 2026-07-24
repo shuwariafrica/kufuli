@@ -49,7 +49,12 @@ enum JoseValue derives CanEqual:
 private object Json:
   private given codec: JsonValueCodec[JoseValue] = new JsonValueCodec[JoseValue]:
     def nullValue: JoseValue = JoseValue.Null
-    def decodeValue(in: JsonReader, default: JoseValue): JoseValue =
+    // jsoniter imposes no nesting cap and the JWT payload is parsed before the signature check, so a
+    // deeply nested value in an unsigned token would recurse to a StackOverflowError. Bound the depth
+    // and reject as a decode error (caught as Malformed) instead.
+    private inline val maxDepth = 64
+    def decodeValue(in: JsonReader, default: JoseValue): JoseValue = decode(in, 0)
+    private def decode(in: JsonReader, depth: Int): JoseValue =
       if in.isNextToken('n') then in.readNullOrError(JoseValue.Null, "expected value")
       else
         in.rollbackToken()
@@ -57,26 +62,30 @@ private object Json:
           case '"'       => in.rollbackToken(); JoseValue.Str(in.readString(""))
           case 't' | 'f' => in.rollbackToken(); JoseValue.Bool(in.readBoolean())
           case '['       =>
-            val elems = List.newBuilder[JoseValue]
-            if !in.isNextToken(']') then
-              in.rollbackToken()
-              @tailrec def loop(): Unit =
-                val _ = elems += decodeValue(in, default)
-                if in.isNextToken(',') then loop()
-              loop()
-              if !in.isCurrentToken(']') then in.arrayEndOrCommaError()
-            JoseValue.Arr(elems.result())
+            if depth >= maxDepth then in.decodeError("nesting too deep")
+            else
+              val elems = List.newBuilder[JoseValue]
+              if !in.isNextToken(']') then
+                in.rollbackToken()
+                @tailrec def loop(): Unit =
+                  val _ = elems += decode(in, depth + 1)
+                  if in.isNextToken(',') then loop()
+                loop()
+                if !in.isCurrentToken(']') then in.arrayEndOrCommaError()
+              JoseValue.Arr(elems.result())
           case '{' =>
-            val fields = Map.newBuilder[String, JoseValue]
-            if !in.isNextToken('}') then
-              in.rollbackToken()
-              @tailrec def loop(): Unit =
-                val k = in.readKeyAsString()
-                val _ = fields += (k -> decodeValue(in, default))
-                if in.isNextToken(',') then loop()
-              loop()
-              if !in.isCurrentToken('}') then in.objectEndOrCommaError()
-            JoseValue.Obj(fields.result())
+            if depth >= maxDepth then in.decodeError("nesting too deep")
+            else
+              val fields = Map.newBuilder[String, JoseValue]
+              if !in.isNextToken('}') then
+                in.rollbackToken()
+                @tailrec def loop(): Unit =
+                  val k = in.readKeyAsString()
+                  val _ = fields += (k -> decode(in, depth + 1))
+                  if in.isNextToken(',') then loop()
+                loop()
+                if !in.isCurrentToken('}') then in.objectEndOrCommaError()
+              JoseValue.Obj(fields.result())
           case _ => in.rollbackToken(); JoseValue.Num(in.readDouble())
         end match
     def encodeValue(x: JoseValue, out: JsonWriter): Unit = x match
@@ -592,22 +601,27 @@ object COSEKey:
       if major != 2 || len < 0 || c2.pos + len > c2.b.length then None
       else Some((c2.b.slice(c2.pos, c2.pos + len), Cur(c2.b, c2.pos + len)))
     }
-  private def skip(c: Cur): Option[Cur] =
-    head(c).flatMap { (major, arg, c2) =>
-      major match
-        case 0 | 1 | 7 => Some(c2)
-        case 2 | 3     =>
-          val len = arg.toInt
-          if len < 0 || c2.pos + len > c2.b.length then None else Some(Cur(c2.b, c2.pos + len))
-        case 4 => skipMany(c2, arg)
-        case 5 => skipMany(c2, arg * 2)
-        case _ => None
-    }
-  @tailrec private def skipMany(c: Cur, n: Long): Option[Cur] =
+  // Skipping an unknown value recurses through nested arrays/maps; bound the nesting depth so a
+  // crafted deeply-nested COSE cannot exhaust the stack (`readMap` only reads a flat top-level map).
+  private inline val maxCborDepth = 64
+  private def skip(c: Cur, depth: Int): Option[Cur] =
+    if depth > maxCborDepth then None
+    else
+      head(c).flatMap { (major, arg, c2) =>
+        major match
+          case 0 | 1 | 7 => Some(c2)
+          case 2 | 3     =>
+            val len = arg.toInt
+            if len < 0 || c2.pos + len > c2.b.length then None else Some(Cur(c2.b, c2.pos + len))
+          case 4 => skipMany(c2, arg, depth + 1)
+          case 5 => skipMany(c2, arg * 2, depth + 1)
+          case _ => None
+      }
+  @tailrec private def skipMany(c: Cur, n: Long, depth: Int): Option[Cur] =
     if n <= 0 then Some(c)
     else
-      skip(c) match
-        case Some(c2) => skipMany(c2, n - 1)
+      skip(c, depth) match
+        case Some(c2) => skipMany(c2, n - 1, depth)
         case None     => None
 
   final private case class Fields(kty: Int, crv: Int, x: Array[Byte], y: Array[Byte])
@@ -627,7 +641,7 @@ object COSEKey:
                   case -1 => readInt(c1).map((v, c2) => (acc.copy(crv = v), c2))
                   case -2 => readBytes(c1).map((v, c2) => (acc.copy(x = v), c2))
                   case -3 => readBytes(c1).map((v, c2) => (acc.copy(y = v), c2))
-                  case _  => skip(c1).map(c2 => (acc, c2))
+                  case _  => skip(c1, 0).map(c2 => (acc, c2))
                 stepped match
                   case Some((acc2, c2)) => loop(c2, i + 1, acc2)
                   case None             => None
@@ -644,7 +658,7 @@ object COSEKey:
         else EffIO.fail(InvalidKey.Unsupported)
 end COSEKey
 
-/** Not implemented: the shapes compile but the operations return placeholder values. */
+/** Not implemented: the shapes compile, but every operation raises rather than returning a value. */
 opaque type JWE = String
 object JWE:
   enum Alg derives CanEqual:
@@ -658,15 +672,20 @@ object JWE:
   case object DecryptionFailed extends DecryptionFailed
   sealed abstract class UntrustedAlgorithm private[jose] () extends Rejected("alg/enc not in the allowlist")
   case object UntrustedAlgorithm extends UntrustedAlgorithm
+  // The shapes are retained but the operations are not implemented; they raise rather than return a
+  // placeholder a caller could mistake for a real seal or open (a fake-successful decryption is worse
+  // than a loud failure).
+  private def unimplemented: Nothing =
+    throw new UnsupportedOperationException("kufuli.jose.JWE is not implemented") // scalafix:ok DisableSyntax.throw
   def seal[C <: EcCurve](pt: Slice, recipient: PublicKey[C], alg: Alg, enc: Enc): UEffIO[JWE] =
     val _ = (pt, recipient, alg, enc)
-    EffIO.succeed("eyJ.design.jwe")
+    EffIO.suspend(unimplemented)
   @targetName("sealRsa")
   def seal(pt: Slice, recipient: PublicKey[Rsa], enc: Enc): UEffIO[JWE] =
     val _ = (pt, recipient, enc)
-    EffIO.succeed("eyJ.design.jwe")
+    EffIO.suspend(unimplemented)
   def open[C <: EcCurve](jwe: String, key: PrivateKey[C], allowed: Set[Enc]): EffIO[Rejected, Array[Byte]] =
     val _ = (jwe, key, allowed)
-    EffIO.succeed(Array.emptyByteArray)
+    EffIO.suspend(unimplemented)
   extension (jwe: JWE) def compact: String = jwe
 end JWE

@@ -47,7 +47,8 @@ class WycheproofSuite extends munit.CatsEffectSuite:
       res = t.field("result").str
       if res == "valid" || res == "invalid"
     yield (material, t.field("msg").str, t.field("sig").str, res, t.field("tcId").int)
-    cases
+    // Guard against a silently empty corpus (a failed vector embedding would otherwise pass vacuously).
+    check(cases.nonEmpty, "wycheproof verify corpus is empty - vector embedding failed") *> cases
       .traverse((material, msg, sig, res, tc) =>
         // A raise (a backend rejecting a malformed key or signature) is a rejection: correct for an
         // `invalid` vector, a real defect only for a `valid` one.
@@ -88,7 +89,7 @@ class WycheproofSuite extends munit.CatsEffectSuite:
              .field("tcId")
              .int
     )
-    cases
+    check(cases.nonEmpty, "wycheproof aead corpus is empty - vector embedding failed") *> cases
       .traverse { (keySize, key, iv, aad, msg, ct, tag, res, tc) =>
         open(keySize, hb(key), hb(iv), hb(aad), hb(ct) ++ hb(tag)).attempt.map {
           case Right(opened) =>
