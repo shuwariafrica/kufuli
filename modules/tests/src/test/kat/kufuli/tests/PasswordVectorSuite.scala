@@ -29,7 +29,7 @@ import kufuli.tests.support.*
 
 class PasswordVectorSuite extends munit.CatsEffectSuite:
 
-  private def hex(b: Array[Byte]): String = b.map(x => f"$x%02x").mkString
+  private def hex(b: Array[Byte]): String = b.map(x => f"${x & 0xff}%02x").mkString
 
   // The reference vector below, encoded to PHC on the JVM (BouncyCastle).
   private val jvmProducedPhc =

@@ -28,7 +28,7 @@ import kufuli.unsafe.*
 
 class UnsafeVectorSuite extends munit.CatsEffectSuite:
 
-  private def hex(b: Array[Byte]): String = b.map(x => f"$x%02x").mkString
+  private def hex(b: Array[Byte]): String = b.map(x => f"${x & 0xff}%02x").mkString
   private def hb(s: String): Array[Byte] = s.grouped(2).map(Integer.parseInt(_, 16).toByte).toArray
 
   test("AesBlock: FIPS 197 C.1 single-block AES-128") {

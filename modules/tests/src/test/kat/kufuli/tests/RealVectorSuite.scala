@@ -29,7 +29,7 @@ import kufuli.tests.support.*
 
 class RealVectorSuite extends munit.CatsEffectSuite:
 
-  private def hex(b: Array[Byte]): String = b.map(x => f"$x%02x").mkString
+  private def hex(b: Array[Byte]): String = b.map(x => f"${x & 0xff}%02x").mkString
   private def hb(s: String): Array[Byte] = s.grouped(2).map(Integer.parseInt(_, 16).toByte).toArray
 
   test("SHA-256(\"abc\") == the FIPS 180-4 digest") {
