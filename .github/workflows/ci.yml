@@ -162,7 +162,7 @@ jobs:
         # Only kufuli-tests carries native test sources; linking that one binary exercises every
         # module's native code and builds aws-lc once. The kufuli-native aggregate links a test
         # binary per module, and five concurrent cold aws-lc builds exhaust the macOS process limit.
-        run: ./project/scripts/run-sbt.sh "kufuli-testsNative/test"
+        run: ./project/scripts/run-sbt.sh "kufuli-testsNative/Test/testOnly *"
 
       - name: Verify vendored native linkage
         # A mis-rebind onto stock OpenSSL fails at link, so a linked binary already proves the shim
@@ -394,7 +394,7 @@ jobs:
       - name: Import Signing Key
         uses: crazy-max/ghaction-import-gpg@v7
         with:
-          gpg_private_key: ${{ secrets.SIGNING_KEY }}
+          gpg_private_key: ${{ secrets.OSS_PUBLISH_USER_SIGNING_KEY }}
           git_user_signingkey: true
           git_commit_gpgsign: true
           trust_level: 5
@@ -405,15 +405,15 @@ jobs:
       - name: Publish Binaries
         run: sbt --server publishSigned
         env:
-          SONATYPE_USERNAME: ${{ secrets.PUBLISH_USER }}
-          SONATYPE_PASSWORD: ${{ secrets.PUBLISH_USER_PASSPHRASE }}
+          SONATYPE_USERNAME: ${{ secrets.OSS_PUBLISH_USER }}
+          SONATYPE_PASSWORD: ${{ secrets.OSS_PUBLISH_USER_PASSPHRASE }}
 
       - name: Publish Maven Central Release
         if: startsWith(github.ref, 'refs/tags/v')
         run: sbt --server "sonaUpload; sonaRelease"
         env:
-          SONATYPE_USERNAME: ${{ secrets.PUBLISH_USER }}
-          SONATYPE_PASSWORD: ${{ secrets.PUBLISH_USER_PASSPHRASE }}
+          SONATYPE_USERNAME: ${{ secrets.OSS_PUBLISH_USER }}
+          SONATYPE_PASSWORD: ${{ secrets.OSS_PUBLISH_USER_PASSPHRASE }}
 
   release:
     name: Create GitHub Release

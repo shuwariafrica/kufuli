@@ -119,7 +119,10 @@ val `kufuli-tests` =
       libraryDependencies += munit % Test,
       libraryDependencies += `munit-cats-effect` % Test,
       libraryDependencies += jsoniter % Test,
-      testFrameworks += new TestFramework("munit.Framework")
+      testFrameworks += new TestFramework("munit.Framework"),
+      // sbt 2.x resolves `test` through testQuick, which skips suites whose prior run succeeded with
+      // unchanged inputs - so a warm state store reports `Total 0` on a fully working suite.
+      Test / test := (Test / testOnly).toTask(" *").value
     )
     .jvmPlatform(
       Seq(scala3),
