@@ -20,6 +20,11 @@
  */
 package kufuli.jose
 
+import java.nio.ByteBuffer
+import java.nio.CharBuffer
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
+
 import scala.annotation.tailrec
 import scala.annotation.targetName
 import scala.concurrent.duration.FiniteDuration
@@ -34,7 +39,9 @@ import kufuli.*
 
 sealed abstract class JoseError(message: String) extends Exception(message) with NoStackTrace derives CanEqual
 
-/** A JSON value carried in a JWT's custom claims (nested objects included - DPoP's `cnf`). */
+/** A JSON value carried in a JWT's custom claims, nesting included (DPoP's `cnf`). Only what JSON
+  * renders is signable: a `Num` must be finite and a `Str` must carry no unpaired surrogate.
+  */
 enum JoseValue derives CanEqual:
   case Str(value: String)
   case Num(value: Double)
@@ -86,7 +93,12 @@ private object Json:
                 loop()
                 if !in.isCurrentToken('}') then in.objectEndOrCommaError()
               JoseValue.Obj(fields.result())
-          case _ => in.rollbackToken(); JoseValue.Num(in.readDouble())
+          case _ =>
+            in.rollbackToken()
+            val n = in.readDouble()
+            // JSON has no literal for a non-finite double, so admitting 1e999 would let an
+            // attacker-supplied header member parse and then raise when it is re-serialised.
+            if n.isFinite then JoseValue.Num(n) else in.decodeError("non-finite number")
         end match
     def encodeValue(x: JoseValue, out: JsonWriter): Unit = x match
       case JoseValue.Str(s)  => out.writeVal(s)
@@ -100,8 +112,17 @@ private object Json:
         fs.toList.sortBy(_._1).foreach { (k, v) => out.writeKey(k); encodeValue(v, out) }
         out.writeObjectEnd()
 
-  def str(s: String): String = writeToString[JoseValue](JoseValue.Str(s))
-  def value(v: JoseValue): String = writeToString[JoseValue](v)
+  // Emission is partial for a value the caller built rather than one `parse` produced: JSON renders
+  // neither a non-finite number nor an unpaired surrogate. `sign` has no channel to report it, so
+  // every emission path raises this one named caller error instead of leaking the codec's exception.
+  def unrenderable(what: String): Nothing =
+    throw new IllegalArgumentException(s"$what has no JSON representation") // scalafix:ok DisableSyntax.throw
+  def str(s: String): String =
+    try writeToString[JoseValue](JoseValue.Str(s))
+    catch case _: JsonWriterException => unrenderable("a claim or header string")
+  def value(v: JoseValue): Option[String] =
+    try Some(writeToString[JoseValue](v))
+    catch case _: JsonWriterException => None
   def obj(fields: List[(String, String)]): String =
     fields.map((k, v) => s"${str(k)}:$v").mkString("{", ",", "}")
   def parse(text: String): Option[Map[String, JoseValue]] =
@@ -165,8 +186,8 @@ object JWT:
   case object MissingHeaderKey extends MissingHeaderKey
 
   /** Claim set under construction: start from [[Claims.empty]] and refine with the withers
-    * (`Claims.empty.subject("u").audience("api").expiresIn(1.hour).id(jti)`). `custom` claims
-    * round-trip into [[Verified]] verbatim (DPoP: jti/htm/htu/cnf).
+    * (`Claims.empty.subject("u").audience("api").expiresIn(1.hour).id(jti)`), each of which owns
+    * one registered claim name; everything else goes through `claim` (DPoP: htm/htu/cnf).
     */
   final case class Claims(
     subject: Option[String],
@@ -193,6 +214,10 @@ object JWT:
 
       /** The `jti` claim (DPoP proofs, revocation lists). */
       def id(value: String): Claims = c.copy(id = Some(value))
+
+      /** A claim outside the registered set; a registered name (`iss`, `sub`, `aud`, `exp`, `nbf`,
+        * `iat`, `jti`) belongs to its wither and is not emitted from here.
+        */
       def claim(name: String, value: JoseValue): Claims = c.copy(custom = c.custom.updated(name, value))
     end extension
   end Claims
@@ -227,6 +252,7 @@ object JWT:
       def unexpiring: Policy = p.copy(requireExpiry = false)
   end Policy
 
+  /** A verified token's claims: the registered ones as typed fields, everything else in `claims`. */
   final case class Verified(
     subject: Option[String],
     issuer: Option[String],
@@ -253,6 +279,8 @@ object JWT:
       case Right(p) => Right(Unverified(claimString(p.payload, "iss"), p.kid, p.algName))
       case Left(_)  => Left(Malformed)
 
+  private val registeredClaims = Set("iss", "sub", "aud", "exp", "nbf", "iat", "jti")
+
   private def payloadJson(c: Claims, at: Long): String =
     val exp = c.expiresAt.orElse(c.lifetime.map(l => at + l.toSeconds))
     val fields =
@@ -266,7 +294,11 @@ object JWT:
         c.notBefore.map(v => "nbf" -> v.toString).toList ++
         List("iat" -> at.toString) ++
         c.id.map(v => "jti" -> Json.str(v)).toList ++
-        c.custom.toList.sortBy(_._1).map((k, v) => k -> Json.value(v))
+        // RFC 7519 section 4: claim names MUST be unique. A custom entry repeating a registered name
+        // would emit it twice, and a verifier taking the first duplicate reads a different token.
+        c.custom.toList.sortBy(_._1).collect {
+          case (k, v) if !registeredClaims.contains(k) => k -> Json.value(v).getOrElse(Json.unrenderable(s"claim $k"))
+        }
     Json.obj(fields)
   end payloadJson
 
@@ -292,15 +324,17 @@ object JWT:
   private def sign[K <: SignatureAlgorithm](claims: Claims, alg: JWSAlg.Asymmetric[K], kid: Option[String], at: Long)(
     key: PrivateKey[K]
   )(using s: Signer[K]): UEffIO[JWT] =
-    val (input, bytes) = signingInput(headerJson(alg, kid), payloadJson(claims, at))
-    s.sign(key, bytes, alg.scheme).map(assemble(input, _))
+    EffIO.suspend(signingInput(headerJson(alg, kid), payloadJson(claims, at))).flatMap { (input, bytes) =>
+      s.sign(key, bytes, alg.scheme).map(assemble(input, _))
+    }
 
   @targetName("signMac")
   def sign[H <: MacAlgorithm](claims: Claims, alg: JWSAlg.Symmetric[H], at: Long)(key: SecretKey[H])(using
     m: Mac[H]
   ): UEffIO[JWT] =
-    val (input, bytes) = signingInput(headerJson(alg, None), payloadJson(claims, at))
-    m.sign(key, bytes).map(assemble(input, _))
+    EffIO.suspend(signingInput(headerJson(alg, None), payloadJson(claims, at))).flatMap { (input, bytes) =>
+      m.sign(key, bytes).map(assemble(input, _))
+    }
 
   /** Sign with the verification key embedded in the protected header (`jwk`, canonical members
     * only) plus an explicit header `typ` - the self-keyed profile (DPoP, RFC 9449). `headerKey` is
@@ -332,9 +366,12 @@ object JWT:
   private def signWithHeader[K <: SignatureAlgorithm](claims: Claims, alg: JWSAlg.Asymmetric[K], typ: String, jwkJson: String, at: Long)(
     key: PrivateKey[K]
   )(using s: Signer[K]): UEffIO[JWT] =
-    val header = Json.obj(List("alg" -> Json.str(alg.name), "jwk" -> jwkJson, "typ" -> Json.str(typ)))
-    val (input, bytes) = signingInput(header, payloadJson(claims, at))
-    s.sign(key, bytes, alg.scheme).map(assemble(input, _))
+    EffIO
+      .suspend {
+        val header = Json.obj(List("alg" -> Json.str(alg.name), "jwk" -> jwkJson, "typ" -> Json.str(typ)))
+        signingInput(header, payloadJson(claims, at))
+      }
+      .flatMap((input, bytes) => s.sign(key, bytes, alg.scheme).map(assemble(input, _)))
 
   final private case class Parsed(
     algName: String,
@@ -345,24 +382,49 @@ object JWT:
     signature: Array[Byte]
   )
 
+  // A token is base64url-decoded and JSON-parsed before any signature check, so its length is the
+  // bound on unauthenticated work; 64 KiB is far above any deployable bearer token.
+  private inline val maxTokenChars = 65536
+
+  // RFC 7515 section 5.2 step 3 requires the octets to BE valid UTF-8. A replacing decode maps
+  // distinct header bytes - distinct `kid` values - onto one string. UTF-8 never yields more chars
+  // than input bytes, so underflow is the only successful result: overflow would silently truncate.
+  private def utf8(bytes: Array[Byte]): Option[String] =
+    val decoder = StandardCharsets.UTF_8
+      .newDecoder()
+      .onMalformedInput(CodingErrorAction.REPORT)
+      .onUnmappableCharacter(CodingErrorAction.REPORT)
+    val out = CharBuffer.allocate(bytes.length)
+    if !decoder.decode(ByteBuffer.wrap(bytes), out, true).isUnderflow || !decoder.flush(out).isUnderflow then None
+    else
+      val _ = out.flip()
+      Some(out.toString)
+
   private def parse(token: String): Either[Rejected, Parsed] =
-    token.split('.') match
-      case Array(h, p, s) =>
-        for
-          hb <- Base64Url.decode(h).left.map(_ => Malformed: Rejected)
-          pb <- Base64Url.decode(p).left.map(_ => Malformed: Rejected)
-          sb <- Base64Url.decode(s).left.map(_ => Malformed: Rejected)
-          header <- Json.parse(new String(hb, "UTF-8")).toRight(Malformed)
-          payload <- Json.parse(new String(pb, "UTF-8")).toRight(Malformed)
-          algName <- header.get("alg") match
-                       case Some(JoseValue.Str(a)) => Right(a)
-                       case _                      => Left(Malformed)
-        yield
-          val kid = header.get("kid") match
-            case Some(JoseValue.Str(k)) => Some(k)
-            case _                      => None
-          Parsed(algName, kid, header, payload, Slice.of(s"$h.$p".getBytes("US-ASCII")), sb)
-      case _ => Left(Malformed)
+    // RFC 7515 section 5.2 step 1: exactly two delimiting periods. `split` drops trailing empty
+    // fields, so without the count "h.p.s" and "h.p.s....." are one token under many strings.
+    if token.length > maxTokenChars || token.count(_ == '.') != 2 then Left(Malformed)
+    else
+      token.split('.') match
+        case Array(h, p, s) =>
+          for
+            hb <- Base64Url.decode(h).left.map(_ => Malformed: Rejected)
+            pb <- Base64Url.decode(p).left.map(_ => Malformed: Rejected)
+            sb <- Base64Url.decode(s).left.map(_ => Malformed: Rejected)
+            header <- utf8(hb).flatMap(Json.parse).toRight(Malformed)
+            payload <- utf8(pb).flatMap(Json.parse).toRight(Malformed)
+            // RFC 7515 section 4.1.11 and Appendix E: `crit` names extensions that MUST be understood
+            // and processed, and this implementation understands none of them.
+            _ <- Either.cond(!header.contains("crit"), (), Malformed)
+            algName <- header.get("alg") match
+                         case Some(JoseValue.Str(a)) => Right(a)
+                         case _                      => Left(Malformed)
+          yield
+            val kid = header.get("kid") match
+              case Some(JoseValue.Str(k)) => Some(k)
+              case _                      => None
+            Parsed(algName, kid, header, payload, Slice.of(s"$h.$p".getBytes("US-ASCII")), sb)
+        case _ => Left(Malformed)
 
   private def claimString(p: Map[String, JoseValue], name: String): Option[String] =
     p.get(name) match
@@ -389,7 +451,6 @@ object JWT:
     else if policy.requiredIssuer.exists(i => !claimString(p, "iss").contains(i)) then Left(IssuerMismatch)
     else if policy.audience.exists(a => !auds.contains(a)) then Left(AudienceMismatch)
     else
-      val registered = Set("iss", "sub", "aud", "exp", "nbf", "iat", "jti")
       Right(
         Verified(
           claimString(p, "sub"),
@@ -398,16 +459,17 @@ object JWT:
           exp,
           claimLong(p, "iat"),
           claimString(p, "jti"),
-          p.filter((k, _) => !registered.contains(k))
+          p.filter((k, _) => !registeredClaims.contains(k))
         )
       )
     end if
   end checkClaims
 
-  /** Verify against a JWKS at explicit time `now`: the token's `kid` (or the sole key) selects the
-    * JWK - no key for the kid is [[UnknownKey]] (the JWKS refresh-on-miss lever); a key whose arm
-    * does not match the header algorithm is [[KeyAlgorithmMismatch]] (never worth a refetch).
-    * Symmetric algs never verify via a public-key set - also [[KeyAlgorithmMismatch]].
+  /** Verify against a JWKS at explicit time `now`: the token's `kid` selects the JWK, and a token
+    * carrying no `kid` takes the first key of the set - against a rotating set that succeeds only
+    * while the signing key leads. No key for the kid is [[UnknownKey]], the JWKS refresh-on-miss
+    * lever; a key whose arm does not match the header algorithm, and any symmetric alg reaching a
+    * public-key set, is [[KeyAlgorithmMismatch]], which no refetch fixes.
     */
   def verify(token: String, keys: JWKS, policy: Policy, now: Long)(using
     ed: Verifier[Ed25519],
@@ -469,6 +531,8 @@ object JWT:
     rsa: Verifier[Rsa],
     edK: EdKeys,
     p256K: EcKeys[P256],
+    p384K: EcKeys[P384],
+    p521K: EcKeys[P521],
     rsaK: RsaKeys
   ): EffIO[Rejected, (Verified, JWK)] =
     EffIO.from(parse(token)).flatMap { parsed =>
@@ -482,13 +546,17 @@ object JWT:
           else
             parsed.header.get("jwk") match
               case Some(JoseValue.Obj(fields)) =>
-                JWK
-                  .parse(Json.value(JoseValue.Obj(fields)))
-                  .mapError(_ => Malformed: Rejected)
-                  .flatMap(jwk =>
-                    verifyArm(parsed, alg, jwk.key).flatMap(_ => EffIO.from(checkClaims(parsed, policy, now))).map(v => (v, jwk))
-                  )
+                Json.value(JoseValue.Obj(fields)) match
+                  case None       => EffIO.fail(Malformed)
+                  case Some(text) =>
+                    JWK
+                      .parse(text)
+                      .mapError(_ => Malformed: Rejected)
+                      .flatMap(jwk =>
+                        verifyArm(parsed, alg, jwk.key).flatMap(_ => EffIO.from(checkClaims(parsed, policy, now))).map(v => (v, jwk))
+                      )
               case _ => EffIO.fail(MissingHeaderKey)
+          end if
         case Some(_) => EffIO.fail(KeyAlgorithmMismatch)
     }
 
@@ -535,9 +603,12 @@ object JWT:
     parsed.left.map(_ => Malformed)
 end JWT
 
-/** A public key in JWK form (RFC 7517/7518): the canonical JSON plus the parsed key arm. Build the
-  * PUBLISHING direction with `JWK.of` (the /jwks endpoint, OIDC discovery); parse with `parse`.
-  * `json` emits the canonical members (RFC 7638 ordering).
+/** A public key in JWK form (RFC 7517/7518): its JSON document plus the parsed key arm. Build the
+  * PUBLISHING direction with `JWK.of` (the /jwks endpoint, OIDC discovery); read the wire direction
+  * with `JWK.parse`. `json` is the document this JWK came from - what `of` published (the required
+  * members lexicographically, then `kid`) or exactly what `parse` was given, including members
+  * outside the required set. It is NOT an RFC 7638 canonical form: hashing it yields a thumbprint
+  * that does not match the key's, which the `thumbprint` extension computes.
   */
 final case class JWK(kid: Option[String], key: ImportedPublicKey, json: String)
 object JWK:
@@ -586,10 +657,14 @@ object JWK:
   def of(kid: String, key: PublicKey[Rsa])(using k: RsaKeys): EffIO[KeyNotExportable, JWK] =
     key.components.map(c => JWK(Some(kid), ImportedPublicKey.OfRsa(key), withKid(Some(kid), canonicalRsa(c))))
 
-  /** Parse a single JWK document; the key goes through the lifecycle imports (typed validation). */
+  /** Parse a single JWK document - OKP/Ed25519, EC/P-256/P-384/P-521, RSA - through the lifecycle
+    * imports, so the key is typed-validated rather than merely decoded.
+    */
   def parse(json: String)(using
     ed: EdKeys,
     p256: EcKeys[P256],
+    p384: EcKeys[P384],
+    p521: EcKeys[P521],
     rsa: RsaKeys
   ): EffIO[Malformed | InvalidKey, JWK] =
     Json.parse(json) match
@@ -607,6 +682,14 @@ object JWK:
             EffIO
               .from(for x <- b64("x"); y <- b64("y") yield Array[Byte](4) ++ x ++ y)
               .flatMap(pt => p256.fromSec1(Slice.of(pt)).map(k => JWK(kid, ImportedPublicKey.EcP256(k), json)))
+          case (Some("EC"), Some("P-384")) =>
+            EffIO
+              .from(for x <- b64("x"); y <- b64("y") yield Array[Byte](4) ++ x ++ y)
+              .flatMap(pt => p384.fromSec1(Slice.of(pt)).map(k => JWK(kid, ImportedPublicKey.EcP384(k), json)))
+          case (Some("EC"), Some("P-521")) =>
+            EffIO
+              .from(for x <- b64("x"); y <- b64("y") yield Array[Byte](4) ++ x ++ y)
+              .flatMap(pt => p521.fromSec1(Slice.of(pt)).map(k => JWK(kid, ImportedPublicKey.EcP521(k), json)))
           case (Some("RSA"), _) =>
             EffIO
               .from(for n <- b64("n"); e <- b64("e") yield (n, e))

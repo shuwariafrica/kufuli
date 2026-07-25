@@ -24,14 +24,14 @@ import scala.annotation.tailrec
 
 import boilerplate.Slice
 
-/** RFC 4648 section 5 base64url, UNPADDED - the JOSE and web-token alphabet. `decode` is strict:
-  * padding, `+`, `/`, any non-alphabet character, or an impossible length (4k+1) is [[Malformed]].
+/** RFC 4648 section 5 base64url, UNPADDED - the JOSE and web-token alphabet. `decode` admits only
+  * the one canonical encoding of an octet string: padding, `+`, `/`, any non-alphabet character, an
+  * impossible length (4k+1), or a short final group whose unused low bits are set is [[Malformed]].
   */
 object Base64Url:
   def encode(bytes: Array[Byte]): String = Base64.encode(bytes, Base64.urlAlphabet, pad = false)
   def decode(text: String): Either[Malformed, Array[Byte]] = Base64.decode(text, Base64.urlInverse, padded = false)
 
-/** RFC 4648 section 4 standard base64 (padded) - private plumbing (PEM bodies). */
 private[kufuli] object Base64:
   private[kufuli] val urlAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
   private[kufuli] val stdAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -74,11 +74,15 @@ private[kufuli] object Base64:
     def stripped: Either[Malformed, String] =
       if !padded then Right(text)
       else if text.length % 4 != 0 then Left(Malformed)
-      else Right(text.reverse.dropWhile(_ == '=').reverse)
+      else
+        val padding = text.length - text.lastIndexWhere(_ != '=') - 1
+        if padding > 2 then Left(Malformed) else Right(text.dropRight(padding))
     stripped.flatMap { body =>
       if body.length % 4 == 1 then Left(Malformed)
       else
-        val out = new Array[Byte](body.length * 3 / 4)
+        // length/4*3, not length*3/4: the latter overflows Int past 715,827,882 characters and throws
+        // a negative array size out of a total Either.
+        val out = new Array[Byte](body.length / 4 * 3 + math.max(body.length % 4 - 1, 0))
         @tailrec def go(i: Int, o: Int): Either[Malformed, Array[Byte]] =
           if i >= body.length then Right(out)
           else
@@ -89,9 +93,12 @@ private[kufuli] object Base64:
                 val c = body.charAt(i + j).toInt
                 if c < 128 then table(c) else -1
               }
-              if values.exists(_ < 0) then Left(Malformed)
+              val acc = values.foldLeft(0)((a, v) => (a << 6) | (v & 0x3f)) << (6 * (4 - chunk))
+              // A short final group carries bits below its last octet that no byte receives; unless
+              // they are zero one octet string has many encodings, defeating any defence keyed on the
+              // encoded string - a replay cache, a denylist, a unique-token column.
+              if values.exists(_ < 0) || (acc & ((1 << (8 * (4 - chunk))) - 1)) != 0 then Left(Malformed)
               else
-                val acc = values.foldLeft(0)((a, v) => (a << 6) | (v & 0x3f)) << (6 * (4 - chunk))
                 out(o) = ((acc >> 16) & 0xff).toByte
                 if chunk >= 3 then out(o + 1) = ((acc >> 8) & 0xff).toByte
                 if chunk == 4 then out(o + 2) = (acc & 0xff).toByte
