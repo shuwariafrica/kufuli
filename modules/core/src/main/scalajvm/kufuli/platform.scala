@@ -18,10 +18,8 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-// JVM backend unit (JCA, floor JDK 25 LTS): bytes-backed keys; ML-KEM via JCA (JEP 496). XChaCha
-// and GCM-SIV are not in JCA, and core-JVM takes no BouncyCastle dependency (BC is
-// password-module-only). This file is the JVM capability table: each trait below is what the
-// shared companion of the same-named typeclass exposes on this unit.
+// JVM capability table (JCA, floor JDK 25 for ML-KEM via JEP 496). XChaCha and GCM-SIV are absent
+// from JCA, and core takes no BouncyCastle dependency - BC is the password module's alone.
 package kufuli
 
 private[kufuli] type KeyRepr = Array[Byte]

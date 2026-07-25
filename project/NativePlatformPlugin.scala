@@ -8,7 +8,7 @@ import snx.sbt.SNXImports.*
   */
 object NativePlatformPlugin {
 
-  /** Set by CI for the musl-static cells; absent or unset for every dynamic build. */
+  // Set by CI for the musl-static cells; absent or unset for every dynamic build.
   private val staticLink: Boolean = sys.env.get("KUFULI_STATIC_LINK").contains("true")
 
   /** The scala-native test-interface carries no semver scheme; `always` stops eviction failing the

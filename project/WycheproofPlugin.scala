@@ -88,10 +88,9 @@ object WycheproofPlugin extends AutoPlugin {
     )
   )
 
-  /** JVM class file constant pool limits UTF8 entries to 65535 bytes. Split large strings into
-    * chunks that stay under this limit, then concatenate at runtime via `StringBuilder`.
-    */
-  private val MaxChunkBytes = 60000 // conservative margin under 65535
+  // A class file's constant pool caps a UTF8 entry at 65535 bytes, so a large vector is split into
+  // chunks concatenated at runtime; 60000 leaves a conservative margin.
+  private val MaxChunkBytes = 60000
 
   private def renderSource(pkg: String, objectName: String, filename: String, jsonContent: String): String = {
     val escaped = escapeTripleQuote(jsonContent)
@@ -118,7 +117,7 @@ object WycheproofPlugin extends AutoPlugin {
     }
   }
 
-  /** Converts `hmac_sha256_test.json` -> `HmacSha256TestJson`. */
+  // hmac_sha256_test.json -> HmacSha256TestJson
   private def filenameToObjectName(filename: String): String = {
     val base = filename.stripSuffix(".json")
     base
@@ -127,11 +126,9 @@ object WycheproofPlugin extends AutoPlugin {
       .mkString + "Json"
   }
 
-  /** Escapes triple-quote sequences inside JSON content so the Scala string literal is valid. */
   private def escapeTripleQuote(s: String): String =
     s.replace("\"\"\"", "\\\"\\\"\\\"")
 
-  /** Splits a string into chunks where each chunk's UTF-8 byte encoding is <= maxBytes. */
   private def splitByByteLimit(s: String, maxBytes: Int): Seq[String] = {
     val result = Vector.newBuilder[String]
     val current = new StringBuilder

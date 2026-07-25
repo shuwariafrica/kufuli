@@ -33,7 +33,8 @@ import kufuli.*
 
 sealed abstract class X509Error(message: String) extends Exception(message) with NoStackTrace derives CanEqual
 
-// Payload-free cases in the class+object error DNA (type positions name the class).
+// Payload-free cases are a class plus a co-named object, and type positions name the CLASS: a union
+// of singleton types does not survive the TypeTest reification `either`/`catchAll` rely on.
 sealed abstract class PathInvalid(message: String) extends X509Error(message)
 object PathInvalid:
   sealed abstract class MalformedChain private[x509] () extends PathInvalid("unparseable certificate in chain")
@@ -157,7 +158,6 @@ private[x509] object X509:
       sigAlg <- read(s, afterTbs, 0x30)
       sigOid <- read(s, sigAlg.contentOff, 0x06)
       sigBits <- read(s, sigAlg.next, 0x03)
-      // walk TBS fields
       fields <- tbsFields(s, tbs)
     yield
       val ext = extensions(s, fields.exts)
@@ -204,16 +204,14 @@ private[x509] object X509:
       subject <- read(s, validity.next, 0x30)
       spki <- read(s, subject.next, 0x30)
       times <- parseValidity(s, validity)
-    yield
-      // scan the remainder of TBS for the extensions [3] wrapper
-      (
-        issuerDer = s.slice(sigAlgId.next, issuer.next).toArray,
-        subjectDer = s.slice(validity.next, subject.next).toArray,
-        notBefore = times.notBefore,
-        notAfter = times.notAfter,
-        spki = s.slice(subject.next, spki.next).toArray,
-        exts = scanExtensions(s, spki.next, tbs.next)
-      )
+    yield (
+      issuerDer = s.slice(sigAlgId.next, issuer.next).toArray,
+      subjectDer = s.slice(validity.next, subject.next).toArray,
+      notBefore = times.notBefore,
+      notAfter = times.notAfter,
+      spki = s.slice(subject.next, spki.next).toArray,
+      exts = scanExtensions(s, spki.next, tbs.next)
+    )
     end for
   end tbsFields
 
@@ -334,7 +332,6 @@ private[x509] object X509:
               case Right(t) => go(t.next, oidString(value.slice(t.contentOff, t.next).toArray) :: acc)
         go(seq.contentOff, Nil)
 
-  // The issuer's public key arm, from its SPKI, for signature verification.
   def issuerKey(spki: Array[Byte]): Option[ImportedPublicKey] =
     Der.peekSpki(Slice.of(spki)).toOption.map {
       case Der.Alg.Ed     => ImportedPublicKey.Ed(PublicKey.unsafe(keyRepr(spki)))
@@ -373,9 +370,16 @@ object Certificate:
       X509.parse(cert).getOrElse(throw new IllegalStateException("validated at construction")) // scalafix:ok DisableSyntax.throw
     def publicKey: ImportedPublicKey =
       X509.issuerKey(parsed.spki).getOrElse(ImportedPublicKey.Ed(PublicKey.unsafe(keyRepr(new Array[Byte](32)))))
+
+    /** Start of the validity window, as epoch seconds. */
     def notBefore: Long = parsed.notBefore
+
+    /** End of the validity window, as epoch seconds. */
     def notAfter: Long = parsed.notAfter
+
+    /** The dNSName SAN entries, which are what [[CertPath$ CertPath]] matches a hostname against. */
     def subjectAltDns: List[String] = parsed.sanDns
+  end extension
 end Certificate
 
 /** A validated DNS hostname for SAN matching; construct via [[Hostname$ Hostname]]. */
@@ -395,7 +399,9 @@ enum PathPurpose derives CanEqual:
 final case class VerifiedPath(leaf: Certificate, chain: List[Certificate])
 
 object CertPath:
-  /** ServerAuth by default (the TLS-client / DB-client path). */
+  /** Validates the chain for ServerAuth (the TLS-client / DB-client path) at the instant `at`, in
+    * epoch seconds - kufuli reads no clock.
+    */
   def verify(
     chain: List[Certificate],
     anchors: TrustAnchors,
@@ -446,12 +452,10 @@ private object engine:
   end build
 
   def validate(path: List[Certificate], at: Long, hostname: Option[Hostname], purpose: PathPurpose): EffIO[PathInvalid, Unit] =
-    // validity window for every cert
     val expired = path.exists(c => at < c.notBefore || at > c.notAfter)
     if expired then EffIO.fail(PathInvalid.Expired)
     else
       val leaf = path.head
-      // CA basic-constraints (cA TRUE) and pathLenConstraint on every issuer (all but the leaf).
       val issuers = path.tail
       if issuers.exists(c => !c.parsed.isCa) then EffIO.fail(PathInvalid.ConstraintViolated)
       else if pathLenExceeded(issuers) then EffIO.fail(PathInvalid.ConstraintViolated)

@@ -136,7 +136,8 @@ case object HS512 extends JWSAlg.Symmetric[HmacSha512]("HS512")
 /** A compact-serialised JWT; sign and verify via [[JWT$ JWT]]. */
 opaque type JWT = String
 object JWT:
-  // Payload-free rejections in the ratified class+object shape (type positions name the class).
+  // Payload-free rejections are a class plus a co-named object, and type positions name the CLASS:
+  // a union of singleton types does not survive the TypeTest reification `either`/`catchAll` rely on.
   sealed abstract class Rejected(message: String) extends JoseError(message)
   sealed abstract class Malformed private[jose] () extends Rejected("not a JWS compact serialization")
   case object Malformed extends Malformed
@@ -515,7 +516,6 @@ object JWT:
       else if parsed.algName != alg.name then EffIO.fail(KeyAlgorithmMismatch)
       else
         m.sign(key, parsed.input).flatMap { computed =>
-          // through the same constant-time discipline as core MAC verify
           if Slice.of(Array.from(computed.bytes.iterator)).constantTimeEquals(Slice.of(parsed.signature))
           then EffIO.from(checkClaims(parsed, policy, now))
           else EffIO.fail(BadSignature)

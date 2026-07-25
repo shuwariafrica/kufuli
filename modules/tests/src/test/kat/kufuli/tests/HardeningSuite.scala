@@ -29,9 +29,6 @@ import kufuli.jose.*
 import kufuli.tests.support.*
 import kufuli.x509 as x5
 
-// Regression tests for the audit hardening fixes: OCSP certStatus parse (was reporting Good for a
-// revoked cert), the JWE loud-failure (was faking success), and the bounded JSON/COSE recursion
-// (was a stack-overflow DoS on an unsigned token).
 class HardeningSuite extends munit.CatsEffectSuite:
 
   // Minimal DER emitter for the OCSP fixtures.
@@ -106,9 +103,7 @@ nDMs9Kp6zwtMzwY2stmLBVOUBGMX780=
   }
 
   test("X25519 small-order points are rejected at import (full blocklist, non-canonical, and SPKI)") {
-    // The seven low-order Curve25519 points (RFC 7748 section 6.1). The shared import rejects each as
-    // WeakPoint on every backend, so the degenerate peer is no longer constructible through the public
-    // API and `agree` stays total. Byte 31's high bit is masked, catching a non-canonical encoding.
+    // The seven low-order Curve25519 points (RFC 7748 section 6.1).
     val blocklist = List(
       "0000000000000000000000000000000000000000000000000000000000000000",
       "0100000000000000000000000000000000000000000000000000000000000000",
