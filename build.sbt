@@ -230,6 +230,7 @@ def wycheproofSettings: List[Setting[?]] = List(
   wycheproofTargetPackage := "kufuli.tests.wycheproof",
   wycheproofVectorFiles := Seq(
     "aes_gcm_test.json",
+    "aes_kwp_test.json",
     "chacha20_poly1305_test.json",
     "ecdsa_secp256r1_sha256_p1363_test.json",
     "ed25519_test.json"

@@ -491,13 +491,20 @@ private[kufuli] object awslc:
   private def rsaScheme(scheme: Scheme[Rsa]): (scheme: CInt, md: CInt) = scheme.runtimeChecked match
     case RsaPss(hash)   => (scheme = SchemeRsaPss, md = mdCode(hash))
     case RsaPkcs1(hash) => (scheme = SchemeRsaPkcs1, md = mdCode(hash))
+  // An RSA operation writes at most one modulus (a signature, an OAEP ciphertext, or the modulus
+  // itself) and the stored encoding it derives from embeds that modulus, so that encoding's own
+  // length is a sufficient capacity at any key size - where a fixed buffer would cap the modulus
+  // this backend accepts.
   private def rsaSigner: Signer[Rsa] = new Signer[Rsa]:
     def sign(key: PrivateKey[Rsa], data: Slice, scheme: Scheme[Rsa]): UEffIO[Signature[Rsa]] = op {
       val rsa = rsaScheme(scheme)
       key.read { der =>
+        val capacity = der.length
         withHandle(parsePriv(der)) { pkey =>
           Signature.unsafe[Rsa](
-            collect(1024)((o, l) => kufuli_pkey_sign(pkey, rsa.scheme, rsa.md, data.unsafePtr, data.length.toCSize, o, l, 1024.toCSize))
+            collect(capacity)((o, l) =>
+              kufuli_pkey_sign(pkey, rsa.scheme, rsa.md, data.unsafePtr, data.length.toCSize, o, l, capacity.toCSize)
+            )
           )
         }
       }
@@ -518,12 +525,17 @@ private[kufuli] object awslc:
       }
     }
 
-  private def agreementOf[A <: AgreementAlgorithm]: Agreement[A] = new Agreement[A]:
+  // aws-lc's EVP_PKEY_derive treats an output buffer smaller than the field as a silent truncation
+  // rather than an error, so the capacity is the curve's exact secret length and a short return is
+  // raised as a defect.
+  private def agreementOf[A <: AgreementAlgorithm](secretLength: Int): Agreement[A] = new Agreement[A]:
     def agree(priv: PrivateKey[A], pub: PublicKey[A]): UEffIO[SharedSecret] = op {
       priv.read { der =>
         withHandle(parsePriv(der)) { privH =>
           withHandle(parsePub(Slice.of(keyBytes(pub.repr)))) { pubH =>
-            SharedSecret.unsafe(collect(64)((o, l) => kufuli_pkey_derive(privH, pubH, o, l, 64.toCSize)))
+            val secret = collect(secretLength)((o, l) => kufuli_pkey_derive(privH, pubH, o, l, secretLength.toCSize))
+            require1(if secret.length == secretLength then 1 else 0)
+            SharedSecret.unsafe(secret)
           }
         }
       }
@@ -663,19 +675,22 @@ private[kufuli] object awslc:
 
   private[kufuli] val oaep: Oaep = new Oaep:
     def encrypt(key: PublicKey[Rsa], plaintext: Slice, scheme: RsaOaep): UEffIO[Slice] = op {
-      withHandle(parsePub(Slice.of(keyBytes(key.repr)))) { pkey =>
+      val spki = keyBytes(key.repr)
+      val capacity = spki.length
+      withHandle(parsePub(Slice.of(spki))) { pkey =>
         Slice.of(
-          collect(1024)((o, l) =>
-            kufuli_pkey_oaep_encrypt(pkey, mdCode(scheme.hash), plaintext.unsafePtr, plaintext.length.toCSize, o, l, 1024.toCSize)
+          collect(capacity)((o, l) =>
+            kufuli_pkey_oaep_encrypt(pkey, mdCode(scheme.hash), plaintext.unsafePtr, plaintext.length.toCSize, o, l, capacity.toCSize)
           )
         )
       }
     }
     def decrypt(key: PrivateKey[Rsa], ciphertext: Slice, scheme: RsaOaep): EffIO[AuthFailed, Slice] = opE {
       key.read { der =>
+        val capacity = der.length
         withHandle(parsePriv(der)) { pkey =>
-          collectE(1024, AuthFailed)((o, l) =>
-            kufuli_pkey_oaep_decrypt(pkey, mdCode(scheme.hash), ciphertext.unsafePtr, ciphertext.length.toCSize, o, l, 1024.toCSize)
+          collectE(capacity, AuthFailed)((o, l) =>
+            kufuli_pkey_oaep_decrypt(pkey, mdCode(scheme.hash), ciphertext.unsafePtr, ciphertext.length.toCSize, o, l, capacity.toCSize)
           ).map(Slice.of(_))
         }
       }
@@ -786,12 +801,16 @@ private[kufuli] object awslc:
     def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[Rsa]] =
       opE(storePriv(parsePriv(der), Pkcs8Max).map(PrivateKey.unsafe))
     def components(key: PublicKey[Rsa]): EffIO[KeyNotExportable, Rsa.Components] = op {
-      withHandle(parsePub(Slice.of(keyBytes(key.repr)))) { h =>
-        val nBuf = new Array[Byte](1024)
-        val eBuf = new Array[Byte](16)
+      val spki = keyBytes(key.repr)
+      val capacity = spki.length
+      withHandle(parsePub(Slice.of(spki))) { h =>
+        val nBuf = new Array[Byte](capacity)
+        val eBuf = new Array[Byte](capacity)
         val nLen = stackalloc[CSize]()
         val eLen = stackalloc[CSize]()
-        require1(kufuli_pkey_rsa_components(h, Slice.of(nBuf).unsafePtr, nLen, 1024.toCSize, Slice.of(eBuf).unsafePtr, eLen, 16.toCSize))
+        require1(
+          kufuli_pkey_rsa_components(h, Slice.of(nBuf).unsafePtr, nLen, capacity.toCSize, Slice.of(eBuf).unsafePtr, eLen, capacity.toCSize)
+        )
         Rsa.Components(IArray.from(nBuf.take((!nLen).toInt)), IArray.from(eBuf.take((!eLen).toInt)))
       }
     }
@@ -854,10 +873,10 @@ private[kufuli] object awslc:
     given Verifier[P521] = ecVerifier
     given Verifier[Rsa] = rsaVerifier
   private[kufuli] trait AgreementAll:
-    given Agreement[X25519] = agreementOf
-    given Agreement[P256] = agreementOf
-    given Agreement[P384] = agreementOf
-    given Agreement[P521] = agreementOf
+    given Agreement[X25519] = agreementOf(32)
+    given Agreement[P256] = agreementOf(32)
+    given Agreement[P384] = agreementOf(48)
+    given Agreement[P521] = agreementOf(66)
   private[kufuli] trait KemAll:
     given Kem[MlKem768] = kemOf(KemMlKem768, MlKem768)
     given Kem[MlKem1024] = kemOf(KemMlKem1024, MlKem1024)
