@@ -11,8 +11,8 @@ them, nonce-misuse-resistant AEADs (XChaCha20-Poly1305, AES-256-GCM-SIV) and fir
 remove the classic footguns.
 
 > Status: under active development. The public API below is complete and verified on all four
-> platforms; the JVM and Native backends are implemented, the JS (node and browser) backends are in
-> progress.
+> platforms; the JVM, Node, and Native backends are implemented, the browser (Web Crypto) backend is
+> in progress.
 
 ## Install
 
@@ -55,22 +55,25 @@ Sealing generates the nonce internally, so it can never be reused by accident. B
 self-describing and versioned, and a `Keyring` makes rotation a value:
 
 ```scala
+import boilerplate.Slice
 import kufuli.*
 
+val aad = Slice.of("user-42".getBytes)
+
 for
-  key   <- AesGcm256.generate                          // or AesGcm256.key(rawBytes)
-  box   <- key.seal("account-number".getBytes, aad = "user-42".getBytes)
-  plain <- key.open(box, aad = "user-42".getBytes)      // EffIO[AuthFailed, Array[Byte]]
-yield box.bytes                                        // the stored form; SealedBox.of parses it back
+  key   <- AesGcm256.generate                     // SecretKey.of(AesGcm256)(raw) parses a stored key
+  box   <- key.seal(Slice.of(accountNumber), aad)
+  plain <- key.open(box, aad)                     // EffIO[AuthFailed, Slice]
+yield box.bytes                                   // the stored form; SealedBox.of parses it back
 ```
 
-A `Keyring` seals under its primary key and still opens anything it holds, so rotation is a value:
+A `Keyring` seals under its primary key and still opens anything it holds, so rotation is a value.
+Ring construction and rotation are pure, and reject a duplicate id:
 
 ```scala
 for
-  ring0 <- EffIO.delay(Keyring.of(KeyId.of(1) -> key))
-  ring1 <- EffIO.delay(ring0.rotated(KeyId.of(2) -> newKey))
-  box   <- ring1.seal(secret)                          // under the new primary; older keys still open
+  ring <- EffIO.from(Keyring.of(KeyId.of(1) -> key2024).flatMap(_.rotated(KeyId.of(2) -> key2025)))
+  box  <- ring.seal(Slice.of(secret))             // under the new primary; retired keys still open
 yield box
 ```
 
@@ -83,27 +86,28 @@ Algorithm-typed keys make cross-algorithm and weak-hash misuse a type error:
 ```scala
 for
   kp  <- Ed25519.generate
-  sig <- kp.privateKey.sign(message)
-  _   <- kp.publicKey.verify(message, sig)                     // EffIO[SignatureRejected, Unit]
+  sig <- kp.privateKey.sign(Slice.of(message))
+  _   <- kp.publicKey.verify(Slice.of(message), sig)           // EffIO[SignatureRejected, Unit]
 yield ()
 ```
 
 ### Issue and check JWTs
 
-The `alg` fixes the key type, the audience and algorithm allowlist are required, and `alg: none` is
-unrepresentable:
+The `alg` fixes the key type, the audience and algorithm allowlist are required, `alg: none` is
+unrepresentable, and a token carrying no `exp` is rejected unless the policy opts out by name.
+Nothing here reads a clock: sign and verify take the instant (epoch seconds) from the caller.
 
 ```scala
 import kufuli.jose.*
 
-val claims = JWT.Claims(subject = Some("user-1"), audiences = Set("api"))
-val policy = JWT.Policy(audience = "api", algorithms = Set(ES256, EdDSA))
+val claims = JWT.Claims.empty.subject("user-1").audience("api").expiresIn(1.hour)
+val policy = JWT.Policy("api", Set(ES256, EdDSA))
 
 for
   kp    <- P256.generate
-  token <- JWT.sign(claims, ES256)(kp.privateKey)              // only accepts a P-256 private key
-  who   <- JWT.verify(token.compact, jwks, policy)             // EffIO[JWT.Rejected, JWT.Verified]
-yield ()
+  token <- JWT.sign(claims, ES256, "key-1", now)(kp.privateKey) // only accepts a P-256 private key
+  who   <- JWT.verify(token.compact, jwks, policy, now)         // EffIO[JWT.Rejected, JWT.Verified]
+yield who
 ```
 
 ### Hash passwords
@@ -131,9 +135,9 @@ in both directions, and the handle enforces and reports RFC 9001 usage budgets:
 
 ```scala
 key.cipher.use: c =>                                           // Resource[IO, Cipher[AesGcm256]]
-  Nonce.xorInto(iv, sequence, nonceBuf, 0)                     // RFC 8446 nonce derivation
-  c.encrypt(out, plaintext, aad, nonce) match
-    case Right(n)             => socket.write(out.take(n))
+  Nonce.xorInto(iv, sequence, nonceBuf)                        // RFC 8446 nonce derivation
+  c.encrypt(out, plaintext, aad, nonceBuf) match
+    case Right(n)              => socket.write(out.take(n))
     case Left(BudgetExhausted) => // rotate keys ahead of the limit via c.budget
 ```
 
@@ -148,7 +152,7 @@ ECDSA, EdDSA, X25519, and RSA - is available everywhere. The rest is backend-dep
 | Capability                            | JVM (JCA) | Node | Native (aws-lc) | Browser |
 | ------------------------------------- | :-------: | :--: | :-------------: | :-----: |
 | ChaCha20-Poly1305, AES-KWP, `Cipher`  |    yes    | yes  |       yes       |   no    |
-| ML-KEM 768/1024                       |    yes    |  no  |       yes       |   no    |
+| ML-KEM 768/1024                       |    yes    | yes  |       yes       |   no    |
 | XChaCha20-Poly1305, AES-256-GCM-SIV   |    no     |  no  |       yes       |   no    |
 | Argon2id                              |    yes    | yes  |       yes       |   no    |
 
@@ -160,7 +164,7 @@ hashing, and `kufuli.unsafe` are not part of it.
 
 - Scala 3.8+.
 - JVM: JDK 25+ (the in-JDK JCA ML-KEM provider).
-- Node.js: 24+ (Argon2id needs 24.7+).
+- Node.js: 24.7+ (the floor for the native Argon2id binding); ML-KEM is verified against 24.18.
 - Scala Native: 0.5+ with a C toolchain; the native backend links aws-lc, provisioned by sbt-snx.
 
 ## Licence

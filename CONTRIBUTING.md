@@ -59,9 +59,12 @@ dependencies exist:
 
 - `src/test/scala` runs on all four artifacts: the pure value-layer checks, the structural misuse
   negatives, and the core round-trip flows.
-- `src/test/extended` (JVM, Native, Node) adds the Direct-gated record-machine suites and the jose,
+- `src/test/kat` (JVM, Node, Native) holds the known-answer and adversarial corpus against a real
+  backend: RFC/NIST vectors, the Wycheproof suites, the budget and `kufuli.unsafe` vectors, the
+  password vectors, the jose verification suite, and the TLS/QUIC-shaped end-to-end flow.
+- `src/test/extended` (JVM, Node, Native) adds the Direct-gated record-machine suites and the jose,
   x509, and password suites.
-- `src/test/pq` (JVM, Native) adds the ML-KEM hybrid flow.
+- `src/test/pq` (JVM, Node, Native) adds the ML-KEM hybrid flow.
 - `src/test/node` and `src/test/browser` hold the per-artifact capability-boundary checks, proved by
   `summon` for presence and `typeChecks` for absence.
 

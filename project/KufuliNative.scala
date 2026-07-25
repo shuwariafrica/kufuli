@@ -19,13 +19,11 @@ object KufuliNative {
 
   private val awsLcRepository: String = "https://github.com/aws/aws-lc.git"
 
-  /** Crypto-only, reproducible. `BUILD_LIBSSL`, `BUILD_TOOL` and `BUILD_TESTING` each default ON;
-    * leaving `BUILD_LIBSSL`/`BUILD_TESTING` on would also pull in a C++ toolchain the crypto build
-    * does not otherwise need. `DISABLE_PERL=OFF` makes Perl a `find_package(REQUIRED)` hard
-    * failure, and `ENABLE_SOURCE_MODIFICATION` defaults ON and writes into the checkout, which a
-    * pinned build must not do. sbt-snx supplies `CMAKE_BUILD_TYPE` and forces
-    * `BUILD_SHARED_LIBS=OFF` itself.
-    */
+  // Crypto-only, reproducible. BUILD_LIBSSL, BUILD_TOOL and BUILD_TESTING each default ON; leaving
+  // BUILD_LIBSSL/BUILD_TESTING on would also pull in a C++ toolchain the crypto build does not
+  // otherwise need. DISABLE_PERL=OFF makes Perl a find_package(REQUIRED) hard failure, and
+  // ENABLE_SOURCE_MODIFICATION defaults ON and writes into the checkout, which a pinned build must
+  // not do. sbt-snx supplies CMAKE_BUILD_TYPE and forces BUILD_SHARED_LIBS=OFF itself.
   private val configureFlags: Seq[String] = Seq(
     "-DBUILD_LIBSSL=OFF",
     "-DBUILD_TOOL=OFF",
@@ -36,20 +34,18 @@ object KufuliNative {
     "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"
   )
 
-  /** aws-lc's CMake Visual Studio generator cannot assemble, so the build is driven by Ninja from
-    * an environment where the MSVC toolchain is already on PATH (`vcvarsall.bat`). sbt-snx's CMake
-    * backend never passes `-DCMAKE_C_COMPILER`, so an `SNX.clang` override would not reach this
-    * build (sbt-snx #19) - the discovered PATH compiler must itself be the MSVC one.
-    * `CMAKE_MSVC_RUNTIME_LIBRARY` (honoured through aws-lc's `CMP0091 NEW`) links the CRT
-    * statically to match the Scala Native link and libargon2; a mismatched CRT leaves aws-lc's
-    * dynamic `__imp_` ucrt symbols unresolved. Plain `MultiThreaded` (release `/MT`) matches the
-    * link's `-fms-runtime-lib=static` even for a Debug build. The per-arch assembler handling that
-    * lets this apply cleanly is in the cmake selector.
-    */
+  // aws-lc's CMake Visual Studio generator cannot assemble, so the build is driven by Ninja from an
+  // environment where the MSVC toolchain is already on PATH (vcvarsall.bat). sbt-snx's CMake backend
+  // never passes -DCMAKE_C_COMPILER, so an SNX.clang override would not reach this build (sbt-snx
+  // #19) - the discovered PATH compiler must itself be the MSVC one. CMAKE_MSVC_RUNTIME_LIBRARY
+  // (honoured through aws-lc's CMP0091 NEW) links the CRT statically to match the Scala Native link
+  // and libargon2; a mismatched CRT leaves aws-lc's dynamic __imp_ ucrt symbols unresolved. Plain
+  // MultiThreaded (release /MT) matches the link's -fms-runtime-lib=static even for a Debug build.
+  // The per-arch assembler handling that lets this apply cleanly is in the cmake selector.
   private val windowsFlags: Seq[String] =
     Seq("-GNinja", "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded")
 
-  /** The link closure a static archive cannot carry itself. */
+  // The link closure a static archive cannot carry itself.
   private val closure: PartialFunction[NativeRuntime, Flags] = { case Linux(_, _) =>
     Flags.libraries("pthread", "dl")
   }
@@ -90,16 +86,13 @@ object KufuliNative {
 
   private val argon2Repository: String = "https://github.com/P-H-C/phc-winner-argon2.git"
 
-  /** Build libargon2 as a static archive with the reference Makefile.
-    *
-    * `NO_THREADS=1` computes every lane on the calling thread: the Argon2id output depends on the
-    * lane count, not on how many OS threads compute them, so the hash is byte-identical while the
-    * build gains no pthread dependency (and never spawns a thread on the musl static row).
-    * `OPTTARGET=` empties the Makefile's `-march`, so the archive is the compiler's default
-    * baseline rather than `-march=native` - reproducible and safe to cross-compile. sbt-snx
-    * requires a backend to write its outputs under the context staging directory, so the source is
-    * copied there and built out of the cached clone.
-    */
+  // NO_THREADS=1 computes every lane on the calling thread: the Argon2id output depends on the lane
+  // count, not on how many OS threads compute them, so the hash is byte-identical while the build
+  // gains no pthread dependency (and never spawns a thread on the musl static row). OPTTARGET=
+  // empties the Makefile's -march, so the archive is the compiler's default baseline rather than
+  // -march=native - reproducible and safe to cross-compile. sbt-snx requires a backend to write its
+  // outputs under the context staging directory, so the source is copied there and built out of the
+  // cached clone.
   private def buildArgon2(context: BuildContext): Artefacts = {
     val buildDir = context.staging / "build"
     IO.copyDirectory(context.source, buildDir)

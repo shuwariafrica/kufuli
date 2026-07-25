@@ -1,5 +1,3 @@
-import WycheproofPlugin.autoImport.*
-
 scalaVersion := scala3
 organization := "africa.shuwari"
 startYear := Some(2026)
@@ -15,8 +13,6 @@ scmInfo := Some(
   )
 )
 
-// kufuli requires JDK 25 or newer: the JVM backend uses JCA ML-KEM (JEP 496, in-JDK from 24) and
-// the ecosystem's LTS floor is 25.
 initialize := {
   val _ = initialize.value
   val running = sys.props.getOrElse("java.specification.version", "0")
@@ -80,7 +76,6 @@ val `kufuli-password` =
     .settings(publishSettings)
     .settings(description := "Argon2id password hashing (PHC codec, policy rehash) over kufuli")
     .settings(libraryDependencies ++= Seq(boilerplate, boilerplateEffect))
-    // BouncyCastle stays password-module + JVM-only: the Argon2id provider for the JVM backend.
     .jvmPlatform(
       Seq(scala3),
       Seq.empty[VirtualAxis],
@@ -113,10 +108,6 @@ val `kufuli-x509` =
       (p: Project) => p.settings(NativePlatformPlugin.schemeSettings ++ NativePlatformPlugin.provisionAwsLc).dependsOn(kufuli.native(scala3))
     )
 
-// Capability-gated test source sets: `scala` runs on all four platforms; `extended` (jvm/native/
-// node) adds the Direct-gated and jose/x509/password suites; `pq` (jvm/native) adds ML-KEM; `node`
-// and `browser` hold the per-artifact capability-boundary checks. The browser row depends on
-// kufuli-browser only, so its universal suite is core-scoped by construction.
 val `kufuli-tests` =
   projectMatrix
     .in(file("modules/tests"))
@@ -216,8 +207,6 @@ def jsNodeSourceDirs: List[Setting[?]] = List(
   Test / unmanagedSourceDirectories += (Test / sourceDirectory).value / "scalajs-node"
 )
 
-// Core-only extra source sets: the stub backend (non-JVM rows) and the synchronous `unsafe` floor
-// (non-browser rows).
 def coreStubDir: List[Setting[?]] =
   List(Compile / unmanagedSourceDirectories += (Compile / sourceDirectory).value / "scala-stub")
 def coreDirectDir: List[Setting[?]] =
@@ -234,7 +223,6 @@ def testDir(name: String): List[Setting[?]] = List(
   Test / unmanagedSourceDirectories += (Test / sourceDirectory).value / name
 )
 
-// p1363 gives raw r||s signatures (kufuli's Signature form); ML-KEM decaps is covered in RealBackendSuite.
 def wycheproofSettings: List[Setting[?]] = List(
   wycheproofTargetPackage := "kufuli.tests.wycheproof",
   wycheproofVectorFiles := Seq(
@@ -327,15 +315,3 @@ def publishSettings: List[Setting[?]] = List(
 
 addCommandAlias("format", "scalafixAll; scalafmtAll; scalafmtSbt; headerCreateAll")
 addCommandAlias("check", "scalafixAll --check; scalafmtCheckAll; scalafmtSbtCheck; headerCheckAll")
-
-lazy val showConfigurations = taskKey[Unit]("Shows all configurations")
-
-lazy val inAnyProjectAndConfiguration = ScopeFilter(inAnyProject, inAnyConfiguration)
-
-showConfigurations := Def.uncached {
-  val configs = configuration.all(inAnyProjectAndConfiguration).value.toSet
-
-  configs.filter(_.isPublic).foreach { c =>
-    println(s"${c.name} - ${c.description}")
-  }
-} // No .value here!

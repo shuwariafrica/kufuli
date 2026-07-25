@@ -29,10 +29,6 @@ import kufuli.*
 import kufuli.jose.*
 import kufuli.tests.support.*
 
-// Jose token verification against the real backends: the rejection taxonomy (key absence vs
-// key/algorithm mismatch), expiry required by default with a named opt-out, and the header-keyed
-// DPoP profile, plus the RFC 9449 interop fixture. Cross-family header-key rejection is a compile
-// fact.
 class JoseVerificationSuite extends munit.CatsEffectSuite:
 
   private val now = 1_700_000_000L

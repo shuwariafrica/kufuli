@@ -18,9 +18,8 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-// Native backend unit (aws-lc): bytes-backed keys; the primary platform carries the fullest set.
-// XChaCha20-Poly1305 and AES-256-GCM-SIV are aws-lc EVP_AEADs; ML-KEM is FIPS 203 in aws-lc. This
-// file is the Native capability table; instance bodies are the real aws-lc backend (`awslc.scala`).
+// Native capability table (aws-lc). It carries the widest set: XChaCha20-Poly1305 and
+// AES-256-GCM-SIV are aws-lc EVP_AEADs, available on no other backend.
 package kufuli
 
 private[kufuli] type KeyRepr = Array[Byte]
