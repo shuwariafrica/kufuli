@@ -37,7 +37,38 @@ class WycheproofSuite extends munit.CatsEffectSuite:
   private def hb(s: String): Array[Byte] =
     if s.isEmpty then Array.emptyByteArray else s.grouped(2).map(Integer.parseInt(_, 16).toByte).toArray
 
+  private def hx(b: Array[Byte]): String = b.map(x => f"${x & 0xff}%02x").mkString
+
   private def parse(json: String): Js = readFromString[Js](json)
+
+  // FIPS 203 KeyGen and Decaps against the published (seed, ek, c, K) quadruples: the seed import is
+  // the only way to reach a decapsulation key, so without it these vectors are unexercisable. Every
+  // `invalid` case in this corpus is a seed or ciphertext length violation, which kufuli refuses at
+  // its own typed constructors.
+  private def runMlKem[K <: KemAlgorithm](json: String, spec: KemSpec[K])(using keys: KemKeys[K], kem: Kem[K]): IO[Unit] =
+    val cases = for
+      g <- parse(json).field("testGroups").arr.toList
+      t <- g.field("tests").arr.toList
+    yield (t.field("seed").str, t.field("c").str, t.field("result").str, t.field("tcId").int, t)
+    check(cases.nonEmpty, s"ML-KEM corpus for ${spec.publicKeyLength}-byte keys is empty - vector embedding failed") *> cases
+      .traverse { (seed, c, res, tc, t) =>
+        if res != "valid" then
+          val rejected = hb(seed).length != 64 || KemCiphertext.of(spec)(hb(c)).isLeft
+          IO.pure(Option.unless(rejected)(s"tc$tc accepted a length-invalid vector"))
+        else
+          val ct = KemCiphertext.of(spec)(hb(c)).toOption.get
+          for
+            kp <- keys.fromSeed(Slice.of(hb(seed))).either
+            pair <- IO.fromOption(kp.toOption)(new AssertionError(s"tc$tc seed import failed: $kp"))
+            ek <- keys.raw(pair.publicKey).absolve
+            shared <- kem.decapsulate(pair.privateKey, ct).absolve
+            secret <- shared.use(s => hx(s.toArray)).absolve
+          yield Option
+            .when(hx(Array.from(ek.iterator)) != t.field("ek").str)(s"tc$tc ek mismatch")
+            .orElse(Option.when(secret != t.field("K").str)(s"tc$tc shared secret mismatch"))
+      }
+      .flatMap(rs => check(rs.flatten.isEmpty, s"${rs.flatten.size} mismatches: ${rs.flatten.take(6).mkString("; ")}"))
+  end runMlKem
 
   private def runVerify(json: String, key: Js => String, verify: (String, String, String) => IO[Boolean]): IO[Unit] =
     val cases = for
@@ -129,6 +160,10 @@ class WycheproofSuite extends munit.CatsEffectSuite:
           case Left(_) => IO.pure(false)
         }
     )
+  }
+
+  test("Wycheproof ML-KEM-768/1024: FIPS 203 KeyGen and Decaps over the published seeds") {
+    runMlKem(Mlkem768TestJson.json, MlKem768) *> runMlKem(Mlkem1024TestJson.json, MlKem1024)
   }
 
   test("Wycheproof Ed25519: verify corpus") {

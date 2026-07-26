@@ -347,4 +347,22 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
     yield ()
     end for
   }
+  test("a certificate whose subject key kufuli cannot import still parses and says so") {
+    // A DSA SubjectPublicKeyInfo (1.2.840.10040.4.1): well-formed X.509, outside kufuli's families.
+    val dsaSpki =
+      seq(seq(oid(Array[Byte](0x2a, 0x86.toByte, 0x48, 0xce.toByte, 0x38, 0x04, 0x01))), tlv(0x03, Array[Byte](0) ++ Array.fill[Byte](20)(7)))
+    for
+      kp <- Ed25519.generate.absolve
+      der <- sign(tbsOf(9, "unsupported", "unsupported", dsaSpki, notBefore, notAfter, Nil), kp.privateKey)
+      cert <- IO.fromEither(x5.Certificate.fromDer(der).left.map(e => new AssertionError(s"parse: $e")))
+      _ <- check(cert.publicKey.swap.toOption.contains(InvalidKey.Unsupported),
+                 s"unsupported SPKI reports itself, got ${cert.publicKey.isRight}"
+           )
+      _ <- check(cert.subjectAltDns.isEmpty && cert.der.length == der.length, "the certificate stays inspectable")
+      mine <- selfSigned("ok.example", List(endEntity))
+      good <- IO.fromEither(x5.Certificate.fromDer(mine.der).left.map(e => new AssertionError(s"parse: $e")))
+      _ <- check(good.publicKey.isRight, "a supported SPKI yields its key")
+    yield ()
+    end for
+  }
 end X509HardeningSuite

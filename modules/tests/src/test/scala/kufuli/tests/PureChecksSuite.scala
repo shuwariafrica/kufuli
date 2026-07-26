@@ -105,4 +105,42 @@ class PureChecksSuite extends munit.FunSuite:
     assert(Signature.fromDer(P256)(Array[Byte](0x30, 0x00)).isLeft, "empty integers rejected")
     assert(Signature.fromDer(P256)(Array.emptyByteArray).isLeft, "empty der rejected")
   }
+
+  test("one signature has one DER spelling: trailing bytes, long-form lengths and padded integers rejected") {
+    val raw = Array.tabulate[Byte](64)(i => (i + 1).toByte)
+    val der = Array.from(Signature.fromRaw(P256)(raw).toOption.get.der.iterator)
+    assert(Signature.fromDer(P256)(der).isRight, "the canonical encoding is accepted")
+    assert(Signature.fromDer(P256)(der :+ 0.toByte).isLeft, "a byte past the SEQUENCE is rejected")
+    val longForm = Array[Byte](0x30, 0x81.toByte, der(1)) ++ der.drop(2)
+    assert(Signature.fromDer(P256)(longForm).isLeft, "a length not in its shortest form is rejected")
+    // SEQUENCE { INTEGER 00 00 01, INTEGER 01 }: r carries a zero byte its sign bit does not need.
+    val paddedInteger = Array[Byte](0x30, 0x08, 0x02, 0x03, 0x00, 0x00, 0x01, 0x02, 0x01, 0x01)
+    assert(Signature.fromDer(P256)(paddedInteger).isLeft, "a non-minimal INTEGER is rejected")
+    val negative = Array[Byte](0x30, 0x06, 0x02, 0x01, 0x80.toByte, 0x02, 0x01, 0x01)
+    assert(Signature.fromDer(P256)(negative).isLeft, "a negative INTEGER is rejected")
+  }
+
+  test("the shared DER peek requires the outer TLV to span the whole blob") {
+    val point = Array.tabulate[Byte](32)(i => (i + 1).toByte)
+    val spki = Array[Byte](0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00) ++ point
+    assertEquals(Der.peekSpki(Slice.of(spki)), Right(Der.Alg.X), "the canonical blob dispatches")
+    assert(Der.peekSpki(Slice.of(spki ++ Array.fill[Byte](32)(0x11))).isLeft, "bytes past the SEQUENCE are rejected")
+    assert(Der.peekSpki(Slice.of(Array[Byte](0x30, 0x81.toByte, 0x2a) ++ spki.drop(2))).isLeft, "a long-form short length is rejected")
+    assert(Der.spkiPublicBits(Slice.of(spki), 32).exists(_.contentEquals(Slice.of(point))), "the point is located by walking")
+    assert(Der.spkiPublicBits(Slice.of(spki), 31).isLeft, "a point of the wrong width is rejected")
+  }
+
+  test("Base32 (RFC 4648 s6, unpadded upper case): vectors both directions, strict rejection") {
+    val vectors =
+      List("" -> "", "f" -> "MY", "fo" -> "MZXQ", "foo" -> "MZXW6", "foob" -> "MZXW6YQ", "fooba" -> "MZXW6YTB", "foobar" -> "MZXW6YTBOI")
+    vectors.foreach { (plain, encoded) =>
+      assertEquals(Base32.encode(plain.getBytes("US-ASCII")), encoded)
+      assert(Base32.decode(encoded).exists(_.sameElements(plain.getBytes("US-ASCII"))), s"decode '$encoded'")
+    }
+    assert(Base32.decode("my").isLeft, "lower case rejected")
+    assert(Base32.decode("MY======").isLeft, "padding rejected")
+    assert(Base32.decode("M").isLeft && Base32.decode("MZX").isLeft && Base32.decode("MZXW6Y").isLeft, "impossible lengths rejected")
+    assert(Base32.decode("MZ").isLeft, "non-canonical trailing bits rejected")
+    assert(Base32.decode("M1").isLeft && Base32.decode("M0").isLeft && Base32.decode("M8").isLeft, "non-alphabet characters rejected")
+  }
 end PureChecksSuite

@@ -22,6 +22,7 @@ package kufuli.tests
 
 import boilerplate.Slice
 import boilerplate.effect.*
+import cats.effect.IO
 import cats.syntax.all.*
 
 import kufuli.*
@@ -127,7 +128,96 @@ nDMs9Kp6zwtMzwY2stmLBVOUBGMX780=
       _ <- check(hb.swap.toOption.contains(InvalidKey.WeakPoint), s"non-canonical order-8 (high bit) -> WeakPoint, got $hb")
       sp <- PublicKey.fromSpki(Slice.of(xSpki)).either
       _ <- check(sp.swap.toOption.contains(InvalidKey.WeakPoint), s"SPKI-wrapped order-8 -> WeakPoint, got $sp")
+      ty <- PublicKey.fromSpki(X25519)(Slice.of(xSpki)).either
+      _ <- check(ty.swap.toOption.contains(InvalidKey.WeakPoint), s"the typed SPKI import carries the blocklist, got $ty")
+      // The point is positioned by walking the encoding, so bytes appended past the SEQUENCE cannot
+      // move the check off it; both the dispatching and the typed import refuse the blob outright.
+      evil = xSpki ++ Array.fill[Byte](32)(0x11)
+      ev <- PublicKey.fromSpki(Slice.of(evil)).either
+      _ <- check(ev == Left(InvalidKey.Malformed), s"trailing bytes after the SPKI -> Malformed, got $ev")
+      evt <- PublicKey.fromSpki(X25519)(Slice.of(evil)).either
+      _ <- check(evt == Left(InvalidKey.Malformed), s"typed import rejects the same blob, got $evt")
     yield ()
+    end for
+  }
+
+  test("an import is bound to the family and curve the caller named, not to what the encoding says") {
+    for
+      ed <- Ed25519.generate.absolve
+      edSpki <- expectRight("ed spki")(ed.publicKey.spki)
+      asX <- summon[XKeys].fromSpki(Slice.of(Array.from(edSpki.iterator))).either
+      _ <- check(asX.isLeft, s"an Ed25519 SPKI must not import as X25519, got $asX")
+      p256 <- P256.generate.absolve
+      p256Spki <- expectRight("p256 spki")(p256.publicKey.spki)
+      asP384 <- summon[EcKeys[P384]].fromSpki(Slice.of(Array.from(p256Spki.iterator))).either
+      _ <- check(asP384.isLeft, s"a P-256 SPKI must not import as P-384, got $asP384")
+      p256Pkcs8 <- expectRight("p256 pkcs8")(p256.privateKey.pkcs8)
+      privP384 <- summon[EcKeys[P384]].fromPkcs8(Slice.of(Array.from(p256Pkcs8.iterator))).either
+      _ <- check(privP384.isLeft, s"a P-256 PKCS#8 must not import as P-384, got $privP384")
+    yield ()
+  }
+
+  test("a stored public key exports at exactly its wire width whatever encoding it arrived in") {
+    val point = Array.tabulate[Byte](32)(i => (i + 3).toByte)
+    val canonical = Array[Byte](0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00) ++ point
+    val longForm = Array[Byte](0x30, 0x81.toByte, 0x2a) ++ canonical.drop(2)
+    for
+      k <- expectRight("canonical ed spki")(PublicKey.fromSpki(Ed25519)(Slice.of(canonical)))
+      raw <- expectRight("raw")(k.raw)
+      _ <- check(raw.length == 32 && raw.sameElements(point), s"the canonical import exports its 32-byte point, got ${raw.length}")
+      nc <- summon[EdKeys].fromSpki(Slice.of(longForm)).either
+      widths <- nc.traverse(k2 => expectRight("non-canonical raw")(k2.raw).map(_.length))
+      _ <- check(widths.forall(_ == 32), s"a non-canonical SPKI is refused or still exports 32 bytes, got $widths")
+    yield ()
+  }
+
+  test("a malformed ML-KEM encapsulation key is a value at import, not a defect at encapsulation") {
+    val bad = Array.fill[Byte](MlKem768.publicKeyLength)(0xff.toByte)
+    PublicKey.fromRaw(MlKem768)(Slice.of(bad)).either.flatMap(r => check(r.isLeft, s"FIPS 203 s7.2 check runs at import, got $r"))
+  }
+
+  test("the record engine refuses a ciphertext shorter than its tag instead of verifying a truncated one") {
+    val nonce = new Array[Byte](12)
+    for
+      key <- AesGcm256.generate.absolve
+      tag <- key.cipher.use { c =>
+               val dst = new Array[Byte](16)
+               IO.fromEither(c.encrypt(Slice.of(dst), Slice.empty, Slice.empty, Slice.of(nonce))).as(dst)
+             }
+      // The leading four bytes of a genuine tag: node accepts a 4-byte GCM tag, so a `src` shorter
+      // than the tag length used to authenticate against a truncated one - 2^32 work, not 2^128.
+      short = tag.take(4)
+      r <- summon[Ciphering[AesGcm256]]
+             .engine(key)
+             .use(e => IO(e.decrypt(Slice.of(new Array[Byte](16)), Slice.of(short), Slice.empty, Slice.of(nonce))))
+      _ <- check(r == Left(AuthFailed), s"a short src is a rejection, not a truncated-tag verification, got $r")
+    yield ()
+    end for
+  }
+
+  test("the AES-CBC-HMAC composite round-trips an empty plaintext") {
+    for
+      key <- A128CbcHs256.generate.absolve
+      box <- key.seal(Slice.empty).absolve
+      out <- key.open(box).absolve
+      _ <- check(out.length == 0, s"empty plaintext round-trips, got ${out.length}")
+    yield ()
+  }
+
+  test("a key encoding the backend rejects is a typed value, not a raised defect") {
+    val offCurve = Array[Byte](4) ++ Array.fill[Byte](64)(0xff.toByte)
+    for
+      spki <- summon[EdKeys].fromSpki(Slice.of(Array[Byte](1, 2, 3))).either.attempt
+      _ <- check(spki.toOption.flatMap(_.swap.toOption).contains(InvalidKey.Malformed), s"malformed SPKI -> Malformed, got $spki")
+      pkcs8 <- summon[EdKeys].fromPkcs8(Slice.of(Array[Byte](1, 2, 3))).either.attempt
+      _ <- check(pkcs8.toOption.flatMap(_.swap.toOption).contains(InvalidKey.Malformed), s"malformed PKCS#8 -> Malformed, got $pkcs8")
+      point <- PublicKey.fromSec1(P256)(Slice.of(offCurve)).either.attempt
+      _ <- check(point.toOption.flatMap(_.swap.toOption).contains(InvalidKey.NotOnCurve), s"off-curve point -> NotOnCurve, got $point")
+    yield ()
+  }
+
+  test("a certificate whose SPKI kufuli cannot import reports it rather than fabricating a key") {
+    check(anyCert.publicKey.isRight, s"a P-256 certificate yields its key, got ${anyCert.publicKey}")
   }
 
   test("JWT with deeply nested JSON is rejected (Malformed), not a stack overflow") {

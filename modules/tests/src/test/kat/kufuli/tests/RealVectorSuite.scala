@@ -23,6 +23,7 @@ package kufuli.tests
 import boilerplate.Slice
 import boilerplate.effect.*
 import cats.effect.IO
+import cats.syntax.all.*
 
 import kufuli.*
 import kufuli.tests.support.*
@@ -89,5 +90,31 @@ class RealVectorSuite extends munit.CatsEffectSuite:
       rej <- key.verify(Slice.empty, bad).either
       _ <- check(rej.isLeft, "tampered ed25519 rejected")
     yield ()
+  }
+  test("HMAC-SHA1 (RFC 2202 s3): the OATH interop vectors, and the RFC 2104 key floor") {
+    val cases = List(
+      (Array.fill[Byte](20)(0x0b.toByte), "Hi There".getBytes("US-ASCII"), "b617318655057264e28bc0b6fb378c8ef146be00"),
+      (Array.fill[Byte](20)(0xaa.toByte), Array.fill[Byte](50)(0xdd.toByte), "125d7342b9ac11cd91a39af48aa17b4f63f175d3"),
+      (Array.tabulate[Byte](25)(i => (i + 1).toByte), Array.fill[Byte](50)(0xcd.toByte), "4c9007f4026250c6bc8414f9bf50c86c2d7235da"),
+      (Array.fill[Byte](20)(0x0c.toByte), "Test With Truncation".getBytes("US-ASCII"), "4c1a03424b55e07fe7f27be1d58bb9324a9a5a04"),
+      (Array.fill[Byte](80)(0xaa.toByte),
+       "Test Using Larger Than Block-Size Key - Hash Key First".getBytes("US-ASCII"),
+       "aa4ae5e15272d00e95705637ce8a3b55ed402112"
+      ),
+      (Array.fill[Byte](80)(0xaa.toByte),
+       "Test Using Larger Than Block-Size Key and Larger Than One Block-Size Data".getBytes("US-ASCII"),
+       "e8e99d0f45237d786d6bbaa7965c7808bbff1a91"
+      )
+    )
+    cases.traverse_ { (k, data, want) =>
+      for
+        key <- IO.fromEither(SecretKey.of(HmacSha1)(k).left.map(e => new AssertionError(s"key import: $e")))
+        tag <- key.sign(Slice.of(data)).absolve
+        _ <- check(hex(Array.from(tag.bytes.iterator)) == want, s"hmac-sha1 tag for a ${k.length}-byte key")
+        ok <- key.verify(Slice.of(data), tag).either
+        _ <- check(ok == Right(()), "the shared constant-time compare accepts the published tag")
+      yield ()
+      // Case 2's four-byte "Jefe" key is below RFC 2104's floor, which kufuli enforces at import.
+    } *> check(SecretKey.of(HmacSha1)("Jefe".getBytes("US-ASCII")).isLeft, "a key shorter than the hash output is refused")
   }
 end RealVectorSuite

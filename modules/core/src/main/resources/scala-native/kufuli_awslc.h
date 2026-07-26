@@ -27,7 +27,12 @@
 /* Every function returns 1 for success and 0 for failure, without exception. aws-lc itself does not:
  * AES_set_encrypt_key returns 0 on success, AES_wrap_key returns a length or -1, ECDH_compute_key
  * returns a length or -1, and the SHA/HMAC one-shots return a pointer. Normalising here means the
- * Scala side cannot misread a convention. Out-lengths are written only on success. */
+ * Scala side cannot misread a convention. Out-lengths are written only on success.
+ *
+ * Every out-buffer parameter is accompanied by the caller's capacity and that capacity is checked
+ * BEFORE the first byte is written. Where an entry point takes an out buffer with no capacity, the
+ * length is fixed by the algorithm named in the same call (a digest, a 32-byte X25519 secret) and
+ * is stated in that function's contract. */
 
 #ifdef __cplusplus
 extern "C" {
@@ -65,19 +70,14 @@ extern "C" {
 #define KUFULI_SCHEME_RSA_PKCS1 4
 
 /* Identity of the linked library: 1 iff this shim was compiled and linked against aws-lc. Calls
- * awslc_api_version_num, which no other OpenSSL-compatible library exports, so it is a runtime
- * companion to the compile-time OPENSSL_IS_AWSLC assertion and the link-time dialect gate. */
+ * awslc_api_version_num, which no other OpenSSL-compatible library exports. The compile-time
+ * OPENSSL_IS_AWSLC assertion and the link-time dialect gate both hold at BUILD time; this is the
+ * only check that sees a consumer who rebound the library to a system shared object, so the Scala
+ * binding asserts it once before handing out any instance. */
 int kufuli_is_awslc(void);
 
 /* CSPRNG. Cannot fail: aws-lc's RAND_bytes aborts rather than return an error. */
 int kufuli_random_bytes(uint8_t *out, size_t len);
-
-/* Constant-time equality over equal lengths; 1 iff equal. Wraps CRYPTO_memcmp, whose sign is
- * undefined for unequal inputs. */
-int kufuli_ct_equals(const uint8_t *a, const uint8_t *b, size_t len);
-
-/* In-place erase (OPENSSL_cleanse). */
-void kufuli_cleanse(uint8_t *p, size_t len);
 
 /* AEAD. The context is an opaque heap EVP_AEAD_CTX; one per Cipher lifetime. Every algorithm above
  * is on aead.h's documented concurrency allow-list, so seal/open may be called concurrently on one
@@ -104,8 +104,7 @@ int kufuli_pbkdf2(uint8_t *out, size_t out_len, int md, const uint8_t *password,
 /* HMAC one-shot. */
 int kufuli_hmac(int md, const uint8_t *key, size_t key_len, const uint8_t *data, size_t data_len, uint8_t *out, size_t *out_len);
 
-/* Digests. kufuli_digest_size reports the output length for `md`, or 0 for an unknown selector. */
-int kufuli_digest_size(int md);
+/* Digests. `out` receives exactly the digest length of `md`. */
 int kufuli_digest(int md, const uint8_t *data, size_t len, uint8_t *out);
 
 /* Incremental hashing. kufuli_hasher_digest SNAPSHOTS: it copies the context and finalises the copy,
@@ -115,20 +114,9 @@ void kufuli_hasher_free(void *ctx);
 int kufuli_hasher_update(void *ctx, const uint8_t *data, size_t len);
 int kufuli_hasher_digest(const void *ctx, uint8_t *out);
 
-/* Ed25519. The private key is 64 bytes (aws-lc appends the public key); RFC 8032's 32-byte value is
- * the seed and is what kufuli_ed25519_from_seed takes. */
-int kufuli_ed25519_keypair(uint8_t *out_pub, uint8_t *out_priv);
-int kufuli_ed25519_from_seed(uint8_t *out_pub, uint8_t *out_priv, const uint8_t *seed);
-int kufuli_ed25519_sign(uint8_t *out_sig, const uint8_t *msg, size_t msg_len, const uint8_t *priv);
-int kufuli_ed25519_verify(const uint8_t *msg, size_t msg_len, const uint8_t *sig, const uint8_t *pub);
-
-/* X25519. kufuli_x25519 returns 0 for a small-order peer point (aws-lc detects the all-zero shared
- * key in constant time); the output buffer is not usable in that case. */
-int kufuli_x25519_keypair(uint8_t *out_pub, uint8_t *out_priv);
-int kufuli_x25519_public_from_private(uint8_t *out_pub, const uint8_t *priv);
-int kufuli_x25519(uint8_t *out_shared, const uint8_t *priv, const uint8_t *peer_pub);
-
-/* AES-KW (RFC 3394) and AES-KWP (RFC 5649), over the default IV. */
+/* AES-KW (RFC 3394) and AES-KWP (RFC 5649), over the default IV. AES_wrap_key writes before it can
+ * report a length, so the plain variants check max_out against the RFC's fixed +/-8 relation first;
+ * the padded variants take max_out themselves. */
 int kufuli_aes_wrap(uint8_t *out, size_t *out_len, size_t max_out, const uint8_t *kek, size_t kek_len, const uint8_t *in,
                     size_t in_len, int padded);
 int kufuli_aes_unwrap(uint8_t *out, size_t *out_len, size_t max_out, const uint8_t *kek, size_t kek_len, const uint8_t *in,
@@ -143,14 +131,20 @@ int kufuli_aes_cbc(int encrypt, uint8_t *out, size_t *out_len, size_t max_out, c
 int kufuli_aes_block_encrypt(uint8_t *out, const uint8_t *in, const uint8_t *key, size_t key_len);
 int kufuli_chacha20_keystream(uint8_t *out, size_t out_len, const uint8_t *key, const uint8_t *nonce, uint32_t counter);
 
-/* ML-KEM (FIPS 203). Sizes are not exposed by any installed aws-lc header, so they are reported here
- * from the EVP size-check convention rather than hardcoded on the Scala side. */
-int kufuli_kem_sizes(int kem, size_t *out_pub, size_t *out_priv, size_t *out_ct, size_t *out_ss);
-int kufuli_kem_keypair(int kem, uint8_t *out_pub, size_t *out_pub_len, uint8_t *out_priv, size_t *out_priv_len);
-int kufuli_kem_encapsulate(int kem, const uint8_t *pub, size_t pub_len, uint8_t *out_ct, size_t *out_ct_len, uint8_t *out_ss,
-                           size_t *out_ss_len);
+/* ML-KEM (FIPS 203). The parameter set fixes every length; each entry point queries aws-lc for the
+ * true size and refuses before writing when the caller's capacity is smaller.
+ * kufuli_kem_public_valid runs the section 7.2 encapsulation-key check at import, so a malformed
+ * peer key is a value rather than a failure deep inside encapsulation.
+ * kufuli_kem_keypair_from_seed is FIPS 203 KeyGen over the 64-byte (d || z) seed. */
+int kufuli_kem_public_valid(int kem, const uint8_t *pub, size_t pub_len);
+int kufuli_kem_keypair(int kem, uint8_t *out_pub, size_t *out_pub_len, size_t max_pub, uint8_t *out_priv,
+                       size_t *out_priv_len, size_t max_priv);
+int kufuli_kem_keypair_from_seed(int kem, const uint8_t *seed, size_t seed_len, uint8_t *out_pub, size_t *out_pub_len,
+                                 size_t max_pub, uint8_t *out_priv, size_t *out_priv_len, size_t max_priv);
+int kufuli_kem_encapsulate(int kem, const uint8_t *pub, size_t pub_len, uint8_t *out_ct, size_t *out_ct_len, size_t max_ct,
+                           uint8_t *out_ss, size_t *out_ss_len, size_t max_ss);
 int kufuli_kem_decapsulate(int kem, const uint8_t *priv, size_t priv_len, const uint8_t *ct, size_t ct_len, uint8_t *out_ss,
-                           size_t *out_ss_len);
+                           size_t *out_ss_len, size_t max_ss);
 
 /* Asymmetric keys and operations over an opaque EVP_PKEY handle. The Scala side owns the handle
  * lifecycle: it parses a key once (per op, or once per prepared Signer/Agreement resource), operates,
@@ -159,7 +153,6 @@ int kufuli_kem_decapsulate(int kem, const uint8_t *priv, size_t priv_len, const 
  * NULL handle, which the Scala side maps to a typed InvalidKey. */
 void *kufuli_pkey_generate(int type, int rsa_bits);
 void kufuli_pkey_free(void *pkey);
-int kufuli_pkey_type(const void *pkey);
 
 void *kufuli_pkey_from_spki(const uint8_t *der, size_t len);
 void *kufuli_pkey_from_pkcs8(const uint8_t *der, size_t len);

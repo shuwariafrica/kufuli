@@ -61,16 +61,59 @@ private[kufuli] object node:
       zero(buf)
       val _ = Slice.of(bytes).wipe()
 
-  // A malformed encoding is a typed value, not a defect; node raises a JS error for a bad key.
-  private def validating[A](notOnCurve: Boolean)(f: => A): Either[InvalidKey, A] =
+  // node reports a data failure - an unauthenticated tag, bad padding, an unreadable encoding, an
+  // invalid encapsulation key - with no `code` at all or with an `ERR_OSSL_*`/`ERR_INVALID_ARG_VALUE`
+  // one, and reports OUR mistakes under the codes below. Typing the latter as the caller's failure
+  // is what turns a kufuli bug into a logged forgery. Nonce, tag and key lengths are all fixed by a
+  // spec before the call, so none of these is reachable from caller data.
+  private val defectCodes: Set[String] =
+    Set(
+      "ERR_INVALID_ARG_TYPE",
+      "ERR_OUT_OF_RANGE",
+      "ERR_CRYPTO_INVALID_AUTH_TAG",
+      "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE",
+      "ERR_CRYPTO_SIGN_KEY_REQUIRED",
+      "ERR_OSSL_EVP_UNSUPPORTED_ALGORITHM"
+    )
+
+  // Re-raising sends the error through `guard` to a sanitised `Unexpected` defect, which is where a
+  // wrongly-called primitive belongs.
+  private def failing[E, A](error: E)(f: => A): Either[E, A] =
     try Right(f)
-    catch case _: js.JavaScriptException => Left(if notOnCurve then InvalidKey.NotOnCurve else InvalidKey.Malformed)
+    catch
+      case e: js.JavaScriptException =>
+        if errorCode(e).exists(defectCodes.contains) then throw e // scalafix:ok DisableSyntax.throw
+        else Left(error)
+
+  private def validating[A](notOnCurve: Boolean)(f: => A): Either[InvalidKey, A] =
+    failing(if notOnCurve then InvalidKey.NotOnCurve else InvalidKey.Malformed)(f)
 
   private def derPub(der: Uint8Array): js.Any = js.Dynamic.literal(key = der, format = "der", `type` = "spki")
   private def derPriv(der: Uint8Array): js.Any = js.Dynamic.literal(key = der, format = "der", `type` = "pkcs8")
   private def parsePub(spki: Array[Byte]): KeyObject = crypto.createPublicKey(derPub(u8(spki)))
   private def exportSpki(k: KeyObject): Array[Byte] = ba(k.`export`(js.Dynamic.literal(`type` = "spki", format = "der")))
   private def exportPkcs8(k: KeyObject): Array[Byte] = ba(k.`export`(js.Dynamic.literal(`type` = "pkcs8", format = "der")))
+
+  // node infers a key's family from the encoding, binds nothing to the family the caller asked
+  // for, and tolerates bytes appended after the outer SEQUENCE - so the family, the curve and full
+  // consumption are all asserted here, and what is stored is node's own canonical re-export.
+  private def bound(k: KeyObject, kind: String, curve: Option[String]): Boolean =
+    k.asymmetricKeyType.toOption.contains(kind) &&
+      curve.forall(c => k.asymmetricKeyDetails.toOption.flatMap(_.namedCurve.toOption).contains(c))
+
+  private def storePub(der: Array[Byte], kind: String, curve: Option[String], notOnCurve: Boolean): Either[InvalidKey, Array[Byte]] =
+    if !Der.spansWhole(Slice.of(der), 0x30) then Left(InvalidKey.Malformed)
+    else
+      validating(notOnCurve)(parsePub(der)).flatMap(k => if bound(k, kind, curve) then Right(exportSpki(k)) else Left(InvalidKey.Malformed))
+
+  private def storePriv(der: Array[Byte], kind: String, curve: Option[String]): Either[InvalidKey, Array[Byte]] =
+    if !Der.spansWhole(Slice.of(der), 0x30) then Left(InvalidKey.Malformed)
+    else
+      validating(notOnCurve = false)(crypto.createPrivateKey(derPriv(u8(der))))
+        .flatMap(k => if bound(k, kind, curve) then Right(exportPkcs8(k)) else Left(InvalidKey.Malformed))
+
+  private def publicPoint(key: KeyRepr, length: Int): IArray[Byte] =
+    IArray.from(demand(Der.spkiPublicBits(Slice.of(keyBytes(key)), length)).toArray)
 
   private def digestName(hash: Sha2): String = hash match
     case _: Sha256.type => "sha256"
@@ -90,19 +133,19 @@ private[kufuli] object node:
     if b.length > 1 && b(0) == 0.toByte then b.drop(1) else b
 
   private[kufuli] val random: Random = new Random:
-    def bytes(n: Int): UEffIO[Slice] = op {
+    private[kufuli] def bytes(n: Int): UEffIO[Slice] = op {
       val buf = new Uint8Array(n)
       val _ = crypto.randomFillSync(buf)
       Slice.of(ba(buf))
     }
-    def fill(dst: Slice): UEffIO[Unit] = op {
+    private[kufuli] def fill(dst: Slice): UEffIO[Unit] = op {
       val buf = new Uint8Array(dst.length)
       val _ = crypto.randomFillSync(buf)
       val _ = Slice.of(ba(buf)).copyInto(dst)
     }
 
   private def aead[A <: AeadAlgorithm](spec: AeadSpec[A], cipherName: String, chacha: Boolean): Aead[A] = new Aead[A]:
-    def seal(key: SecretKey[A], nonce: Nonce[A], aad: Slice, plaintext: Slice): UEffIO[Slice] = op {
+    private[kufuli] def seal(key: SecretKey[A], nonce: Nonce[A], aad: Slice, plaintext: Slice): UEffIO[Slice] = op {
       key.read { k =>
         withSecret(k) { kb =>
           val c = mkCipher(cipherName, kb, u8(nonce.repr), chacha, decrypt = false)
@@ -112,7 +155,7 @@ private[kufuli] object node:
         }
       }
     }
-    def open(key: SecretKey[A], nonce: Nonce[A], aad: Slice, ciphertext: Slice): EffIO[AuthFailed, Slice] = opE {
+    private[kufuli] def open(key: SecretKey[A], nonce: Nonce[A], aad: Slice, ciphertext: Slice): EffIO[AuthFailed, Slice] = opE {
       key.read { k =>
         withSecret(k) { kb =>
           val whole = ciphertext.toArray
@@ -143,7 +186,7 @@ private[kufuli] object node:
       val al = new Array[Byte](8)
       Slice.of(al).writeBE[Long](0, aad.length.toLong * 8)
       hmacRaw(mac, macKey, aad.toArray ++ iv ++ ct ++ al).take(spec.tagLength)
-    def seal(key: SecretKey[A], nonce: Nonce[A], aad: Slice, plaintext: Slice): UEffIO[Slice] = op {
+    private[kufuli] def seal(key: SecretKey[A], nonce: Nonce[A], aad: Slice, plaintext: Slice): UEffIO[Slice] = op {
       key.read { k =>
         val kb = k.toArray
         val half = kb.length / 2
@@ -159,7 +202,7 @@ private[kufuli] object node:
         out
       }
     }
-    def open(key: SecretKey[A], nonce: Nonce[A], aad: Slice, ciphertext: Slice): EffIO[AuthFailed, Slice] = opE {
+    private[kufuli] def open(key: SecretKey[A], nonce: Nonce[A], aad: Slice, ciphertext: Slice): EffIO[AuthFailed, Slice] = opE {
       key.read { k =>
         val kb = k.toArray
         val half = kb.length / 2
@@ -189,14 +232,20 @@ private[kufuli] object node:
   // node has no reusable AEAD context, so each record creates a fresh cipher, as JCA does per op.
   final private class AeadEngine[A <: AeadAlgorithm](keyBuf: Uint8Array, spec: AeadSpec[A], cipherName: String, chacha: Boolean)
       extends Cipher.Engine[A]:
-    def encrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Int =
+    private[kufuli] def encrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Int =
       val c = mkCipher(cipherName, keyBuf, u8(nonce.toArray), chacha, decrypt = false)
       setAad(c, aad)
       val out = ba(c.update(u8(src.toArray))) ++ ba(c.`final`()) ++ ba(c.getAuthTag())
       val _ = Slice.of(out).copyInto(dst)
       out.length
-    def decrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Either[AuthFailed, Int] =
+    private[kufuli] def decrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Either[AuthFailed, Int] =
       val whole = src.toArray
+      // A `src` below the tag length has no ciphertext to authenticate, and node accepts a 4-byte
+      // GCM tag: treating those bytes as the tag verifies against a truncated one, 2^32 work.
+      if whole.length < spec.tagLength then Left(AuthFailed)
+      else decryptChecked(dst, whole, aad, nonce)
+
+    private def decryptChecked(dst: Slice, whole: Array[Byte], aad: Slice, nonce: Slice): Either[AuthFailed, Int] =
       val ct = whole.take(whole.length - spec.tagLength)
       val tag = whole.drop(whole.length - spec.tagLength)
       val d = mkCipher(cipherName, keyBuf, u8(nonce.toArray), chacha, decrypt = true)
@@ -207,11 +256,11 @@ private[kufuli] object node:
         val _ = Slice.of(out).copyInto(dst)
         Right(out.length)
       catch case _: js.JavaScriptException => Left(AuthFailed)
-    end decrypt
+    end decryptChecked
   end AeadEngine
 
   private def ciphering[A <: AeadAlgorithm](spec: AeadSpec[A], cipherName: String, chacha: Boolean): Ciphering[A] = new Ciphering[A]:
-    def engine(key: SecretKey[A]): Resource[IO, Cipher.Engine[A]] =
+    private[kufuli] def engine(key: SecretKey[A]): Resource[IO, Cipher.Engine[A]] =
       Resource
         .make(guard(IO(key.read { k =>
           val a = k.toArray
@@ -222,11 +271,11 @@ private[kufuli] object node:
         .map(buf => new AeadEngine(buf, spec, cipherName, chacha))
 
   private def macOf[H <: MacAlgorithm](name: String): Mac[H] = new Mac[H]:
-    def sign(key: SecretKey[H], data: Slice): UEffIO[Signature[H]] =
+    private[kufuli] def sign(key: SecretKey[H], data: Slice): UEffIO[Signature[H]] =
       op(key.read(k => Signature.unsafe[H](withSecret(k)(kb => ba(crypto.createHmac(name, kb).update(u8(data.toArray)).digest())))))
 
   private def edSigner: Signer[Ed25519] = new Signer[Ed25519]:
-    def sign(key: PrivateKey[Ed25519], data: Slice, scheme: Scheme[Ed25519]): UEffIO[Signature[Ed25519]] = op {
+    private[kufuli] def sign(key: PrivateKey[Ed25519], data: Slice, scheme: Scheme[Ed25519]): UEffIO[Signature[Ed25519]] = op {
       key.read { der =>
         withSecret(der) { buf =>
           Signature.unsafe[Ed25519](ba(crypto.sign(js.undefined, u8(data.toArray), crypto.createPrivateKey(derPriv(buf)))))
@@ -234,7 +283,11 @@ private[kufuli] object node:
       }
     }
   private def edVerifier: Verifier[Ed25519] = new Verifier[Ed25519]:
-    def verify(key: PublicKey[Ed25519], data: Slice, sig: Signature[Ed25519], scheme: Scheme[Ed25519]): EffIO[SignatureRejected, Unit] =
+    private[kufuli] def verify(
+      key: PublicKey[Ed25519],
+      data: Slice,
+      sig: Signature[Ed25519],
+      scheme: Scheme[Ed25519]): EffIO[SignatureRejected, Unit] =
       opE {
         val ok = crypto.verify(js.undefined, u8(data.toArray), parsePub(keyBytes(key.repr)), u8(sig.repr))
         if ok then Right(()) else Left(SignatureRejected)
@@ -242,7 +295,7 @@ private[kufuli] object node:
 
   private def ecKey(k: KeyObject): js.Any = js.Dynamic.literal(key = k, dsaEncoding = "ieee-p1363")
   private def ecSigner[C <: EcCurve]: Signer[C] = new Signer[C]:
-    def sign(key: PrivateKey[C], data: Slice, scheme: Scheme[C]): UEffIO[Signature[C]] = op {
+    private[kufuli] def sign(key: PrivateKey[C], data: Slice, scheme: Scheme[C]): UEffIO[Signature[C]] = op {
       val h = scheme.runtimeChecked match
         case Ecdsa(hash) => digestName(hash)
       key.read { der =>
@@ -252,7 +305,7 @@ private[kufuli] object node:
       }
     }
   private def ecVerifier[C <: EcCurve]: Verifier[C] = new Verifier[C]:
-    def verify(key: PublicKey[C], data: Slice, sig: Signature[C], scheme: Scheme[C]): EffIO[SignatureRejected, Unit] = opE {
+    private[kufuli] def verify(key: PublicKey[C], data: Slice, sig: Signature[C], scheme: Scheme[C]): EffIO[SignatureRejected, Unit] = opE {
       val h = scheme.runtimeChecked match
         case Ecdsa(hash) => digestName(hash)
       val ok = crypto.verify(h, u8(data.toArray), ecKey(parsePub(keyBytes(key.repr))), u8(sig.repr))
@@ -267,7 +320,7 @@ private[kufuli] object node:
       )
     case RsaPkcs1(h) => (algorithm = digestName(h), key = k)
   private def rsaSigner: Signer[Rsa] = new Signer[Rsa]:
-    def sign(key: PrivateKey[Rsa], data: Slice, scheme: Scheme[Rsa]): UEffIO[Signature[Rsa]] = op {
+    private[kufuli] def sign(key: PrivateKey[Rsa], data: Slice, scheme: Scheme[Rsa]): UEffIO[Signature[Rsa]] = op {
       key.read { der =>
         withSecret(der) { buf =>
           val r = rsaKey(crypto.createPrivateKey(derPriv(buf)), scheme)
@@ -276,13 +329,14 @@ private[kufuli] object node:
       }
     }
   private def rsaVerifier: Verifier[Rsa] = new Verifier[Rsa]:
-    def verify(key: PublicKey[Rsa], data: Slice, sig: Signature[Rsa], scheme: Scheme[Rsa]): EffIO[SignatureRejected, Unit] = opE {
-      val r = rsaKey(parsePub(keyBytes(key.repr)), scheme)
-      if crypto.verify(r.algorithm, u8(data.toArray), r.key, u8(sig.repr)) then Right(()) else Left(SignatureRejected)
-    }
+    private[kufuli] def verify(key: PublicKey[Rsa], data: Slice, sig: Signature[Rsa], scheme: Scheme[Rsa]): EffIO[SignatureRejected, Unit] =
+      opE {
+        val r = rsaKey(parsePub(keyBytes(key.repr)), scheme)
+        if crypto.verify(r.algorithm, u8(data.toArray), r.key, u8(sig.repr)) then Right(()) else Left(SignatureRejected)
+      }
 
   private def agreementOf[A <: AgreementAlgorithm]: Agreement[A] = new Agreement[A]:
-    def agree(priv: PrivateKey[A], pub: PublicKey[A]): UEffIO[SharedSecret] = op {
+    private[kufuli] def agree(priv: PrivateKey[A], pub: PublicKey[A]): UEffIO[SharedSecret] = op {
       priv.read { der =>
         withSecret(der) { buf =>
           val secret = crypto.diffieHellman(
@@ -294,11 +348,11 @@ private[kufuli] object node:
     }
 
   private def kemOf[K <: KemAlgorithm](kind: String): Kem[K] = new Kem[K]:
-    def encapsulate(pub: PublicKey[K]): UEffIO[Encapsulated[K]] = op {
+    private[kufuli] def encapsulate(pub: PublicKey[K]): UEffIO[Encapsulated[K]] = op {
       val e = crypto.encapsulate(crypto.createPublicKey(rawPublic(u8(keyBytes(pub.repr)), kind)))
       Encapsulated(SharedSecret.unsafe(ba(e.sharedKey)), KemCiphertext.unsafe(ba(e.ciphertext)))
     }
-    def decapsulate(priv: PrivateKey[K], ct: KemCiphertext[K]): UEffIO[SharedSecret] = op {
+    private[kufuli] def decapsulate(priv: PrivateKey[K], ct: KemCiphertext[K]): UEffIO[SharedSecret] = op {
       priv.read { seed =>
         withSecret(seed) { buf =>
           SharedSecret.unsafe(ba(crypto.decapsulate(crypto.createPrivateKey(rawSeed(buf, kind)), u8(ct.repr))))
@@ -317,7 +371,7 @@ private[kufuli] object node:
   private def wrapOf[W <: WrapAlgorithm](padded: Boolean): Wrap[W] = new Wrap[W]:
     private def cipherName(kekLen: Int): String = s"id-aes${kekLen * 8}-wrap${if padded then "-pad" else ""}"
     private def iv: Array[Byte] = if padded then kwpIv else kwIv
-    def wrap(kek: SecretKey[W], target: Slice): UEffIO[Slice] = op {
+    private[kufuli] def wrap(kek: SecretKey[W], target: Slice): UEffIO[Slice] = op {
       kek.read { k =>
         withSecret(k) { kb =>
           val c = crypto.createCipheriv(cipherName(kb.length), kb, u8(iv))
@@ -325,7 +379,7 @@ private[kufuli] object node:
         }
       }
     }
-    def unwrap(kek: SecretKey[W], wrapped: Slice): EffIO[UnwrapFailed, Slice] = opE {
+    private[kufuli] def unwrap(kek: SecretKey[W], wrapped: Slice): EffIO[UnwrapFailed, Slice] = opE {
       kek.read { k =>
         withSecret(k) { kb =>
           val d = crypto.createDecipheriv(cipherName(kb.length), kb, u8(iv))
@@ -336,12 +390,12 @@ private[kufuli] object node:
     }
 
   private[kufuli] val kdf: Kdf = new Kdf:
-    def extract(hash: Sha2, salt: Slice, ikm: Slice): UEffIO[Prk] = op {
+    private[kufuli] def extract(hash: Sha2, salt: Slice, ikm: Slice): UEffIO[Prk] = op {
       val name = digestName(hash)
       val key = if salt.length == 0 then new Array[Byte](hash.length) else salt.toArray
       Prk.unsafe(hmacRaw(name, key, ikm.toArray))
     }
-    def expand(hash: Sha2, prk: Prk, info: Slice, length: Int): UEffIO[Slice] = op {
+    private[kufuli] def expand(hash: Sha2, prk: Prk, info: Slice, length: Int): UEffIO[Slice] = op {
       prk.read { p =>
         val name = digestName(hash)
         val hlen = hash.length
@@ -359,14 +413,27 @@ private[kufuli] object node:
         Slice.of(out.take(length))
       }
     }
-    def pbkdf2(hash: Sha2, password: Slice, salt: Slice, iterations: Int, length: Int): UEffIO[Slice] = op {
-      Slice.of(ba(crypto.pbkdf2Sync(u8(password.toArray), u8(salt.toArray), iterations, length, digestName(hash))))
-    }
+    private[kufuli] def pbkdf2(hash: Sha2, password: Slice, salt: Slice, iterations: Int, length: Int): UEffIO[Slice] =
+      // node's synchronous PBKDF2 runs on the event loop, stalling every fibre, socket and timer
+      // for the whole derivation; at SCRAM's 600k iterations that is a reachable denial of service.
+      EffIO.liftF(guard(IO.async_ { cb =>
+        crypto.pbkdf2(
+          u8(password.toArray),
+          u8(salt.toArray),
+          iterations,
+          length,
+          digestName(hash),
+          (err, out) =>
+            err.option match
+              case None    => cb(Right(Slice.of(ba(out))))
+              case Some(e) => cb(Left(js.JavaScriptException(e)))
+        )
+      }))
 
   private def hashOf[D <: HashAlgorithm](name: String): Hash[D] = new Hash[D]:
-    def digest(data: Slice): UEffIO[Digest] = op(Digest.unsafe(ba(crypto.createHash(name).update(u8(data.toArray)).digest())))
+    private[kufuli] def digest(data: Slice): UEffIO[Digest] = op(Digest.unsafe(ba(crypto.createHash(name).update(u8(data.toArray)).digest())))
   private def hashingOf[D <: HashAlgorithm](name: String): Hashing[D] = new Hashing[D]:
-    def hasher: Resource[IO, Hasher] = Resource.eval(IO {
+    private[kufuli] def hasher: Resource[IO, Hasher] = Resource.eval(IO {
       new Hasher:
         private val h = crypto.createHash(name)
         def update(data: Slice): Unit =
@@ -377,10 +444,10 @@ private[kufuli] object node:
   private def oaepOptions(k: KeyObject, hash: Sha2): js.Any =
     js.Dynamic.literal(key = k, padding = crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash = digestName(hash))
   private[kufuli] val oaep: Oaep = new Oaep:
-    def encrypt(key: PublicKey[Rsa], plaintext: Slice, scheme: RsaOaep): UEffIO[Slice] = op {
+    private[kufuli] def encrypt(key: PublicKey[Rsa], plaintext: Slice, scheme: RsaOaep): UEffIO[Slice] = op {
       Slice.of(ba(crypto.publicEncrypt(oaepOptions(parsePub(keyBytes(key.repr)), scheme.hash), u8(plaintext.toArray))))
     }
-    def decrypt(key: PrivateKey[Rsa], ciphertext: Slice, scheme: RsaOaep): EffIO[AuthFailed, Slice] = opE {
+    private[kufuli] def decrypt(key: PrivateKey[Rsa], ciphertext: Slice, scheme: RsaOaep): EffIO[AuthFailed, Slice] = opE {
       key.read { der =>
         withSecret(der) { buf =>
           try Right(Slice.of(ba(crypto.privateDecrypt(oaepOptions(crypto.createPrivateKey(derPriv(buf)), scheme.hash), u8(ciphertext.toArray)))))
@@ -392,132 +459,126 @@ private[kufuli] object node:
   private def emptyOptions: js.Any = js.Dynamic.literal()
 
   private[kufuli] val edKeys: EdKeys = new EdKeys:
-    def generate: UEffIO[KeyPair[PublicKey[Ed25519], PrivateKey[Ed25519]]] =
+    private[kufuli] def generate: UEffIO[KeyPair[PublicKey[Ed25519], PrivateKey[Ed25519]]] =
       genKeyPair("ed25519", emptyOptions).map((pub, priv) =>
         KeyPair(PublicKey.unsafe(keyRepr(exportSpki(pub))), PrivateKey.unsafe(exportPkcs8(priv)))
       )
-    def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[Ed25519]] = opE {
+    private[kufuli] def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[Ed25519]] = opE {
       if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
-      else
-        val spki = Der.edSpkiPrefix ++ bytes.toArray
-        validating(notOnCurve = true) { val _ = parsePub(spki); PublicKey.unsafe[Ed25519](keyRepr(spki)) }
+      else storePub(Der.edSpkiPrefix ++ bytes.toArray, "ed25519", None, notOnCurve = true).map(b => PublicKey.unsafe[Ed25519](keyRepr(b)))
     }
-    def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[Ed25519]] = opE {
-      val d = der.toArray
-      validating(notOnCurve = false) { val _ = parsePub(d); PublicKey.unsafe[Ed25519](keyRepr(d)) }
-    }
-    def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[Ed25519]] = opE {
-      val d = der.toArray
-      validating(notOnCurve = false) { val _ = crypto.createPrivateKey(derPriv(u8(d))); PrivateKey.unsafe[Ed25519](d) }
-    }
-    def raw(key: PublicKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]] =
-      op(IArray.from(keyBytes(key.repr).drop(Der.edSpkiPrefix.length)))
-    def spki(key: PublicKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
-    def pkcs8(key: PrivateKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]] =
-      EffIO.defer(key.read(s => op(IArray.from(s.toArray))))
+    private[kufuli] def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[Ed25519]] =
+      opE(storePub(der.toArray, "ed25519", None, notOnCurve = false).map(b => PublicKey.unsafe[Ed25519](keyRepr(b))))
+    private[kufuli] def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[Ed25519]] =
+      opE(storePriv(der.toArray, "ed25519", None).map(PrivateKey.unsafe[Ed25519]))
+    private[kufuli] def raw(key: PublicKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]] =
+      op(publicPoint(key.repr, 32))
+    private[kufuli] def spki(key: PublicKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def pkcs8(key: PrivateKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]] =
+      EffIO.defer(op(key.read(s => IArray.from(s.toArray))))
 
   private[kufuli] val xKeys: XKeys = new XKeys:
-    def generate: UEffIO[KeyPair[PublicKey[X25519], PrivateKey[X25519]]] =
+    private[kufuli] def generate: UEffIO[KeyPair[PublicKey[X25519], PrivateKey[X25519]]] =
       genKeyPair("x25519", emptyOptions).map((pub, priv) =>
         KeyPair(PublicKey.unsafe(keyRepr(exportSpki(pub))), PrivateKey.unsafe(exportPkcs8(priv)))
       )
-    def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[X25519]] = opE {
+    private[kufuli] def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[X25519]] = opE {
       if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
       else if bytes.toArray.forall(_ == 0) then Left(InvalidKey.WeakPoint)
-      else
-        val spki = Der.xSpkiPrefix ++ bytes.toArray
-        validating(notOnCurve = true) { val _ = parsePub(spki); PublicKey.unsafe[X25519](keyRepr(spki)) }
+      else storePub(Der.xSpkiPrefix ++ bytes.toArray, "x25519", None, notOnCurve = true).map(b => PublicKey.unsafe[X25519](keyRepr(b)))
     }
-    def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[X25519]] = opE {
-      val d = der.toArray
-      validating(notOnCurve = false) { val _ = parsePub(d); PublicKey.unsafe[X25519](keyRepr(d)) }
-    }
-    def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[X25519]] = opE {
-      val d = der.toArray
-      validating(notOnCurve = false) { val _ = crypto.createPrivateKey(derPriv(u8(d))); PrivateKey.unsafe[X25519](d) }
-    }
-    def raw(key: PublicKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]] =
-      op(IArray.from(keyBytes(key.repr).drop(Der.xSpkiPrefix.length)))
-    def spki(key: PublicKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
-    def pkcs8(key: PrivateKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]] =
-      EffIO.defer(key.read(s => op(IArray.from(s.toArray))))
+    private[kufuli] def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[X25519]] =
+      opE(storePub(der.toArray, "x25519", None, notOnCurve = false).map(b => PublicKey.unsafe[X25519](keyRepr(b))))
+    private[kufuli] def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[X25519]] =
+      opE(storePriv(der.toArray, "x25519", None).map(PrivateKey.unsafe[X25519]))
+    private[kufuli] def raw(key: PublicKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]] =
+      op(publicPoint(key.repr, 32))
+    private[kufuli] def spki(key: PublicKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def pkcs8(key: PrivateKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]] =
+      EffIO.defer(op(key.read(s => IArray.from(s.toArray))))
 
   private def ecKeysOf[C <: EcCurve](curveName: String, fieldLength: Int, prefix: Array[Byte]): EcKeys[C] = new EcKeys[C]:
     private val pointLength = 1 + 2 * fieldLength
-    def generate: UEffIO[KeyPair[PublicKey[C], PrivateKey[C]]] =
+    private[kufuli] def generate: UEffIO[KeyPair[PublicKey[C], PrivateKey[C]]] =
       genKeyPair("ec", js.Dynamic.literal(namedCurve = curveName)).map((pub, priv) =>
         KeyPair(PublicKey.unsafe(keyRepr(exportSpki(pub))), PrivateKey.unsafe(exportPkcs8(priv)))
       )
-    def fromSec1(point: Slice): EffIO[InvalidKey, PublicKey[C]] = opE {
+    private[kufuli] def fromSec1(point: Slice): EffIO[InvalidKey, PublicKey[C]] = opE {
       if point.length != pointLength then Left(InvalidKey.WrongLength(pointLength, point.length))
       else if point(0) != 4.toByte then Left(InvalidKey.Malformed)
-      else
-        val spki = prefix ++ point.toArray
-        validating(notOnCurve = true) { val _ = parsePub(spki); PublicKey.unsafe[C](keyRepr(spki)) }
+      else storePub(prefix ++ point.toArray, "ec", Some(curveName), notOnCurve = true).map(b => PublicKey.unsafe[C](keyRepr(b)))
     }
-    def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[C]] = opE {
-      val d = der.toArray
-      validating(notOnCurve = false) { val _ = parsePub(d); PublicKey.unsafe[C](keyRepr(d)) }
-    }
-    def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[C]] = opE {
-      val d = der.toArray
-      validating(notOnCurve = false) { val _ = crypto.createPrivateKey(derPriv(u8(d))); PrivateKey.unsafe[C](d) }
-    }
-    def sec1(key: PublicKey[C]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr).drop(prefix.length)))
-    def spki(key: PublicKey[C]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
-    def pkcs8(key: PrivateKey[C]): EffIO[KeyNotExportable, IArray[Byte]] =
-      EffIO.defer(key.read(s => op(IArray.from(s.toArray))))
+    private[kufuli] def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[C]] =
+      opE(storePub(der.toArray, "ec", Some(curveName), notOnCurve = false).map(b => PublicKey.unsafe[C](keyRepr(b))))
+    private[kufuli] def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[C]] =
+      opE(storePriv(der.toArray, "ec", Some(curveName)).map(PrivateKey.unsafe[C]))
+    private[kufuli] def sec1(key: PublicKey[C]): EffIO[KeyNotExportable, IArray[Byte]] = op(publicPoint(key.repr, pointLength))
+    private[kufuli] def spki(key: PublicKey[C]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def pkcs8(key: PrivateKey[C]): EffIO[KeyNotExportable, IArray[Byte]] =
+      EffIO.defer(op(key.read(s => IArray.from(s.toArray))))
 
   private[kufuli] val rsaKeys: RsaKeys = new RsaKeys:
-    def generate(size: Rsa.Size): UEffIO[KeyPair[PublicKey[Rsa], PrivateKey[Rsa]]] =
+    private[kufuli] def generate(size: Rsa.Size): UEffIO[KeyPair[PublicKey[Rsa], PrivateKey[Rsa]]] =
       genKeyPair("rsa", js.Dynamic.literal(modulusLength = size.bits)).map((pub, priv) =>
         KeyPair(PublicKey.unsafe(keyRepr(exportSpki(pub))), PrivateKey.unsafe(exportPkcs8(priv)))
       )
-    def fromComponents(modulus: Slice, exponent: Slice): EffIO[InvalidKey, PublicKey[Rsa]] = opE {
+    private[kufuli] def fromComponents(modulus: Slice, exponent: Slice): EffIO[InvalidKey, PublicKey[Rsa]] = opE {
       validating(notOnCurve = false) {
         val jwk = js.Dynamic.literal(kty = "RSA", n = Base64Url.encode(modulus.toArray), e = Base64Url.encode(exponent.toArray))
         val ko = crypto.createPublicKey(js.Dynamic.literal(key = jwk, format = "jwk"))
         PublicKey.unsafe[Rsa](keyRepr(exportSpki(ko)))
       }
     }
-    def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[Rsa]] = opE {
-      val d = der.toArray
-      validating(notOnCurve = false) { val _ = parsePub(d); PublicKey.unsafe[Rsa](keyRepr(d)) }
-    }
-    def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[Rsa]] = opE {
-      val d = der.toArray
-      validating(notOnCurve = false) { val _ = crypto.createPrivateKey(derPriv(u8(d))); PrivateKey.unsafe[Rsa](d) }
-    }
-    def components(key: PublicKey[Rsa]): EffIO[KeyNotExportable, Rsa.Components] = op {
+    private[kufuli] def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[Rsa]] =
+      opE(storePub(der.toArray, "rsa", None, notOnCurve = false).map(b => PublicKey.unsafe[Rsa](keyRepr(b))))
+    private[kufuli] def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[Rsa]] =
+      opE(storePriv(der.toArray, "rsa", None).map(PrivateKey.unsafe[Rsa]))
+    private[kufuli] def components(key: PublicKey[Rsa]): EffIO[KeyNotExportable, Rsa.Components] = op {
       val der = Slice.of(keyBytes(key.repr))
-      (for
-        outer <- Der.read(der, 0, 0x30)
-        algId <- Der.read(der, outer.contentOff, 0x30)
-        bits <- Der.read(der, algId.next, 0x03)
-        inner <- Der.read(der, bits.contentOff + 1, 0x30)
-        n <- Der.read(der, inner.contentOff, 0x02)
-        e <- Der.read(der, n.next, 0x02)
-      yield Rsa.Components(
-        IArray.from(unsigned(der.slice(n.contentOff, n.next).toArray)),
-        IArray.from(unsigned(der.slice(e.contentOff, e.next).toArray))
-      )).getOrElse(Rsa.Components(IArray.empty, IArray.empty))
+      demand(
+        for
+          bits <- Der.spkiPublicBits(der)
+          inner <- Der.read(bits, 0, 0x30)
+          n <- Der.read(bits, inner.contentOff, 0x02)
+          e <- Der.read(bits, n.next, 0x02)
+        yield Rsa.Components(
+          IArray.from(unsigned(bits.slice(n.contentOff, n.next).toArray)),
+          IArray.from(unsigned(bits.slice(e.contentOff, e.next).toArray))
+        )
+      )
     }
-    def spki(key: PublicKey[Rsa]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
-    def pkcs8(key: PrivateKey[Rsa]): EffIO[KeyNotExportable, IArray[Byte]] =
-      EffIO.defer(key.read(s => op(IArray.from(s.toArray))))
+    private[kufuli] def spki(key: PublicKey[Rsa]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def pkcs8(key: PrivateKey[Rsa]): EffIO[KeyNotExportable, IArray[Byte]] =
+      EffIO.defer(op(key.read(s => IArray.from(s.toArray))))
 
   private def kemKeysOf[K <: KemAlgorithm](kind: String, spec: KemSpec[K]): KemKeys[K] = new KemKeys[K]:
-    def generate: UEffIO[KeyPair[PublicKey[K], PrivateKey[K]]] =
+    private[kufuli] def generate: UEffIO[KeyPair[PublicKey[K], PrivateKey[K]]] =
       genKeyPair(kind, emptyOptions).map { (pub, priv) =>
         val rawPub = ba(pub.`export`(js.Dynamic.literal(format = "raw-public")))
         val seed = ba(priv.`export`(js.Dynamic.literal(format = "raw-seed")))
         KeyPair(PublicKey.unsafe(keyRepr(rawPub)), PrivateKey.unsafe(seed))
       }
-    def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[K]] = opE {
+    private[kufuli] def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[K]] = opE {
       if bytes.length != spec.publicKeyLength then Left(InvalidKey.WrongLength(spec.publicKeyLength, bytes.length))
-      else Right(PublicKey.unsafe(keyRepr(bytes.toArray)))
+      else
+        // FIPS 203 section 7.2's encapsulation-key check; without it a peer key of the right length
+        // fails at `encapsulate` as a defect instead of at import as a value, and the JVM already
+        // rejects it at import.
+        validating(notOnCurve = false) {
+          val _ = crypto.createPublicKey(rawPublic(u8(bytes.toArray), kind))
+          PublicKey.unsafe[K](keyRepr(bytes.toArray))
+        }
     }
-    def raw(key: PublicKey[K]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def raw(key: PublicKey[K]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def fromSeed(seed: Slice): EffIO[InvalidKey, KeyPair[PublicKey[K], PrivateKey[K]]] = opE {
+      if seed.length != 64 then Left(InvalidKey.WrongLength(64, seed.length))
+      else
+        validating(notOnCurve = false) {
+          val priv = crypto.createPrivateKey(rawSeed(u8(seed.toArray), kind))
+          val pub = ba(crypto.createPublicKey(priv).`export`(js.Dynamic.literal(format = "raw-public")))
+          KeyPair(PublicKey.unsafe[K](keyRepr(pub)), PrivateKey.unsafe[K](seed.toArray))
+        }
+    }
 
   // Capability bundles the node platform table wires each companion into.
   private[kufuli] trait RandomDefault:
@@ -540,6 +601,7 @@ private[kufuli] object node:
     given Mac[HmacSha256] = macOf("sha256")
     given Mac[HmacSha384] = macOf("sha384")
     given Mac[HmacSha512] = macOf("sha512")
+    given Mac[HmacSha1] = macOf("sha1")
   private[kufuli] trait SignersAll:
     given Signer[Ed25519] = edSigner
     given Signer[P256] = ecSigner

@@ -50,7 +50,13 @@ private[kufuli] object nodecrypto:
     def diffieHellman(options: js.Any): Uint8Array = js.native
     def publicEncrypt(key: js.Any, buffer: Uint8Array): Uint8Array = js.native
     def privateDecrypt(key: js.Any, buffer: Uint8Array): Uint8Array = js.native
-    def pbkdf2Sync(password: Uint8Array, salt: Uint8Array, iterations: Int, keylen: Int, digest: String): Uint8Array = js.native
+    def pbkdf2(
+      password: Uint8Array,
+      salt: Uint8Array,
+      iterations: Int,
+      keylen: Int,
+      digest: String,
+      callback: js.Function2[js.Error | Null, Uint8Array, Unit]): Unit = js.native
     def encapsulate(publicKey: KeyObject): Encapsulation = js.native
     def decapsulate(privateKey: KeyObject, ciphertext: Uint8Array): Uint8Array = js.native
     val constants: Constants = js.native
@@ -79,6 +85,16 @@ private[kufuli] object nodecrypto:
   @js.native
   private[kufuli] trait KeyObject extends js.Object:
     def `export`(options: js.Any): Uint8Array = js.native
+    val asymmetricKeyType: js.UndefOr[String] = js.native
+    val asymmetricKeyDetails: js.UndefOr[KeyDetails] = js.native
+
+  @js.native
+  private[kufuli] trait KeyDetails extends js.Object:
+    val namedCurve: js.UndefOr[String] = js.native
+
+  @js.native
+  private trait NodeError extends js.Object:
+    val code: js.UndefOr[String] = js.native
 
   @js.native
   private[kufuli] trait Encapsulation extends js.Object:
@@ -99,4 +115,12 @@ private[kufuli] object nodecrypto:
     int8Array2ByteArray(new Int8Array(u.buffer, u.byteOffset, u.length))
 
   private[kufuli] def zero(u: Uint8Array): Unit = (0 until u.length).foreach(i => u(i) = 0.toShort)
+
+  /** The `code` node attaches to a thrown error, which is how its failure taxonomy is read. */
+  private[kufuli] def errorCode(e: js.JavaScriptException): Option[String] = e.exception match
+    case o: js.Object => dynamic(o).code.toOption
+    case _            => None
+
+  // A property JS attaches at runtime has no statically-typed accessor; the cast is the read.
+  private def dynamic(o: js.Object): NodeError = o.asInstanceOf[NodeError] // scalafix:ok DisableSyntax.asInstanceOf
 end nodecrypto
