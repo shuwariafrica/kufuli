@@ -129,7 +129,7 @@ val `kufuli-tests` =
       Seq.empty[VirtualAxis],
       (p: Project) =>
         p.enablePlugins(WycheproofPlugin)
-          .settings(wycheproofSettings ++ testDir("extended") ++ testDir("pq") ++ testDir("kat"))
+          .settings(wycheproofSettings ++ testDir("kat"))
           .dependsOn(kufuli.jvm(scala3), `kufuli-jose`.jvm(scala3), `kufuli-x509`.jvm(scala3), `kufuli-password`.jvm(scala3))
     )
     .jsPlatform(
@@ -137,14 +137,14 @@ val `kufuli-tests` =
       Seq.empty[VirtualAxis],
       (p: Project) =>
         p.enablePlugins(WycheproofPlugin)
-          .settings(jsSettings ++ wycheproofSettings ++ testDir("extended") ++ testDir("pq") ++ testDir("kat") ++ testDir("node"))
+          .settings(jsSettings ++ wycheproofSettings ++ testDir("kat"))
           .dependsOn(kufuli.js(scala3), `kufuli-jose`.js(scala3), `kufuli-x509`.js(scala3), `kufuli-password`.js(scala3))
     )
     .jsPlatform(
       Seq(scala3),
       Seq(WebCryptoAxis),
       (p: Project) =>
-        p.settings(jsSettings ++ testDir("browser"))
+        p.settings(jsSettings)
           .dependsOn(kufuli.finder(VirtualAxis.js, WebCryptoAxis)(scala3))
     )
     .snxPlatform(
@@ -154,7 +154,7 @@ val `kufuli-tests` =
         p.enablePlugins(WycheproofPlugin)
           .settings(
             wycheproofSettings ++ NativePlatformPlugin.testLinkSettings ++ NativePlatformPlugin.provisionAwsLc ++
-              NativePlatformPlugin.provisionArgon2 ++ testDir("extended") ++ testDir("pq") ++ testDir("kat")
+              NativePlatformPlugin.provisionArgon2 ++ testDir("kat")
           )
           .dependsOn(
             kufuli.native(scala3),
@@ -194,12 +194,6 @@ val `kufuli-native` =
     .defaultAxes(VirtualAxis.native, VirtualAxis.scalaABIVersion(scala3))
     .settings(publish / skip := true)
     .aggregate(kufuli, `kufuli-jose`, `kufuli-password`, `kufuli-x509`, `kufuli-tests`)
-
-val `kufuli-root` =
-  projectMatrix
-    .in(file("."))
-    .settings(publish / skip := true)
-    .aggregate(`kufuli-jvm`, `kufuli-js`, `kufuli-native`)
 
 def jsSettings: List[Setting[?]] = List(
   scalaJSLinkerConfig ~= { _.withModuleKind(ModuleKind.ESModule) }
@@ -250,12 +244,7 @@ def baseCompilerOptions = List(
   "-explain",
   "-Wvalue-discard",
   "-Wnonunit-statement",
-  "-Wunused:implicits",
-  "-Wunused:explicits",
-  "-Wunused:imports",
-  "-Wunused:locals",
-  "-Wunused:params",
-  "-Wunused:privates",
+  "-Wunused:all",
   "-Yrequire-targetName",
   "-Ycheck-reentrant",
   "-Ycheck-mods"

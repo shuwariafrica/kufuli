@@ -11,11 +11,13 @@ import snx.sbt.SNXImports.*
   * SNX.libraries += KufuliNative.awsLc      // core
   * SNX.libraries += KufuliNative.argon2     // kufuli-password
   * }}}
+  *
+  * Both libraries are pinned by full commit SHA; sbt-snx resolves any other ref at build time.
   */
 object KufuliNative {
 
-  /** The aws-lc release kufuli is verified against. */
-  val awsLcTag: String = "v5.2.0"
+  /** The aws-lc commit kufuli is verified against - release v5.2.0. */
+  val awsLcCommit: String = "683ebde4bf3bcc016a9a710ad6b49c0c91b59161"
 
   private val awsLcRepository: String = "https://github.com/aws/aws-lc.git"
 
@@ -50,7 +52,7 @@ object KufuliNative {
     Flags.libraries("pthread", "dl")
   }
 
-  /** aws-lc, built from source at a pinned tag and folded into the link.
+  /** aws-lc, built from source at the pinned commit and folded into the link.
     *
     * The name is `crypto` deliberately: it is both the rebind key and the `-l` name a System
     * provisioning renders, which is what lets a consumer whose system libcrypto IS aws-lc rebind to
@@ -62,7 +64,7 @@ object KufuliNative {
     NativeLibrary(
       "crypto",
       Vendored
-        .git(awsLcRepository, awsLcTag)
+        .git(awsLcRepository, awsLcCommit)
         .cmake(
           Seq("crypto"),
           {
@@ -79,10 +81,10 @@ object KufuliNative {
         .options(closure)
     )
 
-  /** The libargon2 release kufuli is verified against (matches the `vendor/phc-winner-argon2`
-    * submodule commit).
+  /** The libargon2 commit kufuli is verified against - release 20190702, and the commit the
+    * `vendor/phc-winner-argon2` submodule pins.
     */
-  val argon2Tag: String = "20190702"
+  val argon2Commit: String = "62358ba2123abd17fccf2a108a301d4b52c01a7c"
 
   private val argon2Repository: String = "https://github.com/P-H-C/phc-winner-argon2.git"
 
@@ -140,7 +142,7 @@ object KufuliNative {
     }
   }
 
-  /** libargon2, built from source at a pinned tag and folded into the link.
+  /** libargon2, built from source at the pinned commit and folded into the link.
     *
     * The name is `argon2`, both the rebind key and the `-l` name, so a consumer whose system
     * already provides libargon2 can rebind `NativeLibrary("argon2")` to System instead of vendoring
@@ -152,7 +154,7 @@ object KufuliNative {
     NativeLibrary(
       "argon2",
       Vendored
-        .git(argon2Repository, argon2Tag)
+        .git(argon2Repository, argon2Commit)
         // The token is the whole cache key for a `command` build (the build function's contents are not
         // hashed), so it MUST change whenever `buildArgon2` changes, or a stale archive is reused.
         .command("libargon2-static-ref-nothreads-2-winobjs")(buildArgon2)
