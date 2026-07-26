@@ -81,6 +81,14 @@ object Unexpected:
 private[kufuli] def guard[A](io: IO[A]): IO[A] =
   io.handleErrorWith(t => IO.raiseError(Unexpected(t)))
 
+// A backend that hands back an unusable value where the call was already made total (a parsed key,
+// a validated length) is anomalous, and on a path producing a key, a signature, a digest or a
+// ciphertext the only sound outcome is a raise: any value of the right shape is a success the
+// caller cannot tell from a real one. `guard` sanitises the raise into a defect.
+private[kufuli] def demand[A](result: Either[?, A]): A = result match
+  case Right(a) => a
+  case Left(_)  => throw new IllegalStateException("backend produced an unusable result") // scalafix:ok DisableSyntax.throw
+
 // The one place secret-byte zeroisation and liveness live; mutable backing is what makes `wipe`
 // possible (best-effort on managed runtimes per `Slice.wipe`).
 final private[kufuli] class Secret(bytes: Array[Byte]):
@@ -210,6 +218,12 @@ sealed trait HmacSha384 extends MacAlgorithm
 case object HmacSha384 extends MacSpec[HmacSha384](48) with HmacSha384
 sealed trait HmacSha512 extends MacAlgorithm
 case object HmacSha512 extends MacSpec[HmacSha512](64) with HmacSha512
+// HMAC-SHA1 exists for OATH HOTP/TOTP interop only (RFC 6238's default; the dominant authenticator
+// apps ignore the algorithm parameter). HMAC is unaffected by SHA-1 collision weakness, and the
+// sealed JWS algorithm set plus Sha2-bounded KDFs keep it out of every signing and derivation
+// position.
+sealed trait HmacSha1 extends MacAlgorithm
+case object HmacSha1 extends MacSpec[HmacSha1](20) with HmacSha1
 
 sealed trait AesKw128 extends WrapAlgorithm
 case object AesKw128 extends WrapSpec[AesKw128](16, padded = false) with AesKw128
@@ -315,9 +329,12 @@ object PublicKey:
       (0 until 31).forall(i => point(i) == entry(i)) && (point(31) & 0x7f) == (entry(31) & 0x7f)
     )
 
-  private def x25519SpkiLowOrder(der: Slice): Boolean =
-    val bytes = der.toArray
-    bytes.length >= 32 && isX25519LowOrder(bytes.takeRight(32))
+  // The blocklist is only meaningful over the point the backend will actually import, so the point
+  // is located by walking the encoding, and an X25519 SPKI this walk cannot reduce to exactly 32
+  // subjectPublicKey octets is refused: any encoding a permissive backend accepts but kufuli cannot
+  // position is one where the check reads different bytes from the import.
+  private def x25519Spki(der: Slice): Either[InvalidKey, Unit] =
+    Der.spkiPublicBits(der, 32).flatMap(point => if isX25519LowOrder(point.toArray) then Left(InvalidKey.WeakPoint) else Right(()))
 
   // PARSE names the encoding. Imports are effectful and typed: real validation (on-curve,
   // small-order, full-encoding) is backend work - and what makes `agree` TOTAL.
@@ -336,7 +353,7 @@ object PublicKey:
     val _ = alg
     k.fromRaw(bytes)
 
-  /** SEC1 point (uncompressed or compressed) - the TLS KeyShare wire form. */
+  /** SEC1 uncompressed point (`0x04 || X || Y`) - the TLS KeyShare wire form. */
   def fromSec1[C <: EcCurve](curve: EcSpec[C])(point: Slice)(using k: EcKeys[C]): EffIO[InvalidKey, PublicKey[C]] =
     val _ = curve
     k.fromSec1(point)
@@ -344,6 +361,30 @@ object PublicKey:
   /** RSA public key from its JWK components. */
   def fromComponents(modulus: Slice, exponent: Slice)(using k: RsaKeys): EffIO[InvalidKey, PublicKey[Rsa]] =
     k.fromComponents(modulus, exponent)
+
+  private def ecAlg(curve: EcSpec[?]): Der.Alg = curve match
+    case _: P256.type => Der.Alg.EcP256
+    case _: P384.type => Der.Alg.EcP384
+    case _: P521.type => Der.Alg.EcP521
+
+  /** SubjectPublicKeyInfo of a KNOWN family - the JWKS, certificate-pinning and configuration
+    * paths, where the algorithm is fixed by the protocol rather than discovered from the blob. The
+    * blob must name that family and nothing else, exactly as the dispatching overload requires.
+    */
+  def fromSpki(alg: Ed25519)(der: Slice)(using k: EdKeys): EffIO[InvalidKey, PublicKey[Ed25519]] =
+    val _ = alg
+    EffIO.from(Der.requireSpki(der, Der.Alg.Ed)).flatMap(_ => k.fromSpki(der))
+  @targetName("fromSpkiX")
+  def fromSpki(alg: X25519)(der: Slice)(using k: XKeys): EffIO[InvalidKey, PublicKey[X25519]] =
+    val _ = alg
+    EffIO.from(Der.requireSpki(der, Der.Alg.X).flatMap(_ => x25519Spki(der))).flatMap(_ => k.fromSpki(der))
+  @targetName("fromSpkiEc")
+  def fromSpki[C <: EcCurve](curve: EcSpec[C])(der: Slice)(using k: EcKeys[C]): EffIO[InvalidKey, PublicKey[C]] =
+    EffIO.from(Der.requireSpki(der, ecAlg(curve))).flatMap(_ => k.fromSpki(der))
+  @targetName("fromSpkiRsa")
+  def fromSpki(alg: Rsa.type)(der: Slice)(using k: RsaKeys): EffIO[InvalidKey, PublicKey[Rsa]] =
+    val _ = alg
+    EffIO.from(Der.requireSpki(der, Der.Alg.OfRsa)).flatMap(_ => k.fromSpki(der))
 
   /** SPKI of UNKNOWN algorithm: the shared bounded DER peek dispatches the WHOLE blob to the right
     * family; the caller matches the enum and the bound type flows into every later op.
@@ -357,10 +398,8 @@ object PublicKey:
     rsa: RsaKeys
   ): EffIO[InvalidKey, ImportedPublicKey] =
     EffIO.from(Der.peekSpki(der)).flatMap {
-      case Der.Alg.Ed => ed.fromSpki(der).map(ImportedPublicKey.Ed(_))
-      case Der.Alg.X  =>
-        if x25519SpkiLowOrder(der) then EffIO.fail(InvalidKey.WeakPoint)
-        else x.fromSpki(der).map(ImportedPublicKey.X(_))
+      case Der.Alg.Ed     => ed.fromSpki(der).map(ImportedPublicKey.Ed(_))
+      case Der.Alg.X      => EffIO.from(x25519Spki(der)).flatMap(_ => x.fromSpki(der)).map(ImportedPublicKey.X(_))
       case Der.Alg.EcP256 => p256.fromSpki(der).map(ImportedPublicKey.EcP256(_))
       case Der.Alg.EcP384 => p384.fromSpki(der).map(ImportedPublicKey.EcP384(_))
       case Der.Alg.EcP521 => p521.fromSpki(der).map(ImportedPublicKey.EcP521(_))
@@ -508,10 +547,11 @@ object Signature:
     val _ = alg
     if bytes.nonEmpty then Right(bytes.clone) else Left(Malformed)
 
-  /** DER <-> raw conversion for the ECDSA wire forms (TLS/X.509 carry the DER
+  /** DER to raw conversion for the ECDSA wire forms (TLS and X.509 carry the DER
     * `SEQUENCE { INTEGER r, INTEGER s }`; JOSE and this library carry fixed-width `r || s`). Pure,
-    * bounded, and strict: a trailing byte, an out-of-range integer, or a non-minimal length is
-    * [[Malformed]].
+    * bounded, and strict, so one signature has exactly one accepted encoding: a trailing byte, a
+    * length or INTEGER not in its shortest form, a negative INTEGER, or a value wider than the
+    * field is [[Malformed]].
     */
   def fromDer[C <: EcCurve](curve: EcSpec[C])(der: Array[Byte]): Either[Malformed, Signature[C]] =
     ecdsaDerToRaw(Slice.of(der), curve.fieldLength).map(unsafe[C]).left.map(_ => Malformed)
@@ -519,6 +559,10 @@ object Signature:
   private[kufuli] def ecdsaDerToRaw(der: Slice, fieldLength: Int): Either[InvalidKey, Array[Byte]] =
     for
       seq <- Der.read(der, 0, 0x30)
+      // Bytes after the SEQUENCE, or between `s` and the SEQUENCE's end, would give one signature
+      // many DER spellings - forgeable identity wherever a consumer keys a replay cache or an audit
+      // fingerprint on the encoded form.
+      _ <- if seq.next == der.length then Right(()) else Left(InvalidKey.Malformed)
       r <- Der.read(der, seq.contentOff, 0x02)
       s <- Der.read(der, r.next, 0x02)
       _ <- if s.next == seq.next then Right(()) else Left(InvalidKey.Malformed)
@@ -526,19 +570,19 @@ object Signature:
       sb <- ecdsaField(der, s, fieldLength)
     yield rb ++ sb
 
-  // One DER INTEGER (r or s) to a fixed-width big-endian field: drop the sign byte / leading zeros,
-  // reject an over-length or negative value, left-pad to `fieldLength`.
+  // One DER INTEGER (r or s) to a fixed-width big-endian field. DER admits exactly one encoding of
+  // a value: no empty content, no leading 0x00 except to clear a set sign bit, and a magnitude
+  // within the field.
   private def ecdsaField(der: Slice, tlv: Der.Tlv, fieldLength: Int): Either[InvalidKey, Array[Byte]] =
     val raw = der.slice(tlv.contentOff, tlv.next).toArray
-    if raw.isEmpty || (raw(0) & 0x80) != 0 then Left(InvalidKey.Malformed)
+    val padded = raw.length > 1 && (raw(0) & 0xff) == 0x00
+    if raw.isEmpty || (raw(0) & 0x80) != 0 || (padded && (raw(1) & 0x80) == 0) then Left(InvalidKey.Malformed)
     else
-      @tailrec def firstNonZero(i: Int): Int = if i < raw.length - 1 && (raw(i) & 0xff) == 0 then firstNonZero(i + 1) else i
-      val i = firstNonZero(0)
-      val magLen = raw.length - i
+      val magLen = if padded then raw.length - 1 else raw.length
       if magLen > fieldLength then Left(InvalidKey.Malformed)
       else
         val out = new Array[Byte](fieldLength)
-        Array.copy(raw, i, out, fieldLength - magLen, magLen)
+        Array.copy(raw, raw.length - magLen, out, fieldLength - magLen, magLen)
         Right(out)
   end ecdsaField
 
@@ -638,7 +682,9 @@ object SharedSecret:
     def deriveKey[A <: SymmetricAlgorithm](hash: Sha2, salt: Slice, info: Slice, as: SymmetricSpec[A])(using
       Kdf
     ): UEffIO[SecretKey[A]] =
-      HKDF.extractFrom(hash, salt, z).flatMap(prk => HKDF.expandKey(hash, prk, info, as).flatMap(k => prk.destroy.map(_ => k)))
+      // The PRK is full key material and the expand can fail or be cancelled, so its destruction is
+      // a finaliser rather than a step on the success path.
+      HKDF.extractFrom(hash, salt, z).flatMap(prk => HKDF.expandKey(hash, prk, info, as).guarantee(prk.destroy))
   end extension
 end SharedSecret
 
@@ -664,23 +710,33 @@ end Prk
 // One typeclass per family. Instances live in the per-unit platform trait each companion extends
 // (implicit scope, zero imports); instance PRESENCE is the backend's capability truth, and the
 // @implicitNotFound message names it.
+//
+// Each family trait is a public TYPE with a `private[kufuli]` METHOD surface: a using-clause still
+// names it and a consumer can still summon and pass the instance, but the primitive is callable
+// only from inside kufuli. Every invariant kufuli advertises lives in the shared wrapper above the
+// primitive - budgets, the HKDF counter bound, the RFC 3394 length rule, the X25519 blocklist - so
+// making the wrapper the sole public path is what makes those invariants unbypassable rather than
+// merely present. Terminal consumer handles (`Signature.Signer`/`Verifier`, `Hasher`, `Cipher`) are
+// NOT part of this seam: they carry no wrapper and sealing them would remove a capability.
+// A backend override must repeat the qualifier - a plain `def` widens the member back to public
+// through that instance's own type.
 
 /** The backend CSPRNG. */
 @implicitNotFound("this kufuli backend provides no CSPRNG (report this artifact pairing as a bug)")
 trait Random:
-  def bytes(n: Int): UEffIO[Slice]
-  def fill(dst: Slice): UEffIO[Unit]
+  private[kufuli] def bytes(n: Int): UEffIO[Slice]
+  private[kufuli] def fill(dst: Slice): UEffIO[Unit]
 object Random extends RandomPlatform:
   /** Fresh CSPRNG bytes (PKCE verifiers, salts, ids). */
   def bytes(n: Int)(using r: Random): UEffIO[Slice] = r.bytes(n)
 
-  /** Zero-allocation fill of a caller buffer. */
+  /** Fills a caller-owned buffer with CSPRNG bytes. */
   def fill(dst: Slice)(using r: Random): UEffIO[Unit] = r.fill(dst)
 
 @implicitNotFound("${A} is not provided by this kufuli backend (XChaCha and GCM-SIV are Native-only; the browser lacks ChaCha)")
 trait Aead[A <: AeadAlgorithm]:
-  def seal(key: SecretKey[A], nonce: Nonce[A], aad: Slice, plaintext: Slice): UEffIO[Slice]
-  def open(key: SecretKey[A], nonce: Nonce[A], aad: Slice, ciphertext: Slice): EffIO[AuthFailed, Slice]
+  private[kufuli] def seal(key: SecretKey[A], nonce: Nonce[A], aad: Slice, plaintext: Slice): UEffIO[Slice]
+  private[kufuli] def open(key: SecretKey[A], nonce: Nonce[A], aad: Slice, ciphertext: Slice): EffIO[AuthFailed, Slice]
 object Aead extends AeadPlatform
 
 /** Whole-message AEAD over the key: the protocol-shaped tier (PASETO-class constructions own their
@@ -695,15 +751,13 @@ extension [A <: AeadAlgorithm](key: SecretKey[A])
 
 @implicitNotFound("HMAC ${H} is not provided by this kufuli backend")
 trait Mac[H <: MacAlgorithm]:
-  /** Compute the tag. Verification is SHARED code (recompute + the one audited constant-time
-    * compare) - never a backend op, so no backend can get the no-oracle rule wrong.
-    */
-  def sign(key: SecretKey[H], data: Slice): UEffIO[Signature[H]]
+  // There is deliberately no backend verify: verification is recompute plus the one audited
+  // constant-time compare, in shared code, so no backend can get the no-oracle rule wrong.
+  private[kufuli] def sign(key: SecretKey[H], data: Slice): UEffIO[Signature[H]]
 
-  /** A prepared-key handle; the default wraps [[sign]] at zero cost - a backend overrides it where
-    * key preparation is genuinely expensive (JCA key objects, WebCrypto imports).
-    */
-  def prepared(key: SecretKey[H]): Resource[IO, Signature.Signer[H]] =
+  // The default costs nothing; a backend overrides it where key preparation is genuinely expensive
+  // (JCA key objects, WebCrypto imports).
+  private[kufuli] def prepared(key: SecretKey[H]): Resource[IO, Signature.Signer[H]] =
     Resource.pure(
       new Signature.Signer[H]:
         def sign(data: Slice): UEffIO[Signature[H]] = Mac.this.sign(key, data)
@@ -740,8 +794,8 @@ end extension
 
 @implicitNotFound("signing for ${A} is not provided by this kufuli backend")
 trait Signer[A <: SignatureAlgorithm]:
-  def sign(key: PrivateKey[A], data: Slice, scheme: Scheme[A]): UEffIO[Signature[A]]
-  def prepared(key: PrivateKey[A], scheme: Scheme[A]): Resource[IO, Signature.Signer[A]] =
+  private[kufuli] def sign(key: PrivateKey[A], data: Slice, scheme: Scheme[A]): UEffIO[Signature[A]]
+  private[kufuli] def prepared(key: PrivateKey[A], scheme: Scheme[A]): Resource[IO, Signature.Signer[A]] =
     Resource.pure(
       new Signature.Signer[A]:
         def sign(data: Slice): UEffIO[Signature[A]] = Signer.this.sign(key, data, scheme)
@@ -750,8 +804,8 @@ object Signer extends SignerPlatform
 
 @implicitNotFound("signature verification for ${A} is not provided by this kufuli backend")
 trait Verifier[A <: SignatureAlgorithm]:
-  def verify(key: PublicKey[A], data: Slice, sig: Signature[A], scheme: Scheme[A]): EffIO[SignatureRejected, Unit]
-  def prepared(key: PublicKey[A], scheme: Scheme[A]): Resource[IO, Signature.Verifier[A]] =
+  private[kufuli] def verify(key: PublicKey[A], data: Slice, sig: Signature[A], scheme: Scheme[A]): EffIO[SignatureRejected, Unit]
+  private[kufuli] def prepared(key: PublicKey[A], scheme: Scheme[A]): Resource[IO, Signature.Verifier[A]] =
     Resource.pure(
       new Signature.Verifier[A]:
         def verify(data: Slice, sig: Signature[A]): EffIO[SignatureRejected, Unit] =
@@ -823,8 +877,8 @@ extension (k: PublicKey[Rsa])
 
 @implicitNotFound("key agreement for ${A} is not provided by this kufuli backend")
 trait Agreement[A <: AgreementAlgorithm]:
-  /** Total: peer keys are validated at import and generated keys are valid by construction. */
-  def agree(priv: PrivateKey[A], pub: PublicKey[A]): UEffIO[SharedSecret]
+  // Total: peer keys are validated at import and generated keys are valid by construction.
+  private[kufuli] def agree(priv: PrivateKey[A], pub: PublicKey[A]): UEffIO[SharedSecret]
 object Agreement extends AgreementPlatform
 
 extension [A <: AgreementAlgorithm](k: PrivateKey[A])
@@ -832,10 +886,10 @@ extension [A <: AgreementAlgorithm](k: PrivateKey[A])
 
 @implicitNotFound("${K} is not provided by this kufuli backend (ML-KEM is JVM >= 25 and Native, not Node or browser)")
 trait Kem[K <: KemAlgorithm]:
-  def encapsulate(pub: PublicKey[K]): UEffIO[Encapsulated[K]]
+  private[kufuli] def encapsulate(pub: PublicKey[K]): UEffIO[Encapsulated[K]]
 
-  /** Total: FIPS 203 implicit rejection returns a pseudorandom secret for a forged ciphertext. */
-  def decapsulate(priv: PrivateKey[K], ct: KemCiphertext[K]): UEffIO[SharedSecret]
+  // Total: FIPS 203 implicit rejection returns a pseudorandom secret for a forged ciphertext.
+  private[kufuli] def decapsulate(priv: PrivateKey[K], ct: KemCiphertext[K]): UEffIO[SharedSecret]
 object Kem extends KemPlatform
 
 extension [K <: KemAlgorithm](pub: PublicKey[K]) def encapsulate(using k: Kem[K]): UEffIO[Encapsulated[K]] = k.encapsulate(pub)
@@ -844,9 +898,8 @@ extension [K <: KemAlgorithm](priv: PrivateKey[K])
 
 @implicitNotFound("key wrapping for ${W} is not provided by this kufuli backend (the browser lacks AES-KWP)")
 trait Wrap[W <: WrapAlgorithm]:
-  /** Backend primitive over pre-validated bytes; the typed surface is the SecretKey extension. */
-  def wrap(kek: SecretKey[W], target: Slice): UEffIO[Slice]
-  def unwrap(kek: SecretKey[W], wrapped: Slice): EffIO[UnwrapFailed, Slice]
+  private[kufuli] def wrap(kek: SecretKey[W], target: Slice): UEffIO[Slice]
+  private[kufuli] def unwrap(kek: SecretKey[W], wrapped: Slice): EffIO[UnwrapFailed, Slice]
 object Wrap extends WrapPlatform
 
 extension [W <: WrapAlgorithm](kek: SecretKey[W])
@@ -878,9 +931,9 @@ end extension
 
 @implicitNotFound("HKDF/PBKDF2 is not provided by this kufuli backend")
 trait Kdf:
-  def extract(hash: Sha2, salt: Slice, ikm: Slice): UEffIO[Prk]
-  def expand(hash: Sha2, prk: Prk, info: Slice, length: Int): UEffIO[Slice]
-  def pbkdf2(hash: Sha2, password: Slice, salt: Slice, iterations: Int, length: Int): UEffIO[Slice]
+  private[kufuli] def extract(hash: Sha2, salt: Slice, ikm: Slice): UEffIO[Prk]
+  private[kufuli] def expand(hash: Sha2, prk: Prk, info: Slice, length: Int): UEffIO[Slice]
+  private[kufuli] def pbkdf2(hash: Sha2, password: Slice, salt: Slice, iterations: Int, length: Int): UEffIO[Slice]
 object Kdf extends KdfPlatform
 
 /** HKDF (RFC 5869) with Extract and Expand exposed SEPARATELY, as the TLS/QUIC key schedule needs.
@@ -960,14 +1013,14 @@ end PBKDF2
 
 @implicitNotFound("${D} is not provided by this kufuli backend")
 trait Hash[D <: HashAlgorithm]:
-  def digest(data: Slice): UEffIO[Digest]
+  private[kufuli] def digest(data: Slice): UEffIO[Digest]
 object Hash extends HashPlatform
 
 @implicitNotFound(
   "this kufuli backend cannot hash synchronously (WebCrypto is async-only): incremental hashing is unavailable in the browser artifact"
 )
 trait Hashing[D <: HashAlgorithm]:
-  def hasher: Resource[IO, Hasher]
+  private[kufuli] def hasher: Resource[IO, Hasher]
 object Hashing extends HashingPlatform
 
 /** A synchronous, single-fibre incremental hash. `digest` SNAPSHOTS without consuming the context -
@@ -979,8 +1032,8 @@ trait Hasher:
 
 @implicitNotFound("RSA-OAEP is not provided by this kufuli backend")
 trait Oaep:
-  def encrypt(key: PublicKey[Rsa], plaintext: Slice, scheme: RsaOaep): UEffIO[Slice]
-  def decrypt(key: PrivateKey[Rsa], ciphertext: Slice, scheme: RsaOaep): EffIO[AuthFailed, Slice]
+  private[kufuli] def encrypt(key: PublicKey[Rsa], plaintext: Slice, scheme: RsaOaep): UEffIO[Slice]
+  private[kufuli] def decrypt(key: PrivateKey[Rsa], ciphertext: Slice, scheme: RsaOaep): EffIO[AuthFailed, Slice]
 object Oaep extends OaepPlatform
 
 extension (k: PublicKey[Rsa])
@@ -1054,8 +1107,8 @@ final case class AeadLimits(encryptions: Long, bytes: Long, decryptFailures: Lon
   require(encryptions > 0 && bytes > 0 && decryptFailures > 0, "AEAD limits must be positive")
 object AeadLimits:
   /** The floor shared by the 96-bit-nonce tier (AES-GCM, GCM-SIV, CBC-HS): SP 800-38D section 8.3
-    * caps invocations at 2^32 for a random 96-bit IV; the forgery limit is the smallest across the
-    * tier (RFC 9001 section 6.6 Poly1305).
+    * caps invocations at 2^32 for a random 96-bit IV, and the forgery budget sits well inside RFC
+    * 9001 section 6.6's AES-GCM integrity limit.
     */
   val default: AeadLimits = AeadLimits(1L << 32, 1L << 50, 1L << 36)
 
@@ -1091,12 +1144,12 @@ object Cipher:
     * [[Cipher]] wrapper, which pre-validates every buffer.
     */
   trait Engine[A <: AeadAlgorithm]:
-    def encrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Int
-    def decrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Either[AuthFailed, Int]
+    private[kufuli] def encrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Int
+    private[kufuli] def decrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Either[AuthFailed, Int]
 
 @implicitNotFound("a synchronous record engine for ${A} is not provided by this kufuli backend (WebCrypto is async-only: the record Cipher is unavailable in the browser artifact)")
 trait Ciphering[A <: AeadAlgorithm]:
-  def engine(key: SecretKey[A]): Resource[IO, Cipher.Engine[A]]
+  private[kufuli] def engine(key: SecretKey[A]): Resource[IO, Cipher.Engine[A]]
 object Ciphering extends CipheringPlatform
 
 // The one audited accounting site. Encrypt charges the confidentiality budgets (invocations AND
@@ -1219,54 +1272,60 @@ end extension
 
 @implicitNotFound("Ed25519 key lifecycle is not provided by this kufuli backend")
 trait EdKeys:
-  def generate: UEffIO[KeyPair[PublicKey[Ed25519], PrivateKey[Ed25519]]]
-  def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[Ed25519]]
-  def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[Ed25519]]
-  def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[Ed25519]]
-  def raw(key: PublicKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]]
-  def spki(key: PublicKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]]
-  def pkcs8(key: PrivateKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]]
+  private[kufuli] def generate: UEffIO[KeyPair[PublicKey[Ed25519], PrivateKey[Ed25519]]]
+  private[kufuli] def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[Ed25519]]
+  private[kufuli] def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[Ed25519]]
+  private[kufuli] def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[Ed25519]]
+  private[kufuli] def raw(key: PublicKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]]
+  private[kufuli] def spki(key: PublicKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]]
+  private[kufuli] def pkcs8(key: PrivateKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]]
 object EdKeys extends EdKeysPlatform
 
 @implicitNotFound("X25519 key lifecycle is not provided by this kufuli backend")
 trait XKeys:
-  def generate: UEffIO[KeyPair[PublicKey[X25519], PrivateKey[X25519]]]
-  def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[X25519]]
-  def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[X25519]]
-  def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[X25519]]
-  def raw(key: PublicKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]]
-  def spki(key: PublicKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]]
-  def pkcs8(key: PrivateKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]]
+  private[kufuli] def generate: UEffIO[KeyPair[PublicKey[X25519], PrivateKey[X25519]]]
+  private[kufuli] def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[X25519]]
+  private[kufuli] def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[X25519]]
+  private[kufuli] def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[X25519]]
+  private[kufuli] def raw(key: PublicKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]]
+  private[kufuli] def spki(key: PublicKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]]
+  private[kufuli] def pkcs8(key: PrivateKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]]
 object XKeys extends XKeysPlatform
 
 @implicitNotFound("key lifecycle for curve ${C} is not provided by this kufuli backend")
 trait EcKeys[C <: EcCurve]:
-  def generate: UEffIO[KeyPair[PublicKey[C], PrivateKey[C]]]
-  def fromSec1(point: Slice): EffIO[InvalidKey, PublicKey[C]]
-  def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[C]]
-  def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[C]]
-  def sec1(key: PublicKey[C]): EffIO[KeyNotExportable, IArray[Byte]]
-  def spki(key: PublicKey[C]): EffIO[KeyNotExportable, IArray[Byte]]
-  def pkcs8(key: PrivateKey[C]): EffIO[KeyNotExportable, IArray[Byte]]
+  private[kufuli] def generate: UEffIO[KeyPair[PublicKey[C], PrivateKey[C]]]
+  private[kufuli] def fromSec1(point: Slice): EffIO[InvalidKey, PublicKey[C]]
+  private[kufuli] def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[C]]
+  private[kufuli] def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[C]]
+  private[kufuli] def sec1(key: PublicKey[C]): EffIO[KeyNotExportable, IArray[Byte]]
+  private[kufuli] def spki(key: PublicKey[C]): EffIO[KeyNotExportable, IArray[Byte]]
+  private[kufuli] def pkcs8(key: PrivateKey[C]): EffIO[KeyNotExportable, IArray[Byte]]
 object EcKeys extends EcKeysPlatform
 
 @implicitNotFound("RSA key lifecycle is not provided by this kufuli backend")
 trait RsaKeys:
-  def generate(size: Rsa.Size): UEffIO[KeyPair[PublicKey[Rsa], PrivateKey[Rsa]]]
-  def fromComponents(modulus: Slice, exponent: Slice): EffIO[InvalidKey, PublicKey[Rsa]]
-  def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[Rsa]]
-  def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[Rsa]]
-  def components(key: PublicKey[Rsa]): EffIO[KeyNotExportable, Rsa.Components]
-  def spki(key: PublicKey[Rsa]): EffIO[KeyNotExportable, IArray[Byte]]
-  def pkcs8(key: PrivateKey[Rsa]): EffIO[KeyNotExportable, IArray[Byte]]
+  private[kufuli] def generate(size: Rsa.Size): UEffIO[KeyPair[PublicKey[Rsa], PrivateKey[Rsa]]]
+  private[kufuli] def fromComponents(modulus: Slice, exponent: Slice): EffIO[InvalidKey, PublicKey[Rsa]]
+  private[kufuli] def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[Rsa]]
+  private[kufuli] def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[Rsa]]
+  private[kufuli] def components(key: PublicKey[Rsa]): EffIO[KeyNotExportable, Rsa.Components]
+  private[kufuli] def spki(key: PublicKey[Rsa]): EffIO[KeyNotExportable, IArray[Byte]]
+  private[kufuli] def pkcs8(key: PrivateKey[Rsa]): EffIO[KeyNotExportable, IArray[Byte]]
 object RsaKeys extends RsaKeysPlatform
 
 // KEM keys travel raw in v1 protocols (TLS KeyShare); SPKI/PKCS#8 interop is post-v1.
 @implicitNotFound("${K} key lifecycle is not provided by this kufuli backend (ML-KEM is JVM >= 25 and Native)")
 trait KemKeys[K <: KemAlgorithm]:
-  def generate: UEffIO[KeyPair[PublicKey[K], PrivateKey[K]]]
-  def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[K]]
-  def raw(key: PublicKey[K]): EffIO[KeyNotExportable, IArray[Byte]]
+  private[kufuli] def generate: UEffIO[KeyPair[PublicKey[K], PrivateKey[K]]]
+  private[kufuli] def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[K]]
+  private[kufuli] def raw(key: PublicKey[K]): EffIO[KeyNotExportable, IArray[Byte]]
+
+  // Deterministic KeyGen from the FIPS 203 64-byte (d || z) seed. No profile persists a
+  // decapsulation key - TLS hybrid shares are generate-and-forget - so a stored one would be a
+  // liability with no use; the seam exists solely so the seed-keyed conformance corpus is
+  // assertable, and the public surface deliberately does not grow.
+  private[kufuli] def fromSeed(seed: Slice): EffIO[InvalidKey, KeyPair[PublicKey[K], PrivateKey[K]]]
 object KemKeys extends KemKeysPlatform
 
 // Exports - effectful and typed. Symmetric raw export is deliberately ABSENT (compile fact).

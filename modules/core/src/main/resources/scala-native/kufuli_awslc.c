@@ -36,12 +36,12 @@
 #include <openssl/chacha.h>
 #include <openssl/cipher.h>
 #include <openssl/crypto.h>
-#include <openssl/curve25519.h>
 #include <openssl/digest.h>
 #include <openssl/ec.h>
 #include <openssl/ec_key.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/experimental/kem_deterministic_api.h>
 #include <openssl/hkdf.h>
 #include <openssl/hmac.h>
 #include <openssl/mem.h>
@@ -87,15 +87,6 @@ int kufuli_is_awslc(void) { return awslc_api_version_num() > 0 ? 1 : 0; }
 int kufuli_random_bytes(uint8_t *out, size_t len) {
   if (len == 0) return 1;
   return RAND_bytes(out, len);
-}
-
-int kufuli_ct_equals(const uint8_t *a, const uint8_t *b, size_t len) {
-  if (len == 0) return 1;
-  return CRYPTO_memcmp(a, b, len) == 0 ? 1 : 0;
-}
-
-void kufuli_cleanse(uint8_t *p, size_t len) {
-  if (len > 0) OPENSSL_cleanse(p, len);
 }
 
 void *kufuli_aead_new(int alg, const uint8_t *key, size_t key_len) {
@@ -158,11 +149,6 @@ int kufuli_hmac(int md, const uint8_t *key, size_t key_len, const uint8_t *data,
   return 1;
 }
 
-int kufuli_digest_size(int md) {
-  const EVP_MD *digest = md_of(md);
-  return digest == NULL ? 0 : (int)EVP_MD_size(digest);
-}
-
 int kufuli_digest(int md, const uint8_t *data, size_t len, uint8_t *out) {
   const EVP_MD *digest = md_of(md);
   unsigned int n = 0;
@@ -207,64 +193,43 @@ int kufuli_hasher_digest(const void *ctx, uint8_t *out) {
   return ok;
 }
 
-int kufuli_ed25519_keypair(uint8_t *out_pub, uint8_t *out_priv) {
-  ED25519_keypair(out_pub, out_priv); /* void */
-  return 1;
-}
-
-int kufuli_ed25519_from_seed(uint8_t *out_pub, uint8_t *out_priv, const uint8_t *seed) {
-  ED25519_keypair_from_seed(out_pub, out_priv, seed); /* void */
-  return 1;
-}
-
-int kufuli_ed25519_sign(uint8_t *out_sig, const uint8_t *msg, size_t msg_len, const uint8_t *priv) {
-  return ED25519_sign(out_sig, msg, msg_len, priv);
-}
-
-int kufuli_ed25519_verify(const uint8_t *msg, size_t msg_len, const uint8_t *sig, const uint8_t *pub) {
-  return ED25519_verify(msg, msg_len, sig, pub);
-}
-
-int kufuli_x25519_keypair(uint8_t *out_pub, uint8_t *out_priv) {
-  X25519_keypair(out_pub, out_priv); /* void */
-  return 1;
-}
-
-int kufuli_x25519_public_from_private(uint8_t *out_pub, const uint8_t *priv) {
-  X25519_public_from_private(out_pub, priv); /* void */
-  return 1;
-}
-
-int kufuli_x25519(uint8_t *out_shared, const uint8_t *priv, const uint8_t *peer_pub) {
-  return X25519(out_shared, priv, peer_pub);
-}
-
 int kufuli_aes_wrap(uint8_t *out, size_t *out_len, size_t max_out, const uint8_t *kek, size_t kek_len, const uint8_t *in,
                     size_t in_len, int padded) {
   AES_KEY key;
+  int ok = 0;
   /* AES_set_encrypt_key returns ZERO on success - the header warns it breaks the convention. */
   if (AES_set_encrypt_key(kek, (unsigned)(kek_len * 8), &key) != 0) return 0;
-  if (padded) return AES_wrap_key_padded(&key, out, out_len, max_out, in, in_len);
-  /* AES_wrap_key returns the written length or -1, not 1/0. NULL iv selects the RFC 3394 default. */
-  {
+  if (padded) {
+    ok = AES_wrap_key_padded(&key, out, out_len, max_out, in, in_len);
+  } else if (in_len <= SIZE_MAX - 8 && in_len + 8 <= max_out) {
+    /* AES_wrap_key writes in_len + 8 bytes and only then returns that length, so the capacity has
+     * to be settled from the RFC 3394 relation before the call rather than from its result. */
     int n = AES_wrap_key(&key, NULL, out, in, in_len);
-    if (n < 0 || (size_t)n > max_out) return 0;
-    *out_len = (size_t)n;
-    return 1;
+    if (n >= 0) {
+      *out_len = (size_t)n;
+      ok = 1;
+    }
   }
+  OPENSSL_cleanse(&key, sizeof(key));
+  return ok;
 }
 
 int kufuli_aes_unwrap(uint8_t *out, size_t *out_len, size_t max_out, const uint8_t *kek, size_t kek_len, const uint8_t *in,
                       size_t in_len, int padded) {
   AES_KEY key;
+  int ok = 0;
   if (AES_set_decrypt_key(kek, (unsigned)(kek_len * 8), &key) != 0) return 0;
-  if (padded) return AES_unwrap_key_padded(&key, out, out_len, max_out, in, in_len);
-  {
+  if (padded) {
+    ok = AES_unwrap_key_padded(&key, out, out_len, max_out, in, in_len);
+  } else if (in_len >= 8 && in_len - 8 <= max_out) {
     int n = AES_unwrap_key(&key, NULL, out, in, in_len);
-    if (n < 0 || (size_t)n > max_out) return 0;
-    *out_len = (size_t)n;
-    return 1;
+    if (n >= 0) {
+      *out_len = (size_t)n;
+      ok = 1;
+    }
   }
+  OPENSSL_cleanse(&key, sizeof(key));
+  return ok;
 }
 
 int kufuli_aes_cbc(int encrypt, uint8_t *out, size_t *out_len, size_t max_out, const uint8_t *key, size_t key_len,
@@ -312,61 +277,91 @@ int kufuli_chacha20_keystream(uint8_t *out, size_t out_len, const uint8_t *key, 
   return 1;
 }
 
-/* ML-KEM. Sizes come from the EVP size-check convention (both output buffers NULL -> lengths only),
- * so they are read from the library rather than hardcoded from an uninstalled internal header. */
-int kufuli_kem_sizes(int kem, size_t *out_pub, size_t *out_priv, size_t *out_ct, size_t *out_ss) {
-  EVP_PKEY_CTX *ctx = NULL;
-  EVP_PKEY *key = NULL;
-  EVP_PKEY_CTX *ectx = NULL;
+/* ML-KEM. Every length is fixed by the parameter set; each entry point asks aws-lc for the true
+ * size and refuses before writing a byte when the caller's buffer is smaller. */
+static int kem_context(int kem, EVP_PKEY_CTX **out_ctx) {
   int nid = kem_nid_of(kem);
-  int ok = 0;
+  EVP_PKEY_CTX *ctx = NULL;
   if (nid == NID_undef) return 0;
   ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_KEM, NULL);
   if (ctx == NULL) return 0;
-  if (EVP_PKEY_CTX_kem_set_params(ctx, nid) && EVP_PKEY_keygen_init(ctx) && EVP_PKEY_keygen(ctx, &key)) {
-    size_t pub_len = 0, priv_len = 0;
-    if (EVP_PKEY_get_raw_public_key(key, NULL, &pub_len) && EVP_PKEY_get_raw_private_key(key, NULL, &priv_len)) {
-      ectx = EVP_PKEY_CTX_new(key, NULL);
-      /* Both output buffers NULL is the documented size-check call. */
-      if (ectx != NULL && EVP_PKEY_encapsulate(ectx, NULL, out_ct, NULL, out_ss)) {
-        *out_pub = pub_len;
-        *out_priv = priv_len;
-        ok = 1;
-      }
+  if (!EVP_PKEY_CTX_kem_set_params(ctx, nid) || !EVP_PKEY_keygen_init(ctx)) {
+    EVP_PKEY_CTX_free(ctx);
+    return 0;
+  }
+  *out_ctx = ctx;
+  return 1;
+}
+
+static int kem_export(const EVP_PKEY *key, uint8_t *out_pub, size_t *out_pub_len, size_t max_pub, uint8_t *out_priv,
+                      size_t *out_priv_len, size_t max_priv) {
+  size_t pub_len = 0;
+  size_t priv_len = 0;
+  if (!EVP_PKEY_get_raw_public_key(key, NULL, &pub_len) || !EVP_PKEY_get_raw_private_key(key, NULL, &priv_len)) return 0;
+  if (pub_len > max_pub || priv_len > max_priv) return 0;
+  if (!EVP_PKEY_get_raw_public_key(key, out_pub, &pub_len) || !EVP_PKEY_get_raw_private_key(key, out_priv, &priv_len)) return 0;
+  *out_pub_len = pub_len;
+  *out_priv_len = priv_len;
+  return 1;
+}
+
+/* EVP_PKEY_kem_new_raw_public_key checks only the length: aws-lc runs FIPS 203 section 7.2's
+ * modulus check inside encapsulation and nowhere earlier, so the check IS a throwaway
+ * encapsulation. Its scratch secret is cleansed before the buffers are released. */
+int kufuli_kem_public_valid(int kem, const uint8_t *pub, size_t pub_len) {
+  int nid = kem_nid_of(kem);
+  EVP_PKEY *key = NULL;
+  EVP_PKEY_CTX *ctx = NULL;
+  int ok = 0;
+  if (nid == NID_undef) return 0;
+  key = EVP_PKEY_kem_new_raw_public_key(nid, pub, pub_len);
+  if (key == NULL) return 0;
+  ctx = EVP_PKEY_CTX_new(key, NULL);
+  if (ctx != NULL) {
+    size_t ct_len = 0;
+    size_t ss_len = 0;
+    if (EVP_PKEY_encapsulate(ctx, NULL, &ct_len, NULL, &ss_len)) {
+      uint8_t *ct = OPENSSL_malloc(ct_len);
+      uint8_t *ss = OPENSSL_malloc(ss_len);
+      if (ct != NULL && ss != NULL) ok = EVP_PKEY_encapsulate(ctx, ct, &ct_len, ss, &ss_len);
+      if (ss != NULL) OPENSSL_cleanse(ss, ss_len);
+      OPENSSL_free(ct);
+      OPENSSL_free(ss);
     }
   }
-  EVP_PKEY_CTX_free(ectx);
+  EVP_PKEY_CTX_free(ctx);
+  EVP_PKEY_free(key);
+  return ok;
+}
+
+int kufuli_kem_keypair(int kem, uint8_t *out_pub, size_t *out_pub_len, size_t max_pub, uint8_t *out_priv,
+                       size_t *out_priv_len, size_t max_priv) {
+  EVP_PKEY_CTX *ctx = NULL;
+  EVP_PKEY *key = NULL;
+  int ok = 0;
+  if (!kem_context(kem, &ctx)) return 0;
+  if (EVP_PKEY_keygen(ctx, &key)) ok = kem_export(key, out_pub, out_pub_len, max_pub, out_priv, out_priv_len, max_priv);
   EVP_PKEY_free(key);
   EVP_PKEY_CTX_free(ctx);
   return ok;
 }
 
-int kufuli_kem_keypair(int kem, uint8_t *out_pub, size_t *out_pub_len, uint8_t *out_priv, size_t *out_priv_len) {
+int kufuli_kem_keypair_from_seed(int kem, const uint8_t *seed, size_t seed_len, uint8_t *out_pub, size_t *out_pub_len,
+                                 size_t max_pub, uint8_t *out_priv, size_t *out_priv_len, size_t max_priv) {
   EVP_PKEY_CTX *ctx = NULL;
   EVP_PKEY *key = NULL;
-  int nid = kem_nid_of(kem);
+  size_t len = seed_len;
   int ok = 0;
-  if (nid == NID_undef) return 0;
-  ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_KEM, NULL);
-  if (ctx == NULL) return 0;
-  if (EVP_PKEY_CTX_kem_set_params(ctx, nid) && EVP_PKEY_keygen_init(ctx) && EVP_PKEY_keygen(ctx, &key)) {
-    /* get_raw_*_key takes the buffer capacity in *out_len on entry; a size query fills it from the
-     * key so the caller need only pass a buffer sized to the parameter set (as the others do). */
-    size_t pub_len = 0;
-    size_t priv_len = 0;
-    if (EVP_PKEY_get_raw_public_key(key, NULL, &pub_len) && EVP_PKEY_get_raw_private_key(key, NULL, &priv_len)) {
-      *out_pub_len = pub_len;
-      *out_priv_len = priv_len;
-      ok = EVP_PKEY_get_raw_public_key(key, out_pub, out_pub_len) && EVP_PKEY_get_raw_private_key(key, out_priv, out_priv_len);
-    }
-  }
+  if (!kem_context(kem, &ctx)) return 0;
+  if (EVP_PKEY_keygen_deterministic(ctx, &key, seed, &len))
+    ok = kem_export(key, out_pub, out_pub_len, max_pub, out_priv, out_priv_len, max_priv);
   EVP_PKEY_free(key);
   EVP_PKEY_CTX_free(ctx);
   return ok;
 }
 
-int kufuli_kem_encapsulate(int kem, const uint8_t *pub, size_t pub_len, uint8_t *out_ct, size_t *out_ct_len, uint8_t *out_ss,
-                           size_t *out_ss_len) {
+int kufuli_kem_encapsulate(int kem, const uint8_t *pub, size_t pub_len, uint8_t *out_ct, size_t *out_ct_len, size_t max_ct,
+                           uint8_t *out_ss, size_t *out_ss_len, size_t max_ss) {
   EVP_PKEY *key = NULL;
   EVP_PKEY_CTX *ctx = NULL;
   int nid = kem_nid_of(kem);
@@ -376,14 +371,14 @@ int kufuli_kem_encapsulate(int kem, const uint8_t *pub, size_t pub_len, uint8_t 
   if (key == NULL) return 0;
   ctx = EVP_PKEY_CTX_new(key, NULL);
   if (ctx != NULL) {
-    /* EVP_PKEY_encapsulate checks the ciphertext and shared-secret buffer capacities on entry; the
-     * NULL-buffer size query fills them from the KEM. */
+    /* Both output buffers NULL is the documented size-check call. */
     size_t ct_len = 0;
     size_t ss_len = 0;
-    if (EVP_PKEY_encapsulate(ctx, NULL, &ct_len, NULL, &ss_len)) {
+    if (EVP_PKEY_encapsulate(ctx, NULL, &ct_len, NULL, &ss_len) && ct_len <= max_ct && ss_len <= max_ss &&
+        EVP_PKEY_encapsulate(ctx, out_ct, &ct_len, out_ss, &ss_len)) {
       *out_ct_len = ct_len;
       *out_ss_len = ss_len;
-      ok = EVP_PKEY_encapsulate(ctx, out_ct, out_ct_len, out_ss, out_ss_len);
+      ok = 1;
     }
   }
   EVP_PKEY_CTX_free(ctx);
@@ -394,7 +389,7 @@ int kufuli_kem_encapsulate(int kem, const uint8_t *pub, size_t pub_len, uint8_t 
 /* Total by construction: FIPS 203 implicit rejection returns a pseudorandom secret for a forged
  * ciphertext rather than an error, which is what makes kufuli's decapsulate total. */
 int kufuli_kem_decapsulate(int kem, const uint8_t *priv, size_t priv_len, const uint8_t *ct, size_t ct_len, uint8_t *out_ss,
-                           size_t *out_ss_len) {
+                           size_t *out_ss_len, size_t max_ss) {
   EVP_PKEY *key = NULL;
   EVP_PKEY_CTX *ctx = NULL;
   int nid = kem_nid_of(kem);
@@ -405,9 +400,10 @@ int kufuli_kem_decapsulate(int kem, const uint8_t *priv, size_t priv_len, const 
   ctx = EVP_PKEY_CTX_new(key, NULL);
   if (ctx != NULL) {
     size_t ss_len = 0;
-    if (EVP_PKEY_decapsulate(ctx, NULL, &ss_len, ct, ct_len)) {
+    if (EVP_PKEY_decapsulate(ctx, NULL, &ss_len, ct, ct_len) && ss_len <= max_ss &&
+        EVP_PKEY_decapsulate(ctx, out_ss, &ss_len, ct, ct_len)) {
       *out_ss_len = ss_len;
-      ok = EVP_PKEY_decapsulate(ctx, out_ss, out_ss_len, ct, ct_len);
+      ok = 1;
     }
   }
   EVP_PKEY_CTX_free(ctx);
@@ -475,16 +471,6 @@ void *kufuli_pkey_generate(int type, int rsa_bits) {
 
 void kufuli_pkey_free(void *pkey) {
   if (pkey != NULL) EVP_PKEY_free((EVP_PKEY *)pkey);
-}
-
-int kufuli_pkey_type(const void *pkey) {
-  switch (EVP_PKEY_id((const EVP_PKEY *)pkey)) {
-    case EVP_PKEY_ED25519: return KUFULI_PKEY_ED25519;
-    case EVP_PKEY_X25519: return KUFULI_PKEY_X25519;
-    case EVP_PKEY_RSA: return KUFULI_PKEY_RSA;
-    case EVP_PKEY_EC: return KUFULI_PKEY_P256;
-    default: return 0;
-  }
 }
 
 void *kufuli_pkey_from_spki(const uint8_t *der, size_t len) {

@@ -32,6 +32,61 @@ object Base64Url:
   def encode(bytes: Array[Byte]): String = Base64.encode(bytes, Base64.urlAlphabet, pad = false)
   def decode(text: String): Either[Malformed, Array[Byte]] = Base64.decode(text, Base64.urlInverse, padded = false)
 
+/** RFC 4648 section 6 base32, UNPADDED upper case - the alphabet `otpauth://` enrolment URIs and
+  * authenticator apps carry a shared secret in. `decode` admits only the one canonical encoding:
+  * lower case, `=` padding, any character outside `A-Z2-7`, a length of 1, 3 or 6 modulo 8, or a
+  * final symbol whose unused low bits are set is [[Malformed]]. Table-driven, so NOT constant time:
+  * an enrolment secret is transcribed once by a human, never compared on a request path.
+  */
+object Base32:
+  private val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+  private val inverse: Array[Int] =
+    val t = Array.fill(128)(-1)
+    for i <- 0 until alphabet.length do t(alphabet.charAt(i).toInt) = i
+    t
+
+  def encode(bytes: Array[Byte]): String =
+    val out = new StringBuilder((bytes.length * 8 + 4) / 5)
+    @tailrec def go(i: Int, acc: Int, bits: Int): Unit =
+      if bits >= 5 then
+        val _ = out.append(alphabet((acc >>> (bits - 5)) & 0x1f))
+        go(i, acc & ((1 << (bits - 5)) - 1), bits - 5)
+      else if i < bytes.length then go(i + 1, (acc << 8) | (bytes(i) & 0xff), bits + 8)
+      else if bits > 0 then
+        val _ = out.append(alphabet((acc << (5 - bits)) & 0x1f))
+        ()
+    go(0, 0, 0)
+    out.toString
+  end encode
+
+  def decode(text: String): Either[Malformed, Array[Byte]] =
+    val residue = text.length % 8
+    // 5 bits per symbol: 1, 3 and 6 symbols carry 5, 15 and 30 bits, none of which completes an
+    // octet count that 8 fewer symbols could not encode - so no octet string produces them.
+    if residue == 1 || residue == 3 || residue == 6 then Left(Malformed)
+    else
+      val out = new Array[Byte](text.length / 8 * 5 + residue * 5 / 8)
+      @tailrec def go(i: Int, acc: Int, bits: Int, o: Int): Either[Malformed, Array[Byte]] =
+        if i >= text.length then
+          // The final symbol's low bits reach no octet; unless they are zero one secret has many
+          // spellings, and an enrolment record keyed on the string no longer identifies the secret.
+          if acc != 0 then Left(Malformed) else Right(out)
+        else
+          val c = text.charAt(i).toInt
+          val v = if c < 128 then inverse(c) else -1
+          if v < 0 then Left(Malformed)
+          else
+            val a = (acc << 5) | v
+            val b = bits + 5
+            if b >= 8 then
+              out(o) = ((a >>> (b - 8)) & 0xff).toByte
+              go(i + 1, a & ((1 << (b - 8)) - 1), b - 8, o + 1)
+            else go(i + 1, a, b, o)
+      go(0, 0, 0, 0)
+    end if
+  end decode
+end Base32
+
 private[kufuli] object Base64:
   private[kufuli] val urlAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
   private[kufuli] val stdAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -168,7 +223,10 @@ private[kufuli] object Der:
   final private[kufuli] case class Tlv(contentOff: Int, contentLen: Int, next: Int)
 
   // Reads one definite-length TLV at `off`, requiring the given tag. Rejects indefinite and
-  // long-form lengths beyond two bytes (no key encoding needs them) and any out-of-bounds claim.
+  // long-form lengths beyond two bytes (no key encoding needs them), a length not in its shortest
+  // form, and any out-of-bounds claim. Shortest-form matters beyond pedantry: a long-form encoding
+  // of a small length shifts every subsequent offset, which is how a fixed-prefix reader above this
+  // one can be steered onto the wrong bytes.
   private[kufuli] def read(der: Slice, off: Int, tag: Int): Either[InvalidKey, Tlv] =
     if off + 2 > der.length then Left(InvalidKey.Malformed)
     else if (der(off) & 0xff) != tag then Left(InvalidKey.Malformed)
@@ -176,12 +234,16 @@ private[kufuli] object Der:
       val l0 = der(off + 1) & 0xff
       val header =
         if l0 < 0x80 then Right((l0, 2))
-        else if l0 == 0x81 && off + 3 <= der.length then Right((der(off + 2) & 0xff, 3))
-        else if l0 == 0x82 && off + 4 <= der.length then Right((((der(off + 2) & 0xff) << 8) | (der(off + 3) & 0xff), 4))
+        else if l0 == 0x81 && off + 3 <= der.length then
+          val len = der(off + 2) & 0xff
+          if len < 0x80 then Left(InvalidKey.Malformed) else Right((len, 3))
+        else if l0 == 0x82 && off + 4 <= der.length then
+          val len = ((der(off + 2) & 0xff) << 8) | (der(off + 3) & 0xff)
+          if len < 0x100 then Left(InvalidKey.Malformed) else Right((len, 4))
         else Left(InvalidKey.Malformed)
       header.flatMap { (len, hdr) =>
         val start = off + hdr
-        if len < 0 || start + len > der.length then Left(InvalidKey.Malformed)
+        if start + len > der.length then Left(InvalidKey.Malformed)
         else Right(Tlv(start, len, start + len))
       }
 
@@ -207,13 +269,56 @@ private[kufuli] object Der:
       }
     }
 
+  // The outer SEQUENCE must span the whole slice. Anything appended past it is a second encoding
+  // the peek never sees: the family dispatch would report the prefix's algorithm while a permissive
+  // backend parses the prefix and ignores the suffix, so two readers disagree about one blob.
+  private def whole(der: Slice, outer: Tlv): Either[InvalidKey, Unit] =
+    if outer.next == der.length then Right(()) else Left(InvalidKey.Malformed)
+
   /** Peeks the AlgorithmIdentifier of a SubjectPublicKeyInfo blob. */
   def peekSpki(der: Slice): Either[InvalidKey, Alg] =
-    read(der, 0, 0x30).flatMap(outer => dispatch(der, outer.contentOff))
+    read(der, 0, 0x30).flatMap(outer => whole(der, outer).flatMap(_ => dispatch(der, outer.contentOff)))
 
   /** Peeks the AlgorithmIdentifier of a PKCS#8 PrivateKeyInfo blob (skips the version INTEGER). */
   def peekPkcs8(der: Slice): Either[InvalidKey, Alg] =
-    read(der, 0, 0x30).flatMap(outer => read(der, outer.contentOff, 0x02).flatMap(v => dispatch(der, v.next)))
+    read(der, 0, 0x30).flatMap(outer => whole(der, outer).flatMap(_ => read(der, outer.contentOff, 0x02).flatMap(v => dispatch(der, v.next))))
+
+  /** The subjectPublicKey octets of an SPKI, located by walking the encoding: the
+    * AlgorithmIdentifier is variable-length, so any fixed prefix length reads the wrong bytes for a
+    * blob that is valid but not byte-identical to kufuli's own template.
+    */
+  def spkiPublicBits(der: Slice): Either[InvalidKey, Slice] =
+    for
+      outer <- read(der, 0, 0x30)
+      _ <- whole(der, outer)
+      algId <- read(der, outer.contentOff, 0x30)
+      bits <- read(der, algId.next, 0x03)
+      // A public key occupies whole octets, so the unused-bits count is present and zero, and the
+      // BIT STRING is the last element of the SPKI.
+      _ <-
+        if bits.next == outer.next && bits.contentLen >= 1 && der(bits.contentOff) == 0.toByte then Right(())
+        else Left(InvalidKey.Malformed)
+    yield der.slice(bits.contentOff + 1, bits.next)
+
+  /** Requires a stored SPKI to name exactly `alg` - the family and, for EC, the named curve.
+    * Applied to a backend's own canonical re-marshalling this is what binds an import to the family
+    * the caller asked for: every provider here infers the family from the encoding instead.
+    */
+  def requireSpki(der: Slice, alg: Alg): Either[InvalidKey, Unit] =
+    peekSpki(der).flatMap(found => if found == alg then Right(()) else Left(InvalidKey.Malformed))
+
+  /** As [[requireSpki]], over a PKCS#8 PrivateKeyInfo. */
+  def requirePkcs8(der: Slice, alg: Alg): Either[InvalidKey, Unit] =
+    peekPkcs8(der).flatMap(found => if found == alg then Right(()) else Left(InvalidKey.Malformed))
+
+  /** True when one definite-length TLV of `tag` spans the whole slice - the anti-ambiguity check a
+    * permissive backend does not make for itself.
+    */
+  def spansWhole(der: Slice, tag: Int): Boolean = read(der, 0, tag).exists(_.next == der.length)
+
+  /** As [[spkiPublicBits]], additionally requiring the family's exact point length. */
+  def spkiPublicBits(der: Slice, length: Int): Either[InvalidKey, Slice] =
+    spkiPublicBits(der).flatMap(point => if point.length == length then Right(point) else Left(InvalidKey.WrongLength(length, point.length)))
 
   // Fixed encoding templates (RFC 8410 / RFC 5480 layouts) for byte-backed backends that build and
   // match whole SPKI/PKCS#8 blobs directly; the JCA/WebCrypto backends round-trip through their
@@ -313,6 +418,7 @@ private[kufuli] object Der:
   // byte-backed backends that assemble encodings directly.
   private[kufuli] def tlv(tag: Int, content: Array[Byte]): Array[Byte] =
     val len = content.length
+    require(len < 0x10000, s"DER content of $len bytes exceeds the two-byte length forms this emitter writes")
     val header =
       if len < 0x80 then Array[Byte](tag.toByte, len.toByte)
       else if len < 0x100 then Array[Byte](tag.toByte, 0x81.toByte, len.toByte)

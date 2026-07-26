@@ -19,15 +19,13 @@
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 // Node Argon2id provider over `crypto.argon2` (Node >= 24.7); memory-hard, so it runs on node's
-// async threadpool.
+// async threadpool. This source set is the node row alone: a hard `node:crypto` import must not
+// reach a browser artifact if this module ever grows one, as core's already has.
 package kufuli.password
 
 import scala.scalajs.js
 import scala.scalajs.js.annotation.JSImport
-import scala.scalajs.js.typedarray.Int8Array
 import scala.scalajs.js.typedarray.Uint8Array
-import scala.scalajs.js.typedarray.byteArray2Int8Array
-import scala.scalajs.js.typedarray.int8Array2ByteArray
 
 import boilerplate.Slice
 import boilerplate.effect.EffIO
@@ -36,19 +34,16 @@ import boilerplate.nullable.option
 import cats.effect.IO
 
 import kufuli.guard
+import kufuli.nodecrypto.ba
+import kufuli.nodecrypto.u8
 
 private[password] object nodeArgon2:
+  // `crypto.argon2` is outside core's facade because core has no password tier; the byte
+  // converters are core's, so there is one copy point for the whole JS artifact.
   @js.native
   @JSImport("node:crypto", JSImport.Default)
   private[password] object crypto extends js.Object:
     def argon2(algorithm: String, options: js.Any, callback: js.Function2[js.Error | Null, Uint8Array, Unit]): Unit = js.native
-
-  private[password] def u8(a: Array[Byte]): Uint8Array =
-    val i8 = byteArray2Int8Array(a)
-    new Uint8Array(i8.buffer, i8.byteOffset, i8.length)
-  private[password] def ba(u: Uint8Array): Array[Byte] =
-    int8Array2ByteArray(new Int8Array(u.buffer, u.byteOffset, u.length))
-end nodeArgon2
 
 private[password] trait Argon2Platform:
   given Argon2 = new Argon2:
@@ -57,8 +52,8 @@ private[password] trait Argon2Platform:
         nodeArgon2.crypto.argon2(
           "argon2id",
           js.Dynamic.literal(
-            message = nodeArgon2.u8(password.toArray),
-            nonce = nodeArgon2.u8(salt.toArray),
+            message = u8(password.toArray),
+            nonce = u8(salt.toArray),
             parallelism = params.parallelism,
             tagLength = 32,
             memory = params.memoryKib,
@@ -66,7 +61,7 @@ private[password] trait Argon2Platform:
           ),
           (err, out) =>
             err.option match
-              case None    => cb(Right(nodeArgon2.ba(out)))
+              case None    => cb(Right(ba(out)))
               case Some(e) => cb(Left(js.JavaScriptException(e)))
         )
       }))

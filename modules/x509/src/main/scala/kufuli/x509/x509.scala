@@ -457,8 +457,13 @@ object Certificate:
   extension (cert: Certificate)
     private[x509] def parsed: Parsed = cert
     def der: IArray[Byte] = cert.parsed.encoded
-    def publicKey: ImportedPublicKey =
-      X509.issuerKey(cert.parsed.spki).getOrElse(ImportedPublicKey.Ed(PublicKey.unsafe(keyRepr(new Array[Byte](32)))))
+
+    /** The subject public key, or [[InvalidKey.Unsupported]] where the SPKI names an algorithm
+      * kufuli does not implement - a certificate carrying one still parses, and its validity
+      * window, SAN entries and encoding stay readable.
+      */
+    def publicKey: Either[InvalidKey, ImportedPublicKey] =
+      X509.issuerKey(cert.parsed.spki).toRight(InvalidKey.Unsupported)
 
     /** Start of the validity window, as epoch seconds. */
     def notBefore: Long = cert.parsed.notBefore

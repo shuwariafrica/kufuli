@@ -81,7 +81,11 @@ val `kufuli-password` =
       Seq.empty[VirtualAxis],
       (p: Project) => p.settings(libraryDependencies += bouncycastle).dependsOn(kufuli.jvm(scala3))
     )
-    .jsPlatform(Seq(scala3), Seq.empty[VirtualAxis], (p: Project) => p.settings(jsSettings).dependsOn(kufuli.js(scala3)))
+    .jsPlatform(
+      Seq(scala3),
+      Seq.empty[VirtualAxis],
+      (p: Project) => p.settings(jsSettings ++ jsNodeSourceDirs).dependsOn(kufuli.js(scala3))
+    )
     .snxPlatform(
       Seq(scala3),
       Seq.empty[VirtualAxis],
@@ -227,7 +231,9 @@ def wycheproofSettings: List[Setting[?]] = List(
     "aes_kwp_test.json",
     "chacha20_poly1305_test.json",
     "ecdsa_secp256r1_sha256_p1363_test.json",
-    "ed25519_test.json"
+    "ed25519_test.json",
+    "mlkem_768_test.json",
+    "mlkem_1024_test.json"
   )
 )
 

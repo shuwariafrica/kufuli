@@ -31,6 +31,7 @@ import scala.scalanative.unsigned.*
 import boilerplate.Slice
 import boilerplate.effect.EffIO
 import boilerplate.effect.UEffIO
+import boilerplate.nullable.option
 import cats.effect.IO
 import cats.effect.Resource
 
@@ -38,7 +39,6 @@ import cats.effect.Resource
 private[kufuli] object awslcffi:
   def kufuli_is_awslc(): CInt = extern
   def kufuli_random_bytes(out: Ptr[Byte], len: CSize): CInt = extern
-  def kufuli_cleanse(p: Ptr[Byte], len: CSize): Unit = extern
   def kufuli_aead_new(alg: CInt, key: Ptr[Byte], keyLen: CSize): Ptr[Byte] = extern
   def kufuli_aead_free(ctx: Ptr[Byte]): Unit = extern
   def kufuli_aead_seal(
@@ -84,7 +84,6 @@ private[kufuli] object awslcffi:
     iterations: CUnsignedInt): CInt = extern
   def kufuli_hmac(md: CInt, key: Ptr[Byte], keyLen: CSize, data: Ptr[Byte], dataLen: CSize, out: Ptr[Byte], outLen: Ptr[CSize]): CInt =
     extern
-  def kufuli_digest_size(md: CInt): CInt = extern
   def kufuli_digest(md: CInt, data: Ptr[Byte], len: CSize, out: Ptr[Byte]): CInt = extern
   def kufuli_hasher_new(md: CInt): Ptr[Byte] = extern
   def kufuli_hasher_free(ctx: Ptr[Byte]): Unit = extern
@@ -121,17 +120,35 @@ private[kufuli] object awslcffi:
   def kufuli_aes_block_encrypt(out: Ptr[Byte], in: Ptr[Byte], key: Ptr[Byte], keyLen: CSize): CInt = extern
   def kufuli_chacha20_keystream(out: Ptr[Byte], outLen: CSize, key: Ptr[Byte], nonce: Ptr[Byte], counter: CUnsignedInt): CInt =
     extern
-  def kufuli_kem_sizes(kem: CInt, pub: Ptr[CSize], priv: Ptr[CSize], ct: Ptr[CSize], ss: Ptr[CSize]): CInt = extern
-  def kufuli_kem_keypair(kem: CInt, outPub: Ptr[Byte], outPubLen: Ptr[CSize], outPriv: Ptr[Byte], outPrivLen: Ptr[CSize]): CInt =
-    extern
+  def kufuli_kem_public_valid(kem: CInt, pub: Ptr[Byte], pubLen: CSize): CInt = extern
+  def kufuli_kem_keypair(
+    kem: CInt,
+    outPub: Ptr[Byte],
+    outPubLen: Ptr[CSize],
+    maxPub: CSize,
+    outPriv: Ptr[Byte],
+    outPrivLen: Ptr[CSize],
+    maxPriv: CSize): CInt = extern
+  def kufuli_kem_keypair_from_seed(
+    kem: CInt,
+    seed: Ptr[Byte],
+    seedLen: CSize,
+    outPub: Ptr[Byte],
+    outPubLen: Ptr[CSize],
+    maxPub: CSize,
+    outPriv: Ptr[Byte],
+    outPrivLen: Ptr[CSize],
+    maxPriv: CSize): CInt = extern
   def kufuli_kem_encapsulate(
     kem: CInt,
     pub: Ptr[Byte],
     pubLen: CSize,
     outCt: Ptr[Byte],
     outCtLen: Ptr[CSize],
+    maxCt: CSize,
     outSs: Ptr[Byte],
-    outSsLen: Ptr[CSize]): CInt = extern
+    outSsLen: Ptr[CSize],
+    maxSs: CSize): CInt = extern
   def kufuli_kem_decapsulate(
     kem: CInt,
     priv: Ptr[Byte],
@@ -139,7 +156,8 @@ private[kufuli] object awslcffi:
     ct: Ptr[Byte],
     ctLen: CSize,
     outSs: Ptr[Byte],
-    outSsLen: Ptr[CSize]): CInt = extern
+    outSsLen: Ptr[CSize],
+    maxSs: CSize): CInt = extern
   def kufuli_pkey_generate(tpe: CInt, rsaBits: CInt): Ptr[Byte] = extern
   def kufuli_pkey_free(pkey: Ptr[Byte]): Unit = extern
   def kufuli_pkey_from_spki(der: Ptr[Byte], len: CSize): Ptr[Byte] = extern
@@ -225,12 +243,20 @@ private[kufuli] object awslc:
   private def require1(ok: CInt): Unit =
     if ok != 1 then throw new IllegalStateException("aws-lc primitive failed unexpectedly") // scalafix:ok DisableSyntax.throw
 
-  // aws-lc yields a null handle (address 0) when it rejects an input. A native pointer is a value,
-  // not a nullable reference, so this tests the address directly: boilerplate.nullable does not
-  // apply (it boxes an `A | Null` reference) and no `null` literal is needed.
-  private def present(p: Ptr[Byte]): Boolean = p.toLong != 0L
+  // aws-lc yields a null handle when it rejects an input, and Scala Native surfaces that as a null
+  // REFERENCE, not as a pointer whose address is zero: the test must therefore be a reference test,
+  // because reading the address off the handle dereferences it. Every typed `InvalidKey` this
+  // backend returns for a rejected encoding depends on this.
+  private def present(p: Ptr[Byte]): Boolean =
+    val handle: Ptr[Byte] | Null = p
+    handle.option.isDefined
 
   private def requirePresent(p: Ptr[Byte]): Unit = require1(if present(p) then 1 else 0)
+
+  // The compile-time OPENSSL_IS_AWSLC assertion and the link-time dialect gate both hold at build
+  // time. A consumer who rebinds `crypto` to a system shared library can still put another provider
+  // behind the same symbols, and this runs once, on first touch of any instance, before it can.
+  require1(kufuli_is_awslc())
 
   private def mdCode(hash: Sha2): CInt = hash match
     case _: Sha256.type => MdSha256
@@ -239,17 +265,25 @@ private[kufuli] object awslc:
 
   // Runs a shim call that writes at most `max` bytes plus its length, returning the written prefix;
   // the length pointer is consumed here and never escapes, so a stack buffer is sound.
+  // The staging buffer holds whatever the call produced - a shared secret, a PRK, a PKCS#8 private
+  // key - and `take` only copies the used prefix, so the buffer is wiped before it is released.
+  // Native's `Slice.wipe` is a volatile store the optimiser must keep, which is why erasure here is
+  // a guarantee rather than best effort.
   private def collect(max: Int)(call: (Ptr[Byte], Ptr[CSize]) => CInt): Array[Byte] =
     val buf = new Array[Byte](max)
-    val lenP = stackalloc[CSize]()
-    require1(call(Slice.of(buf).unsafePtr, lenP))
-    buf.take((!lenP).toInt)
+    try
+      val lenP = stackalloc[CSize]()
+      require1(call(Slice.of(buf).unsafePtr, lenP))
+      buf.take((!lenP).toInt)
+    finally Slice.of(buf).wipe()
 
   // As `collect`, but a 0 return is the typed failure `e` rather than a defect.
   private def collectE[E](max: Int, e: E)(call: (Ptr[Byte], Ptr[CSize]) => CInt): Either[E, Array[Byte]] =
     val buf = new Array[Byte](max)
-    val lenP = stackalloc[CSize]()
-    if call(Slice.of(buf).unsafePtr, lenP) == 1 then Right(buf.take((!lenP).toInt)) else Left(e)
+    try
+      val lenP = stackalloc[CSize]()
+      if call(Slice.of(buf).unsafePtr, lenP) == 1 then Right(buf.take((!lenP).toInt)) else Left(e)
+    finally Slice.of(buf).wipe()
 
   // Parse a stored encoding to an EVP_PKEY handle, use it, and always free it.
   private def withHandle[A](handle: Ptr[Byte])(f: Ptr[Byte] => A): A =
@@ -259,29 +293,35 @@ private[kufuli] object awslc:
   private def parsePub(der: Slice): Ptr[Byte] = kufuli_pkey_from_spki(der.unsafePtr, der.length.toCSize)
   private def parsePriv(der: Slice): Ptr[Byte] = kufuli_pkey_from_pkcs8(der.unsafePtr, der.length.toCSize)
 
-  // Validate a parsed handle and store its canonical encoding as the key's bytes.
-  private def storePub(handle: Ptr[Byte], maxLen: Int): Either[InvalidKey, Array[Byte]] =
+  // Validate a parsed handle and store its canonical encoding as the key's bytes. aws-lc infers the
+  // family from the encoding and one EC handle serves every curve, so the canonical encoding's own
+  // AlgorithmIdentifier is what binds the import to the family and curve the caller named.
+  private def storePub(handle: Ptr[Byte], maxLen: Int, expect: Der.Alg): Either[InvalidKey, Array[Byte]] =
     if present(handle) then
-      try Right(collect(maxLen)((o, l) => kufuli_pkey_spki(handle, o, l, maxLen.toCSize)))
+      try
+        val stored = collect(maxLen)((o, l) => kufuli_pkey_spki(handle, o, l, maxLen.toCSize))
+        Der.requireSpki(Slice.of(stored), expect).map(_ => stored)
       finally kufuli_pkey_free(handle)
     else Left(InvalidKey.Malformed)
 
-  private def storePriv(handle: Ptr[Byte], maxLen: Int): Either[InvalidKey, Array[Byte]] =
+  private def storePriv(handle: Ptr[Byte], maxLen: Int, expect: Der.Alg): Either[InvalidKey, Array[Byte]] =
     if present(handle) then
-      try Right(collect(maxLen)((o, l) => kufuli_pkey_pkcs8(handle, o, l, maxLen.toCSize)))
+      try
+        val stored = collect(maxLen)((o, l) => kufuli_pkey_pkcs8(handle, o, l, maxLen.toCSize))
+        Der.requirePkcs8(Slice.of(stored), expect).map(_ => stored)
       finally kufuli_pkey_free(handle)
     else Left(InvalidKey.Malformed)
 
   private[kufuli] val random: Random = new Random:
-    def bytes(n: Int): UEffIO[Slice] = op {
+    private[kufuli] def bytes(n: Int): UEffIO[Slice] = op {
       val b = new Array[Byte](n)
       require1(kufuli_random_bytes(Slice.of(b).unsafePtr, n.toCSize))
       Slice.of(b)
     }
-    def fill(dst: Slice): UEffIO[Unit] = op(require1(kufuli_random_bytes(dst.unsafePtr, dst.length.toCSize)))
+    private[kufuli] def fill(dst: Slice): UEffIO[Unit] = op(require1(kufuli_random_bytes(dst.unsafePtr, dst.length.toCSize)))
 
   private def aeadOf[A <: AeadAlgorithm](spec: AeadSpec[A], alg: CInt): Aead[A] = new Aead[A]:
-    def seal(key: SecretKey[A], nonce: Nonce[A], aad: Slice, plaintext: Slice): UEffIO[Slice] = op {
+    private[kufuli] def seal(key: SecretKey[A], nonce: Nonce[A], aad: Slice, plaintext: Slice): UEffIO[Slice] = op {
       key.read { k =>
         val ctx = kufuli_aead_new(alg, k.unsafePtr, k.length.toCSize)
         requirePresent(ctx)
@@ -304,7 +344,7 @@ private[kufuli] object awslc:
         end try
       }
     }
-    def open(key: SecretKey[A], nonce: Nonce[A], aad: Slice, ciphertext: Slice): EffIO[AuthFailed, Slice] = opE {
+    private[kufuli] def open(key: SecretKey[A], nonce: Nonce[A], aad: Slice, ciphertext: Slice): EffIO[AuthFailed, Slice] = opE {
       key.read { k =>
         val ctx = kufuli_aead_new(alg, k.unsafePtr, k.length.toCSize)
         requirePresent(ctx)
@@ -331,7 +371,7 @@ private[kufuli] object awslc:
   // One const EVP_AEAD_CTX for the engine's lifetime (aws-lc documents these AEADs concurrent-safe);
   // the ctx is zeroised and freed at release.
   final private class AeadEngine[A <: AeadAlgorithm](ctx: Ptr[Byte]) extends Cipher.Engine[A]:
-    def encrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Int =
+    private[kufuli] def encrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Int =
       val lenP = stackalloc[CSize]()
       require1(
         kufuli_aead_seal(ctx,
@@ -348,7 +388,7 @@ private[kufuli] object awslc:
       )
       (!lenP).toInt
     end encrypt
-    def decrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Either[AuthFailed, Int] =
+    private[kufuli] def decrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Either[AuthFailed, Int] =
       val lenP = stackalloc[CSize]()
       if kufuli_aead_open(ctx,
                           dst.unsafePtr,
@@ -368,7 +408,7 @@ private[kufuli] object awslc:
   end AeadEngine
 
   private def cipheringOf[A <: AeadAlgorithm](alg: CInt): Ciphering[A] = new Ciphering[A]:
-    def engine(key: SecretKey[A]): Resource[IO, Cipher.Engine[A]] =
+    private[kufuli] def engine(key: SecretKey[A]): Resource[IO, Cipher.Engine[A]] =
       Resource
         .make(guard(IO {
           val ctx = key.read(k => kufuli_aead_new(alg, k.unsafePtr, k.length.toCSize))
@@ -401,19 +441,21 @@ private[kufuli] object awslc:
       val al = new Array[Byte](8)
       Slice.of(al).writeBE[Long](0, aad.length.toLong * 8)
       hmacRaw(md, macKey, aad.toArray ++ iv ++ ct ++ al).take(spec.tagLength)
-    def seal(key: SecretKey[A], nonce: Nonce[A], aad: Slice, plaintext: Slice): UEffIO[Slice] = op {
+    private[kufuli] def seal(key: SecretKey[A], nonce: Nonce[A], aad: Slice, plaintext: Slice): UEffIO[Slice] = op {
       key.read { k =>
         val kb = k.toArray
         val half = kb.length / 2
         val macKey = kb.take(half)
         val encKey = kb.drop(half)
         val iv = nonce.repr
-        val ct = aesCbc(encrypt = true, encKey, iv, plaintext.toArray).getOrElse(new Array[Byte](0))
-        require1(if ct.isEmpty && plaintext.length > 0 then 0 else 1)
+        // PKCS#7 always emits at least one block, for the empty plaintext included, so an empty
+        // result is a failed encryption whatever went in.
+        val ct = demand(aesCbc(encrypt = true, encKey, iv, plaintext.toArray).toRight(()))
+        require1(if ct.isEmpty then 0 else 1)
         Slice.of(ct ++ macTag(macKey, iv, aad, ct))
       }
     }
-    def open(key: SecretKey[A], nonce: Nonce[A], aad: Slice, ciphertext: Slice): EffIO[AuthFailed, Slice] = opE {
+    private[kufuli] def open(key: SecretKey[A], nonce: Nonce[A], aad: Slice, ciphertext: Slice): EffIO[AuthFailed, Slice] = opE {
       key.read { k =>
         val kb = k.toArray
         val half = kb.length / 2
@@ -431,14 +473,14 @@ private[kufuli] object awslc:
     }
 
   private def macOf[H <: MacAlgorithm](md: CInt): Mac[H] = new Mac[H]:
-    def sign(key: SecretKey[H], data: Slice): UEffIO[Signature[H]] = op {
+    private[kufuli] def sign(key: SecretKey[H], data: Slice): UEffIO[Signature[H]] = op {
       key.read { k =>
         Signature.unsafe[H](collect(64)((o, l) => kufuli_hmac(md, k.unsafePtr, k.length.toCSize, data.unsafePtr, data.length.toCSize, o, l)))
       }
     }
 
   private def edSigner: Signer[Ed25519] = new Signer[Ed25519]:
-    def sign(key: PrivateKey[Ed25519], data: Slice, scheme: Scheme[Ed25519]): UEffIO[Signature[Ed25519]] = op {
+    private[kufuli] def sign(key: PrivateKey[Ed25519], data: Slice, scheme: Scheme[Ed25519]): UEffIO[Signature[Ed25519]] = op {
       key.read { der =>
         withHandle(parsePriv(der)) { h =>
           Signature.unsafe[Ed25519](
@@ -448,7 +490,11 @@ private[kufuli] object awslc:
       }
     }
   private def edVerifier: Verifier[Ed25519] = new Verifier[Ed25519]:
-    def verify(key: PublicKey[Ed25519], data: Slice, sig: Signature[Ed25519], scheme: Scheme[Ed25519]): EffIO[SignatureRejected, Unit] =
+    private[kufuli] def verify(
+      key: PublicKey[Ed25519],
+      data: Slice,
+      sig: Signature[Ed25519],
+      scheme: Scheme[Ed25519]): EffIO[SignatureRejected, Unit] =
       opE {
         withHandle(parsePub(Slice.of(keyBytes(key.repr)))) { h =>
           val ok = kufuli_pkey_verify(h,
@@ -464,7 +510,7 @@ private[kufuli] object awslc:
       }
 
   private def ecSigner[C <: EcCurve](fieldLength: Int): Signer[C] = new Signer[C]:
-    def sign(key: PrivateKey[C], data: Slice, scheme: Scheme[C]): UEffIO[Signature[C]] = op {
+    private[kufuli] def sign(key: PrivateKey[C], data: Slice, scheme: Scheme[C]): UEffIO[Signature[C]] = op {
       val h = scheme.runtimeChecked match
         case Ecdsa(hash) => mdCode(hash)
       key.read { der =>
@@ -472,12 +518,12 @@ private[kufuli] object awslc:
           val derSig = collect(fieldLength * 2 + 16)((o, l) =>
             kufuli_pkey_sign(pkey, SchemeEcdsa, h, data.unsafePtr, data.length.toCSize, o, l, (fieldLength * 2 + 16).toCSize)
           )
-          Signature.unsafe[C](Signature.ecdsaDerToRaw(Slice.of(derSig), fieldLength).getOrElse(new Array[Byte](2 * fieldLength)))
+          Signature.unsafe[C](demand(Signature.ecdsaDerToRaw(Slice.of(derSig), fieldLength)))
         }
       }
     }
   private def ecVerifier[C <: EcCurve]: Verifier[C] = new Verifier[C]:
-    def verify(key: PublicKey[C], data: Slice, sig: Signature[C], scheme: Scheme[C]): EffIO[SignatureRejected, Unit] = opE {
+    private[kufuli] def verify(key: PublicKey[C], data: Slice, sig: Signature[C], scheme: Scheme[C]): EffIO[SignatureRejected, Unit] = opE {
       val h = scheme.runtimeChecked match
         case Ecdsa(hash) => mdCode(hash)
       val derSig = Signature.ecdsaRawToDer(sig.repr)
@@ -496,7 +542,7 @@ private[kufuli] object awslc:
   // length is a sufficient capacity at any key size - where a fixed buffer would cap the modulus
   // this backend accepts.
   private def rsaSigner: Signer[Rsa] = new Signer[Rsa]:
-    def sign(key: PrivateKey[Rsa], data: Slice, scheme: Scheme[Rsa]): UEffIO[Signature[Rsa]] = op {
+    private[kufuli] def sign(key: PrivateKey[Rsa], data: Slice, scheme: Scheme[Rsa]): UEffIO[Signature[Rsa]] = op {
       val rsa = rsaScheme(scheme)
       key.read { der =>
         val capacity = der.length
@@ -510,26 +556,27 @@ private[kufuli] object awslc:
       }
     }
   private def rsaVerifier: Verifier[Rsa] = new Verifier[Rsa]:
-    def verify(key: PublicKey[Rsa], data: Slice, sig: Signature[Rsa], scheme: Scheme[Rsa]): EffIO[SignatureRejected, Unit] = opE {
-      val rsa = rsaScheme(scheme)
-      withHandle(parsePub(Slice.of(keyBytes(key.repr)))) { pkey =>
-        val ok = kufuli_pkey_verify(pkey,
-                                    rsa.scheme,
-                                    rsa.md,
-                                    data.unsafePtr,
-                                    data.length.toCSize,
-                                    Slice.of(sig.repr).unsafePtr,
-                                    sig.repr.length.toCSize
-        )
-        if ok == 1 then Right(()) else Left(SignatureRejected)
+    private[kufuli] def verify(key: PublicKey[Rsa], data: Slice, sig: Signature[Rsa], scheme: Scheme[Rsa]): EffIO[SignatureRejected, Unit] =
+      opE {
+        val rsa = rsaScheme(scheme)
+        withHandle(parsePub(Slice.of(keyBytes(key.repr)))) { pkey =>
+          val ok = kufuli_pkey_verify(pkey,
+                                      rsa.scheme,
+                                      rsa.md,
+                                      data.unsafePtr,
+                                      data.length.toCSize,
+                                      Slice.of(sig.repr).unsafePtr,
+                                      sig.repr.length.toCSize
+          )
+          if ok == 1 then Right(()) else Left(SignatureRejected)
+        }
       }
-    }
 
   // aws-lc's EVP_PKEY_derive treats an output buffer smaller than the field as a silent truncation
   // rather than an error, so the capacity is the curve's exact secret length and a short return is
   // raised as a defect.
   private def agreementOf[A <: AgreementAlgorithm](secretLength: Int): Agreement[A] = new Agreement[A]:
-    def agree(priv: PrivateKey[A], pub: PublicKey[A]): UEffIO[SharedSecret] = op {
+    private[kufuli] def agree(priv: PrivateKey[A], pub: PublicKey[A]): UEffIO[SharedSecret] = op {
       priv.read { der =>
         withHandle(parsePriv(der)) { privH =>
           withHandle(parsePub(Slice.of(keyBytes(pub.repr)))) { pubH =>
@@ -541,45 +588,47 @@ private[kufuli] object awslc:
       }
     }
 
+  private inline val KemSecretMax = 32
+
   private def kemOf[K <: KemAlgorithm](kem: CInt, spec: KemSpec[K]): Kem[K] = new Kem[K]:
-    def encapsulate(pub: PublicKey[K]): UEffIO[Encapsulated[K]] = op {
+    private[kufuli] def encapsulate(pub: PublicKey[K]): UEffIO[Encapsulated[K]] = op {
       val pubBytes = keyBytes(pub.repr)
       val ctBuf = new Array[Byte](spec.ciphertextLength)
-      val ssBuf = new Array[Byte](32)
       val ctLen = stackalloc[CSize]()
-      val ssLen = stackalloc[CSize]()
-      require1(
+      val secret = collect(KemSecretMax) { (o, l) =>
         kufuli_kem_encapsulate(kem,
                                Slice.of(pubBytes).unsafePtr,
                                pubBytes.length.toCSize,
                                Slice.of(ctBuf).unsafePtr,
                                ctLen,
-                               Slice.of(ssBuf).unsafePtr,
-                               ssLen
+                               spec.ciphertextLength.toCSize,
+                               o,
+                               l,
+                               KemSecretMax.toCSize
         )
-      )
-      Encapsulated(SharedSecret.unsafe(ssBuf.take((!ssLen).toInt)), KemCiphertext.unsafe(ctBuf.take((!ctLen).toInt)))
+      }
+      Encapsulated(SharedSecret.unsafe(secret), KemCiphertext.unsafe(ctBuf.take((!ctLen).toInt)))
     }
-    def decapsulate(priv: PrivateKey[K], ct: KemCiphertext[K]): UEffIO[SharedSecret] = op {
+    private[kufuli] def decapsulate(priv: PrivateKey[K], ct: KemCiphertext[K]): UEffIO[SharedSecret] = op {
       priv.read { p =>
-        val ssBuf = new Array[Byte](32)
-        val ssLen = stackalloc[CSize]()
-        require1(
-          kufuli_kem_decapsulate(kem,
-                                 p.unsafePtr,
-                                 p.length.toCSize,
-                                 Slice.of(ct.repr).unsafePtr,
-                                 ct.repr.length.toCSize,
-                                 Slice.of(ssBuf).unsafePtr,
-                                 ssLen
+        SharedSecret.unsafe(
+          collect(KemSecretMax)((o, l) =>
+            kufuli_kem_decapsulate(kem,
+                                   p.unsafePtr,
+                                   p.length.toCSize,
+                                   Slice.of(ct.repr).unsafePtr,
+                                   ct.repr.length.toCSize,
+                                   o,
+                                   l,
+                                   KemSecretMax.toCSize
+            )
           )
         )
-        SharedSecret.unsafe(ssBuf.take((!ssLen).toInt))
       }
     }
 
   private def wrapOf[W <: WrapAlgorithm](padded: Boolean): Wrap[W] = new Wrap[W]:
-    def wrap(kek: SecretKey[W], target: Slice): UEffIO[Slice] = op {
+    private[kufuli] def wrap(kek: SecretKey[W], target: Slice): UEffIO[Slice] = op {
       kek.read { k =>
         Slice.of(
           collect(target.length + 16)((o, l) =>
@@ -596,7 +645,7 @@ private[kufuli] object awslc:
         )
       }
     }
-    def unwrap(kek: SecretKey[W], wrapped: Slice): EffIO[UnwrapFailed, Slice] = opE {
+    private[kufuli] def unwrap(kek: SecretKey[W], wrapped: Slice): EffIO[UnwrapFailed, Slice] = opE {
       kek.read { k =>
         collectE(wrapped.length, UnwrapFailed)((o, l) =>
           kufuli_aes_unwrap(o,
@@ -613,12 +662,12 @@ private[kufuli] object awslc:
     }
 
   private[kufuli] val kdf: Kdf = new Kdf:
-    def extract(hash: Sha2, salt: Slice, ikm: Slice): UEffIO[Prk] = op {
+    private[kufuli] def extract(hash: Sha2, salt: Slice, ikm: Slice): UEffIO[Prk] = op {
       Prk.unsafe(
         collect(64)((o, l) => kufuli_hkdf_extract(o, l, mdCode(hash), salt.unsafePtr, salt.length.toCSize, ikm.unsafePtr, ikm.length.toCSize))
       )
     }
-    def expand(hash: Sha2, prk: Prk, info: Slice, length: Int): UEffIO[Slice] = op {
+    private[kufuli] def expand(hash: Sha2, prk: Prk, info: Slice, length: Int): UEffIO[Slice] = op {
       prk.read { p =>
         val out = new Array[Byte](length)
         require1(
@@ -634,7 +683,7 @@ private[kufuli] object awslc:
         Slice.of(out)
       }
     }
-    def pbkdf2(hash: Sha2, password: Slice, salt: Slice, iterations: Int, length: Int): UEffIO[Slice] = blockingOp {
+    private[kufuli] def pbkdf2(hash: Sha2, password: Slice, salt: Slice, iterations: Int, length: Int): UEffIO[Slice] = blockingOp {
       val out = new Array[Byte](length)
       require1(
         kufuli_pbkdf2(Slice.of(out).unsafePtr,
@@ -651,13 +700,13 @@ private[kufuli] object awslc:
     }
 
   private def hashOf[D <: HashAlgorithm](md: CInt, length: Int): Hash[D] = new Hash[D]:
-    def digest(data: Slice): UEffIO[Digest] = op {
+    private[kufuli] def digest(data: Slice): UEffIO[Digest] = op {
       val out = new Array[Byte](length)
       require1(kufuli_digest(md, data.unsafePtr, data.length.toCSize, Slice.of(out).unsafePtr))
       Digest.unsafe(out)
     }
   private def hashingOf[D <: HashAlgorithm](md: CInt, length: Int): Hashing[D] = new Hashing[D]:
-    def hasher: Resource[IO, Hasher] =
+    private[kufuli] def hasher: Resource[IO, Hasher] =
       Resource
         .make(guard(IO {
           val ctx = kufuli_hasher_new(md)
@@ -674,7 +723,7 @@ private[kufuli] object awslc:
         )
 
   private[kufuli] val oaep: Oaep = new Oaep:
-    def encrypt(key: PublicKey[Rsa], plaintext: Slice, scheme: RsaOaep): UEffIO[Slice] = op {
+    private[kufuli] def encrypt(key: PublicKey[Rsa], plaintext: Slice, scheme: RsaOaep): UEffIO[Slice] = op {
       val spki = keyBytes(key.repr)
       val capacity = spki.length
       withHandle(parsePub(Slice.of(spki))) { pkey =>
@@ -685,7 +734,7 @@ private[kufuli] object awslc:
         )
       }
     }
-    def decrypt(key: PrivateKey[Rsa], ciphertext: Slice, scheme: RsaOaep): EffIO[AuthFailed, Slice] = opE {
+    private[kufuli] def decrypt(key: PrivateKey[Rsa], ciphertext: Slice, scheme: RsaOaep): EffIO[AuthFailed, Slice] = opE {
       key.read { der =>
         val capacity = der.length
         withHandle(parsePriv(der)) { pkey =>
@@ -711,96 +760,97 @@ private[kufuli] object awslc:
     finally kufuli_pkey_free(h)
 
   private[kufuli] val edKeys: EdKeys = new EdKeys:
-    def generate: UEffIO[KeyPair[PublicKey[Ed25519], PrivateKey[Ed25519]]] = op {
+    private[kufuli] def generate: UEffIO[KeyPair[PublicKey[Ed25519], PrivateKey[Ed25519]]] = op {
       val kp = genPkey(PkeyEd25519, 0)
       KeyPair(PublicKey.unsafe(keyRepr(kp.pub)), PrivateKey.unsafe(kp.priv))
     }
-    def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[Ed25519]] = opE {
+    private[kufuli] def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[Ed25519]] = opE {
       if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
       else
-        storePub(kufuli_pkey_from_raw_public(PkeyEd25519, bytes.unsafePtr, bytes.length.toCSize), SpkiMax).map(b =>
+        storePub(kufuli_pkey_from_raw_public(PkeyEd25519, bytes.unsafePtr, bytes.length.toCSize), SpkiMax, Der.Alg.Ed).map(b =>
           PublicKey.unsafe(keyRepr(b))
         )
     }
-    def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[Ed25519]] =
-      opE(storePub(parsePub(der), SpkiMax).map(b => PublicKey.unsafe(keyRepr(b))))
-    def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[Ed25519]] =
-      opE(storePriv(parsePriv(der), Pkcs8Max).map(PrivateKey.unsafe))
-    def raw(key: PublicKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]] =
+    private[kufuli] def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[Ed25519]] =
+      opE(storePub(parsePub(der), SpkiMax, Der.Alg.Ed).map(b => PublicKey.unsafe(keyRepr(b))))
+    private[kufuli] def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[Ed25519]] =
+      opE(storePriv(parsePriv(der), Pkcs8Max, Der.Alg.Ed).map(PrivateKey.unsafe))
+    private[kufuli] def raw(key: PublicKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]] =
       op(
         withHandle(parsePub(Slice.of(keyBytes(key.repr))))(h => IArray.from(collect(32)((o, l) => kufuli_pkey_raw_public(h, o, l, 32.toCSize))))
       )
-    def spki(key: PublicKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
-    def pkcs8(key: PrivateKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]] =
-      EffIO.defer(key.read(s => op(IArray.from(s.toArray))))
+    private[kufuli] def spki(key: PublicKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def pkcs8(key: PrivateKey[Ed25519]): EffIO[KeyNotExportable, IArray[Byte]] =
+      EffIO.defer(op(key.read(s => IArray.from(s.toArray))))
 
   private[kufuli] val xKeys: XKeys = new XKeys:
-    def generate: UEffIO[KeyPair[PublicKey[X25519], PrivateKey[X25519]]] = op {
+    private[kufuli] def generate: UEffIO[KeyPair[PublicKey[X25519], PrivateKey[X25519]]] = op {
       val kp = genPkey(PkeyX25519, 0)
       KeyPair(PublicKey.unsafe(keyRepr(kp.pub)), PrivateKey.unsafe(kp.priv))
     }
-    def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[X25519]] = opE {
+    private[kufuli] def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[X25519]] = opE {
       if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
       else if bytes.toArray.forall(_ == 0) then Left(InvalidKey.WeakPoint)
       else
-        storePub(kufuli_pkey_from_raw_public(PkeyX25519, bytes.unsafePtr, bytes.length.toCSize), SpkiMax).map(b =>
+        storePub(kufuli_pkey_from_raw_public(PkeyX25519, bytes.unsafePtr, bytes.length.toCSize), SpkiMax, Der.Alg.X).map(b =>
           PublicKey.unsafe(keyRepr(b))
         )
     }
-    def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[X25519]] =
-      opE(storePub(parsePub(der), SpkiMax).map(b => PublicKey.unsafe(keyRepr(b))))
-    def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[X25519]] =
-      opE(storePriv(parsePriv(der), Pkcs8Max).map(PrivateKey.unsafe))
-    def raw(key: PublicKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]] =
+    private[kufuli] def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[X25519]] =
+      opE(storePub(parsePub(der), SpkiMax, Der.Alg.X).map(b => PublicKey.unsafe(keyRepr(b))))
+    private[kufuli] def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[X25519]] =
+      opE(storePriv(parsePriv(der), Pkcs8Max, Der.Alg.X).map(PrivateKey.unsafe))
+    private[kufuli] def raw(key: PublicKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]] =
       op(
         withHandle(parsePub(Slice.of(keyBytes(key.repr))))(h => IArray.from(collect(32)((o, l) => kufuli_pkey_raw_public(h, o, l, 32.toCSize))))
       )
-    def spki(key: PublicKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
-    def pkcs8(key: PrivateKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]] =
-      EffIO.defer(key.read(s => op(IArray.from(s.toArray))))
+    private[kufuli] def spki(key: PublicKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def pkcs8(key: PrivateKey[X25519]): EffIO[KeyNotExportable, IArray[Byte]] =
+      EffIO.defer(op(key.read(s => IArray.from(s.toArray))))
 
-  private def ecKeysOf[C <: EcCurve](tpe: CInt, fieldLength: Int): EcKeys[C] = new EcKeys[C]:
+  private def ecKeysOf[C <: EcCurve](tpe: CInt, curve: Der.Alg, fieldLength: Int): EcKeys[C] = new EcKeys[C]:
     private val pointLength = 1 + 2 * fieldLength
-    def generate: UEffIO[KeyPair[PublicKey[C], PrivateKey[C]]] = op {
+    private[kufuli] def generate: UEffIO[KeyPair[PublicKey[C], PrivateKey[C]]] = op {
       val kp = genPkey(tpe, 0)
       KeyPair(PublicKey.unsafe(keyRepr(kp.pub)), PrivateKey.unsafe(kp.priv))
     }
-    def fromSec1(point: Slice): EffIO[InvalidKey, PublicKey[C]] = opE {
+    private[kufuli] def fromSec1(point: Slice): EffIO[InvalidKey, PublicKey[C]] = opE {
       if point.length != pointLength then Left(InvalidKey.WrongLength(pointLength, point.length))
       else if point(0) != 4.toByte then Left(InvalidKey.Malformed)
       else
         val h = kufuli_pkey_from_ec_point(tpe, point.unsafePtr, point.length.toCSize)
-        if present(h) then storePub(h, SpkiMax).map(b => PublicKey.unsafe(keyRepr(b))) else Left(InvalidKey.NotOnCurve)
+        if present(h) then storePub(h, SpkiMax, curve).map(b => PublicKey.unsafe(keyRepr(b))) else Left(InvalidKey.NotOnCurve)
     }
-    def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[C]] =
-      opE(storePub(parsePub(der), SpkiMax).map(b => PublicKey.unsafe(keyRepr(b))))
-    def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[C]] =
-      opE(storePriv(parsePriv(der), Pkcs8Max).map(PrivateKey.unsafe))
-    def sec1(key: PublicKey[C]): EffIO[KeyNotExportable, IArray[Byte]] =
+    private[kufuli] def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[C]] =
+      opE(storePub(parsePub(der), SpkiMax, curve).map(b => PublicKey.unsafe(keyRepr(b))))
+    private[kufuli] def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[C]] =
+      opE(storePriv(parsePriv(der), Pkcs8Max, curve).map(PrivateKey.unsafe))
+    private[kufuli] def sec1(key: PublicKey[C]): EffIO[KeyNotExportable, IArray[Byte]] =
       op(
         withHandle(parsePub(Slice.of(keyBytes(key.repr))))(h =>
           IArray.from(collect(pointLength)((o, l) => kufuli_pkey_ec_point(h, o, l, pointLength.toCSize)))
         )
       )
-    def spki(key: PublicKey[C]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
-    def pkcs8(key: PrivateKey[C]): EffIO[KeyNotExportable, IArray[Byte]] =
-      EffIO.defer(key.read(s => op(IArray.from(s.toArray))))
+    private[kufuli] def spki(key: PublicKey[C]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def pkcs8(key: PrivateKey[C]): EffIO[KeyNotExportable, IArray[Byte]] =
+      EffIO.defer(op(key.read(s => IArray.from(s.toArray))))
 
   private[kufuli] val rsaKeys: RsaKeys = new RsaKeys:
-    def generate(size: Rsa.Size): UEffIO[KeyPair[PublicKey[Rsa], PrivateKey[Rsa]]] = blockingOp {
+    private[kufuli] def generate(size: Rsa.Size): UEffIO[KeyPair[PublicKey[Rsa], PrivateKey[Rsa]]] = blockingOp {
       val kp = genPkey(PkeyRsa, size.bits)
       KeyPair(PublicKey.unsafe(keyRepr(kp.pub)), PrivateKey.unsafe(kp.priv))
     }
-    def fromComponents(modulus: Slice, exponent: Slice): EffIO[InvalidKey, PublicKey[Rsa]] = opE {
+    private[kufuli] def fromComponents(modulus: Slice, exponent: Slice): EffIO[InvalidKey, PublicKey[Rsa]] = opE {
       storePub(kufuli_pkey_from_rsa_components(modulus.unsafePtr, modulus.length.toCSize, exponent.unsafePtr, exponent.length.toCSize),
-               SpkiMax
+               SpkiMax,
+               Der.Alg.OfRsa
       ).map(b => PublicKey.unsafe(keyRepr(b)))
     }
-    def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[Rsa]] =
-      opE(storePub(parsePub(der), SpkiMax).map(b => PublicKey.unsafe(keyRepr(b))))
-    def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[Rsa]] =
-      opE(storePriv(parsePriv(der), Pkcs8Max).map(PrivateKey.unsafe))
-    def components(key: PublicKey[Rsa]): EffIO[KeyNotExportable, Rsa.Components] = op {
+    private[kufuli] def fromSpki(der: Slice): EffIO[InvalidKey, PublicKey[Rsa]] =
+      opE(storePub(parsePub(der), SpkiMax, Der.Alg.OfRsa).map(b => PublicKey.unsafe(keyRepr(b))))
+    private[kufuli] def fromPkcs8(der: Slice): EffIO[InvalidKey, PrivateKey[Rsa]] =
+      opE(storePriv(parsePriv(der), Pkcs8Max, Der.Alg.OfRsa).map(PrivateKey.unsafe))
+    private[kufuli] def components(key: PublicKey[Rsa]): EffIO[KeyNotExportable, Rsa.Components] = op {
       val spki = keyBytes(key.repr)
       val capacity = spki.length
       withHandle(parsePub(Slice.of(spki))) { h =>
@@ -814,24 +864,46 @@ private[kufuli] object awslc:
         Rsa.Components(IArray.from(nBuf.take((!nLen).toInt)), IArray.from(eBuf.take((!eLen).toInt)))
       }
     }
-    def spki(key: PublicKey[Rsa]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
-    def pkcs8(key: PrivateKey[Rsa]): EffIO[KeyNotExportable, IArray[Byte]] =
-      EffIO.defer(key.read(s => op(IArray.from(s.toArray))))
+    private[kufuli] def spki(key: PublicKey[Rsa]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def pkcs8(key: PrivateKey[Rsa]): EffIO[KeyNotExportable, IArray[Byte]] =
+      EffIO.defer(op(key.read(s => IArray.from(s.toArray))))
 
   private def kemKeysOf[K <: KemAlgorithm](kem: CInt, spec: KemSpec[K], privLength: Int): KemKeys[K] = new KemKeys[K]:
-    def generate: UEffIO[KeyPair[PublicKey[K], PrivateKey[K]]] = op {
+    private[kufuli] def generate: UEffIO[KeyPair[PublicKey[K], PrivateKey[K]]] = op {
       val pubBuf = new Array[Byte](spec.publicKeyLength)
-      val privBuf = new Array[Byte](privLength)
       val pubLen = stackalloc[CSize]()
-      val privLen = stackalloc[CSize]()
-      require1(kufuli_kem_keypair(kem, Slice.of(pubBuf).unsafePtr, pubLen, Slice.of(privBuf).unsafePtr, privLen))
-      KeyPair(PublicKey.unsafe(keyRepr(pubBuf.take((!pubLen).toInt))), PrivateKey.unsafe(privBuf.take((!privLen).toInt)))
+      val priv = collect(privLength)((o, l) =>
+        kufuli_kem_keypair(kem, Slice.of(pubBuf).unsafePtr, pubLen, spec.publicKeyLength.toCSize, o, l, privLength.toCSize)
+      )
+      KeyPair(PublicKey.unsafe(keyRepr(pubBuf.take((!pubLen).toInt))), PrivateKey.unsafe(priv))
     }
-    def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[K]] = opE {
+    private[kufuli] def fromRaw(bytes: Slice): EffIO[InvalidKey, PublicKey[K]] = opE {
       if bytes.length != spec.publicKeyLength then Left(InvalidKey.WrongLength(spec.publicKeyLength, bytes.length))
+      // FIPS 203 section 7.2's encapsulation-key check: a peer key is adversarial input, so it
+      // belongs in the typed channel at import rather than in a failure inside encapsulation.
+      else if kufuli_kem_public_valid(kem, bytes.unsafePtr, bytes.length.toCSize) != 1 then Left(InvalidKey.Malformed)
       else Right(PublicKey.unsafe(keyRepr(bytes.toArray)))
     }
-    def raw(key: PublicKey[K]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def raw(key: PublicKey[K]): EffIO[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def fromSeed(seed: Slice): EffIO[InvalidKey, KeyPair[PublicKey[K], PrivateKey[K]]] = opE {
+      if seed.length != 64 then Left(InvalidKey.WrongLength(64, seed.length))
+      else
+        val pubBuf = new Array[Byte](spec.publicKeyLength)
+        val pubLen = stackalloc[CSize]()
+        val priv = collect(privLength)((o, l) =>
+          kufuli_kem_keypair_from_seed(kem,
+                                       seed.unsafePtr,
+                                       seed.length.toCSize,
+                                       Slice.of(pubBuf).unsafePtr,
+                                       pubLen,
+                                       spec.publicKeyLength.toCSize,
+                                       o,
+                                       l,
+                                       privLength.toCSize
+          )
+        )
+        Right(KeyPair(PublicKey.unsafe(keyRepr(pubBuf.take((!pubLen).toInt))), PrivateKey.unsafe(priv)))
+    }
 
   // Capability bundles the Native platform table wires each companion into.
   private[kufuli] trait RandomDefault:
@@ -860,6 +932,7 @@ private[kufuli] object awslc:
     given Mac[HmacSha256] = macOf(MdSha256)
     given Mac[HmacSha384] = macOf(MdSha384)
     given Mac[HmacSha512] = macOf(MdSha512)
+    given Mac[HmacSha1] = macOf(MdSha1)
   private[kufuli] trait SignersAll:
     given Signer[Ed25519] = edSigner
     given Signer[P256] = ecSigner(32)
@@ -904,9 +977,9 @@ private[kufuli] object awslc:
   private[kufuli] trait XKeysBytes:
     given XKeys = xKeys
   private[kufuli] trait EcKeysBytes:
-    given EcKeys[P256] = ecKeysOf(PkeyP256, 32)
-    given EcKeys[P384] = ecKeysOf(PkeyP384, 48)
-    given EcKeys[P521] = ecKeysOf(PkeyP521, 66)
+    given EcKeys[P256] = ecKeysOf(PkeyP256, Der.Alg.EcP256, 32)
+    given EcKeys[P384] = ecKeysOf(PkeyP384, Der.Alg.EcP384, 48)
+    given EcKeys[P521] = ecKeysOf(PkeyP521, Der.Alg.EcP521, 66)
   private[kufuli] trait RsaKeysBytes:
     given RsaKeys = rsaKeys
   private[kufuli] trait KemKeysAll:
