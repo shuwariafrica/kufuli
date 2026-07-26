@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-: "${MAIN_REPO_OWNER:=arashi01}"
+: "${MAIN_REPO_OWNER:=shuwariafrica}"
 : "${MAIN_REPO_NAME:=kufuli}"
 
 readonly C_RESET='\033[0m'

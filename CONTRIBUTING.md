@@ -7,7 +7,6 @@
 - Node.js 24+ (for the Scala.js targets).
 - A C toolchain for Scala Native: clang and, on Windows, the MSVC toolchain via `vcvarsall.bat`. The
   native backend links aws-lc, provisioned by sbt-snx from `vendor/`.
-- Playwright browsers, for the browser test target.
 - Git, for the vendored submodules.
 
 ## First build
@@ -54,19 +53,12 @@ vendor/
 
 ## Test structure
 
-The `tests` module composes capability-gated source sets, so each suite runs only where its
-dependencies exist:
+The `tests` module splits its suites by what the artifact under test can provide:
 
-- `src/test/scala` runs on all four artifacts: the pure value-layer checks, the structural misuse
-  negatives, and the core round-trip flows.
-- `src/test/kat` (JVM, Node, Native) holds the known-answer and adversarial corpus against a real
-  backend: RFC/NIST vectors, the Wycheproof suites, the budget and `kufuli.unsafe` vectors, the
-  password vectors, the jose verification suite, and the TLS/QUIC-shaped end-to-end flow.
-- `src/test/extended` (JVM, Node, Native) adds the Direct-gated record-machine suites and the jose,
-  x509, and password suites.
-- `src/test/pq` (JVM, Node, Native) adds the ML-KEM hybrid flow.
-- `src/test/node` and `src/test/browser` hold the per-artifact capability-boundary checks, proved by
-  `summon` for presence and `typeChecks` for absence.
+- `src/test/scala` runs on all four artifacts - JVM, Node, browser and Native - and holds the pure
+  value-layer checks, the structural misuse negatives, and the core round-trip flows.
+- `src/test/kat` runs on JVM, Node and Native, and holds the known-answer and adversarial vectors
+  against a real backend. The browser artifact is stub-backed, so it has no backend to answer them.
 
 Conventions for new tests:
 
@@ -96,4 +88,4 @@ Then record the new SHA in `NOTICE`.
 
 Run `sbt format` before committing (`scalafixAll; scalafmtAll; scalafmtSbt; headerCreateAll`); `sbt
 check` is the read-only gate CI runs. Both main and test sources compile under the same strict
-regime: `-Werror`, `-Yexplicit-nulls`, and the full `-Wunused` set.
+regime: `-Werror`, `-Yexplicit-nulls`, and `-Wunused:all`.

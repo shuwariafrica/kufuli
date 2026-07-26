@@ -14,7 +14,9 @@ on:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # `publish` gates on every test job, so a cancelled main or tag run leaves that commit unvalidated
+  # and unpublished.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -116,19 +118,16 @@ jobs:
             runner: ubuntu-24.04-arm
             dockerImage: shuwariafrica/el10-jdk:25
             link: dynamic
-          # Dynamic musl passes. The fully-static musl lanes hit scala-native#4934 (a static-musl
-          # new-thread SIGSEGV, unreleased as of 0.5.12) and are commented out below until it ships;
-          # the `Verify static linkage` step stays and lies dormant until they return.
+          # The fully-static musl rows below await scala-native#4934 (static-musl new-thread SIGSEGV,
+          # unreleased as of 0.5.12); the `Verify static linkage` step stays for their return.
           - target: linux-musl-x86_64
             runner: ubuntu-24.04
             dockerImage: shuwariafrica/alpine-jdk:25
             link: dynamic
-            continueOnError: true
           - target: linux-musl-aarch64
             runner: ubuntu-24.04-arm
             dockerImage: shuwariafrica/alpine-jdk:25
             link: dynamic
-            continueOnError: true
           # - target: linux-musl-x86_64-static
           #   runner: ubuntu-24.04
           #   dockerImage: shuwariafrica/alpine-jdk:25
@@ -174,7 +173,9 @@ jobs:
           if ! command -v nm >/dev/null 2>&1; then
             echo "::error::nm (binutils) not found for the linkage-symbol assertion"; exit 1
           fi
-          bin=$(find target/out -type f -name 'kufuli-tests-test' 2>/dev/null | sort -V | tail -1)
+          # Without this, a missing target/out fails the step under `-eo pipefail` and the check
+          # below never runs.
+          bin=$(find target/out -type f -name 'kufuli-tests-test' 2>/dev/null | sort -V | tail -1 || true)
           if [ -z "$bin" ]; then
             echo "::error::no Native test binary located for the linkage-symbol assertion"; exit 1
           fi
@@ -409,8 +410,9 @@ jobs:
           SONATYPE_PASSWORD: ${{ secrets.OSS_PUBLISH_USER_PASSPHRASE }}
 
       - name: Publish Maven Central Release
+        # `sonaUpload` is the same action under another publishing type; running both deploys twice.
         if: startsWith(github.ref, 'refs/tags/v')
-        run: sbt --server "sonaUpload; sonaRelease"
+        run: sbt --server sonaRelease
         env:
           SONATYPE_USERNAME: ${{ secrets.OSS_PUBLISH_USER }}
           SONATYPE_PASSWORD: ${{ secrets.OSS_PUBLISH_USER_PASSPHRASE }}
