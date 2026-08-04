@@ -396,8 +396,6 @@ jobs:
         uses: crazy-max/ghaction-import-gpg@v7
         with:
           gpg_private_key: ${{ secrets.OSS_PUBLISH_USER_SIGNING_KEY }}
-          git_user_signingkey: true
-          git_commit_gpgsign: true
           trust_level: 5
 
       - name: Set up Coursier cache
