@@ -48,27 +48,62 @@ object PathInvalid:
   case object NameMismatch extends NameMismatch
   sealed abstract class ConstraintViolated private[x509] () extends PathInvalid("certificate constraints violated")
   case object ConstraintViolated extends ConstraintViolated
+  sealed abstract class NameConstraintViolated private[x509] () extends PathInvalid("certificate name outside the issuers' name constraints")
+  case object NameConstraintViolated extends NameConstraintViolated
+  sealed abstract class LimitExceeded private[x509] () extends PathInvalid("certificate path exceeds a validation resource bound")
+  case object LimitExceeded extends LimitExceeded
 end PathInvalid
 
+// Every GeneralName a certificate presents. The four forms RFC 5280 defines no matching rule for
+// are recorded as presence, which is all the fail-closed conjunction reads; URI joins them there
+// while keeping its values for the accessor.
+final private[x509] case class San(
+  dns: List[String],
+  ips: List[IpBits],
+  emails: List[String],
+  uris: List[String],
+  dirNames: List[List[List[Ava]]],
+  unprocessed: Set[UnprocessedForm]
+)
+
 // Everything path validation reads from a certificate, extracted once at construction: `Certificate`
-// is opaque over this, so no accessor re-parses.
+// is opaque over this, so no accessor re-parses. Identity is the DER, with the hash taken in the
+// same pass, because the case-class equality over its array fields would be reference equality.
 final private[x509] case class Parsed(
   encoded: IArray[Byte],
+  hash: Int,
   tbs: Array[Byte],
   spki: Array[Byte],
   issuerDer: Array[Byte],
   subjectDer: Array[Byte],
+  subject: List[List[Ava]],
   notBefore: Long,
   notAfter: Long,
-  sanDns: List[String],
-  isCa: Boolean,
+  san: Option[San],
+  isCa: Option[Boolean],
   maxPathLen: Option[Int],
   ekus: List[String],
   keyCertSign: Option[Boolean],
+  constraints: Option[NameConstraints],
   unhandledCritical: Boolean,
   sigScheme: Option[SigScheme],
   signature: Array[Byte]
-)
+):
+  override def hashCode: Int = hash
+  override def equals(that: Any): Boolean =
+    that match
+      case other: Parsed => hash == other.hash && Parsed.sameBytes(encoded, other.encoded, 0)
+      case _             => false
+end Parsed
+
+private[x509] object Parsed:
+  @tailrec def sameBytes(a: IArray[Byte], b: IArray[Byte], i: Int): Boolean =
+    if a.length != b.length then false
+    else if i >= a.length then true
+    else a(i) == b(i) && sameBytes(a, b, i + 1)
+
+  @tailrec def hashOf(a: IArray[Byte], i: Int, acc: Int): Int =
+    if i >= a.length then acc else hashOf(a, i + 1, acc * 31 + a(i))
 
 // The scheme named in a certificate's own signatureAlgorithm - what its ISSUER's key verifies with.
 private[x509] enum SigScheme derives CanEqual:
@@ -92,23 +127,88 @@ private[x509] object X509:
   private val oidKeyUsage = Array[Byte](0x55, 0x1d, 0x0f)
   private val oidSan = Array[Byte](0x55, 0x1d, 0x11)
   private val oidBasicConstraints = Array[Byte](0x55, 0x1d, 0x13)
+  private val oidNameConstraints = Array[Byte](0x55, 0x1d, 0x1e)
   private val oidEku = Array[Byte](0x55, 0x1d, 0x25)
+  // The subject-DN attribute RFC 5280 section 4.2.1.10 checks as an rfc822Name when a certificate
+  // carries no SAN extension.
+  private val oidEmailAddress = Array[Byte](0x2a, 0x86.toByte, 0x48, 0x86.toByte, 0xf7.toByte, 0x0d, 0x01, 0x09, 0x01)
+  // Hash and mask-generation OIDs, for RSASSA-PSS parameters.
+  private val sha256Oid = Array[Byte](0x60, 0x86.toByte, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01)
+  private val sha384Oid = Array[Byte](0x60, 0x86.toByte, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02)
+  private val sha512Oid = Array[Byte](0x60, 0x86.toByte, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03)
+  private val mgf1 = Array[Byte](0x2a, 0x86.toByte, 0x48, 0x86.toByte, 0xf7.toByte, 0x0d, 0x01, 0x01, 0x08)
   // EKU purpose OIDs.
   val ekuServerAuth = "1.3.6.1.5.5.7.3.1"
   val ekuClientAuth = "1.3.6.1.5.5.7.3.2"
 
   private def eq(a: Slice, b: Array[Byte]): Boolean = a.contentEquals(Slice.of(b))
 
-  private def sigScheme(oid: Slice): Option[SigScheme] =
-    if eq(oid, ed25519) then Some(SigScheme.Ed)
-    else if eq(oid, ecdsaSha256) then Some(SigScheme.Ec(Sha256))
-    else if eq(oid, ecdsaSha384) then Some(SigScheme.Ec(Sha384))
-    else if eq(oid, ecdsaSha512) then Some(SigScheme.Ec(Sha512))
-    else if eq(oid, rsaSha256) then Some(SigScheme.RsaPkcs1(Sha256))
-    else if eq(oid, rsaSha384) then Some(SigScheme.RsaPkcs1(Sha384))
-    else if eq(oid, rsaSha512) then Some(SigScheme.RsaPkcs1(Sha512))
-    else if eq(oid, rsaPss) then Some(SigScheme.RsaPss(Sha256))
-    else None
+  // The whole AlgorithmIdentifier, because RSASSA-PSS carries its digest in the parameters.
+  private def sigScheme(s: Slice, algId: Der.Tlv): Option[SigScheme] =
+    read(s, algId.contentOff, 0x06, algId.next).toOption.flatMap { t =>
+      val oid = s.slice(t.contentOff, t.next)
+      if eq(oid, ed25519) then Some(SigScheme.Ed)
+      else if eq(oid, ecdsaSha256) then Some(SigScheme.Ec(Sha256))
+      else if eq(oid, ecdsaSha384) then Some(SigScheme.Ec(Sha384))
+      else if eq(oid, ecdsaSha512) then Some(SigScheme.Ec(Sha512))
+      else if eq(oid, rsaSha256) then Some(SigScheme.RsaPkcs1(Sha256))
+      else if eq(oid, rsaSha384) then Some(SigScheme.RsaPkcs1(Sha384))
+      else if eq(oid, rsaSha512) then Some(SigScheme.RsaPkcs1(Sha512))
+      else if eq(oid, rsaPss) then pssHash(s, t.next, algId.next).map(SigScheme.RsaPss(_))
+      else None
+    }
+
+  private def hashOid(s: Slice, algId: Der.Tlv): Option[Sha2] =
+    read(s, algId.contentOff, 0x06, algId.next).toOption.flatMap { t =>
+      val oid = s.slice(t.contentOff, t.next)
+      if eq(oid, sha256Oid) then Some(Sha256)
+      else if eq(oid, sha384Oid) then Some(Sha384)
+      else if eq(oid, sha512Oid) then Some(Sha512)
+      else None
+    }
+
+  private def hashLength(hash: Sha2): Int =
+    hash match
+      case _: Sha256.type => 32
+      case _: Sha384.type => 48
+      case _: Sha512.type => 64
+
+  // RSASSA-PSS-params ::= SEQUENCE { hashAlgorithm [0], maskGenAlgorithm [1], saltLength [2],
+  // trailerField [3] }, each with a DEFAULT naming SHA-1. kufuli verifies only the three profiles
+  // where MGF1 uses the same SHA-2 digest and the salt is that digest's length; every other
+  // parameter set - the SHA-1 defaults included - has no scheme here and fails closed.
+  private def pssHash(s: Slice, off: Int, limit: Int): Option[Sha2] =
+    for
+      params <- read(s, off, 0x30, limit).toOption
+      _ <- Option.when(params.next == limit)(())
+      hashField <- read(s, params.contentOff, 0xa0, params.next).toOption
+      hashAlg <- read(s, hashField.contentOff, 0x30, hashField.next).toOption
+      hash <- hashOid(s, hashAlg)
+      maskField <- read(s, hashField.next, 0xa1, params.next).toOption
+      maskAlg <- read(s, maskField.contentOff, 0x30, maskField.next).toOption
+      maskOid <- read(s, maskAlg.contentOff, 0x06, maskAlg.next).toOption
+      _ <- Option.when(eq(s.slice(maskOid.contentOff, maskOid.next), mgf1))(())
+      maskHashAlg <- read(s, maskOid.next, 0x30, maskAlg.next).toOption
+      maskHash <- hashOid(s, maskHashAlg)
+      _ <- Option.when(hashLength(maskHash) == hashLength(hash))(())
+      saltField <- read(s, maskField.next, 0xa2, params.next).toOption
+      saltInt <- read(s, saltField.contentOff, 0x02, saltField.next).toOption
+      salt <- smallInteger(s, saltInt)
+      _ <- Option.when(salt == hashLength(hash))(())
+      _ <- trailerIsDefault(s, saltField.next, params.next)
+    yield hash
+
+  // trailerField is optional and its only defined value is trailerBCompatible(1).
+  private def trailerIsDefault(s: Slice, off: Int, limit: Int): Option[Unit] =
+    if off == limit then Some(())
+    else
+      for
+        field <- read(s, off, 0xa3, limit).toOption
+        _ <- Option.when(field.next == limit)(())
+        value <- read(s, field.contentOff, 0x02, field.next).toOption
+        n <- smallInteger(s, value)
+        _ <- Option.when(n == 1)(())
+      yield ()
 
   // Civil date (UTC) to epoch seconds without java.time (Howard Hinnant's algorithm).
   private def epoch(y: Int, m: Int, d: Int, hh: Int, mm: Int, ss: Int): Long =
@@ -187,26 +287,33 @@ private[x509] object X509:
       _ <- wellFormed(cert.next == s.length)
       tbs <- read(s, cert.contentOff, 0x30, cert.next)
       sigAlg <- read(s, tbs.next, 0x30, cert.next)
-      sigOid <- read(s, sigAlg.contentOff, 0x06, sigAlg.next)
       sigBits <- read(s, sigAlg.next, 0x03, cert.next)
       _ <- wellFormed(sigBits.next == cert.next && sigBits.contentLen >= 1)
       fields <- tbsFields(s, tbs)
+      // RFC 5280 section 4.1.1.2: the outer signatureAlgorithm is not covered by the signature, so
+      // the scheme it names is attacker-chosen unless it equals the signed inner one byte for byte.
+      _ <- wellFormed(s.slice(tbs.next, sigAlg.next).contentEquals(fields.innerSigAlg))
+      subject <- distinguishedName(s, fields.subjectRange.from, fields.subjectRange.until)
       ext <- extensions(s, fields.exts)
+      _ <- wellFormed(fields.exts.isEmpty || fields.version.contains(2))
     yield Parsed(
       encoded = der,
+      hash = Parsed.hashOf(der, 0, 1),
       tbs = s.slice(cert.contentOff, tbs.next).toArray,
       spki = fields.spki,
       issuerDer = fields.issuerDer,
       subjectDer = fields.subjectDer,
+      subject = subject,
       notBefore = fields.notBefore,
       notAfter = fields.notAfter,
-      sanDns = ext.sanDns,
+      san = ext.san,
       isCa = ext.isCa,
       maxPathLen = ext.maxPathLen,
       ekus = ext.ekus,
       keyCertSign = ext.keyCertSign,
+      constraints = ext.constraints,
       unhandledCritical = ext.unhandledCritical,
-      sigScheme = sigScheme(s.slice(sigOid.contentOff, sigOid.next)),
+      sigScheme = sigScheme(s, sigAlg),
       signature = s.slice(sigBits.contentOff + 1, sigBits.next).toArray
     )
     end for
@@ -218,21 +325,33 @@ private[x509] object X509:
   private type TbsFields = (
     issuerDer: Array[Byte],
     subjectDer: Array[Byte],
+    subjectRange: (from: Int, until: Int),
+    innerSigAlg: Slice,
+    version: Option[Int],
     notBefore: Long,
     notAfter: Long,
     spki: Array[Byte],
     exts: Option[Der.Tlv]
   )
 
-  // Version is [0] EXPLICIT and defaults to v1 by being absent, so only its encoding is read here.
-  private def afterVersion(s: Slice, tbs: Der.Tlv): Either[PathInvalid, Int] =
-    if tbs.contentOff < tbs.next && (s(tbs.contentOff) & 0xff) == 0xa0 then read(s, tbs.contentOff, 0xa0, tbs.next).map(_.next)
-    else Right(tbs.contentOff)
+  // Version is [0] EXPLICIT and absent for v1. RFC 5280 section 4.1.2.1 admits 0, 1 and 2, but DER
+  // omits a DEFAULT value, so a present [0] encoding v1 is an alternative encoding of the same
+  // certificate.
+  private def afterVersion(s: Slice, tbs: Der.Tlv): Either[PathInvalid, (next: Int, version: Option[Int])] =
+    if tbs.contentOff < tbs.next && (s(tbs.contentOff) & 0xff) == 0xa0 then
+      for
+        wrapper <- read(s, tbs.contentOff, 0xa0, tbs.next)
+        value <- read(s, wrapper.contentOff, 0x02, wrapper.next)
+        _ <- wellFormed(value.next == wrapper.next)
+        n <- smallInteger(s, value).toRight(PathInvalid.MalformedChain)
+        _ <- wellFormed(n == 1 || n == 2)
+      yield (next = wrapper.next, version = Some(n))
+    else Right((next = tbs.contentOff, version = None))
 
   private def tbsFields(s: Slice, tbs: Der.Tlv): Either[PathInvalid, TbsFields] =
     for
       start <- afterVersion(s, tbs)
-      serial <- read(s, start, 0x02, tbs.next)
+      serial <- read(s, start.next, 0x02, tbs.next)
       sigAlgId <- read(s, serial.next, 0x30, tbs.next)
       issuer <- read(s, sigAlgId.next, 0x30, tbs.next)
       validity <- read(s, issuer.next, 0x30, tbs.next)
@@ -243,6 +362,9 @@ private[x509] object X509:
     yield (
       issuerDer = s.slice(sigAlgId.next, issuer.next).toArray,
       subjectDer = s.slice(validity.next, subject.next).toArray,
+      subjectRange = (from = validity.next, until = subject.next),
+      innerSigAlg = s.slice(serial.next, sigAlgId.next),
+      version = start.version,
       notBefore = times.notBefore,
       notAfter = times.notAfter,
       spki = s.slice(subject.next, spki.next).toArray,
@@ -288,11 +410,12 @@ private[x509] object X509:
         case Right(t) => scanExtensions(s, t.next, end)
 
   final private case class Extensions(
-    sanDns: List[String],
-    isCa: Boolean,
+    san: Option[San],
+    isCa: Option[Boolean],
     maxPathLen: Option[Int],
     ekus: List[String],
     keyCertSign: Option[Boolean],
+    constraints: Option[NameConstraints],
     unhandledCritical: Boolean
   )
 
@@ -303,7 +426,7 @@ private[x509] object X509:
   // constraint, both of which read as "unrestricted".
   private def extensions(s: Slice, exts: Option[Der.Tlv]): Either[PathInvalid, Extensions] =
     val empty =
-      Extensions(sanDns = Nil, isCa = false, maxPathLen = None, ekus = Nil, keyCertSign = None, unhandledCritical = false)
+      Extensions(san = None, isCa = None, maxPathLen = None, ekus = Nil, keyCertSign = None, constraints = None, unhandledCritical = false)
     exts match
       case None      => Right(empty)
       case Some(seq) =>
@@ -330,44 +453,195 @@ private[x509] object X509:
       updated <- absorb(s.slice(octet.contentOff, octet.next), id, flag.critical, acc)
     yield (next = ext.next, id = id, acc = updated)
 
-  private def criticality(s: Slice, off: Int, limit: Int): Either[PathInvalid, (critical: Boolean, next: Int)] =
+  // DER omits a DEFAULT FALSE and encodes TRUE as 0xFF, so an explicit FALSE or any other content
+  // is a second encoding of a value that already has exactly one - the raw material of a parser
+  // differential.
+  private def booleanFlag(s: Slice, off: Int, limit: Int): Either[PathInvalid, (set: Boolean, next: Int)] =
     if off < limit && (s(off) & 0xff) == 0x01 then
       read(s, off, 0x01, limit).flatMap { b =>
-        if b.contentLen != 1 then Left(PathInvalid.MalformedChain)
-        else Right((critical = (s(b.contentOff) & 0xff) != 0x00, next = b.next))
+        if b.contentLen != 1 || (s(b.contentOff) & 0xff) != 0xff then Left(PathInvalid.MalformedChain)
+        else Right((set = true, next = b.next))
       }
-    else Right((critical = false, next = off))
+    else Right((set = false, next = off))
+
+  private def criticality(s: Slice, off: Int, limit: Int): Either[PathInvalid, (critical: Boolean, next: Int)] =
+    booleanFlag(s, off, limit).map(b => (critical = b.set, next = b.next))
 
   private def absorb(value: Slice, oid: Slice, critical: Boolean, acc: Extensions): Either[PathInvalid, Extensions] =
-    if eq(oid, oidSan) then parseSan(value).map(dns => acc.copy(sanDns = dns))
-    else if eq(oid, oidBasicConstraints) then parseBasicConstraints(value).map(bc => acc.copy(isCa = bc.isCa, maxPathLen = bc.maxPathLen))
+    if eq(oid, oidSan) then parseSan(value).map(san => acc.copy(san = Some(san)))
+    else if eq(oid, oidBasicConstraints) then
+      parseBasicConstraints(value).map(bc => acc.copy(isCa = Some(bc.isCa), maxPathLen = bc.maxPathLen))
+    else if eq(oid, oidNameConstraints) then parseNameConstraints(value).map(nc => acc.copy(constraints = Some(nc)))
     else if eq(oid, oidEku) then parseEku(value).map(e => acc.copy(ekus = e))
     else if eq(oid, oidKeyUsage) then parseKeyUsage(value).map(k => acc.copy(keyCertSign = Some(k)))
     else Right(acc.copy(unhandledCritical = acc.unhandledCritical || critical))
 
-  private def parseSan(value: Slice): Either[PathInvalid, List[String]] =
-    // GeneralNames ::= SEQUENCE OF GeneralName; dNSName is context [2] IA5String.
-    @tailrec def go(pos: Int, limit: Int, acc: List[String]): Either[PathInvalid, List[String]] =
-      if pos >= limit then Right(acc.reverse)
+  // IA5String is 7-bit: decoding a high byte as US-ASCII substitutes a replacement character, which
+  // folds two distinct names onto one string.
+  private def ia5(s: Slice, t: Der.Tlv): Option[String] =
+    val raw = s.slice(t.contentOff, t.next).toArray
+    if raw.forall(_ >= 0) then Some(new String(raw, "US-ASCII")) else None
+
+  // GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName. Every form is read: the four with no
+  // RFC 5280 matching rule, and URI, only as presence, which is what the fail-closed conjunction
+  // consumes.
+  private def parseSan(value: Slice): Either[PathInvalid, San] =
+    @tailrec def go(pos: Int, limit: Int, count: Int, acc: San): Either[PathInvalid, San] =
+      if pos >= limit then Right(acc)
+      else if count >= maxNames then Left(PathInvalid.MalformedChain)
       else
         val tag = value(pos) & 0xff
         read(value, pos, tag, limit) match
           case Left(e)  => Left(e)
           case Right(t) =>
-            val name = if tag == 0x82 then new String(value.slice(t.contentOff, t.next).toArray, "US-ASCII") :: acc else acc
-            go(t.next, limit, name)
-    only(value, 0x30).flatMap(seq => go(seq.contentOff, seq.next, Nil))
+            sanEntry(value, tag, t, acc) match
+              case Left(e)     => Left(e)
+              case Right(next) => go(t.next, limit, count + 1, next)
+    for
+      seq <- only(value, 0x30)
+      _ <- wellFormed(seq.contentOff < seq.next)
+      san <- go(seq.contentOff, seq.next, 0, San(Nil, Nil, Nil, Nil, Nil, Set.empty))
+    yield San(
+      dns = san.dns.reverse,
+      ips = san.ips.reverse,
+      emails = san.emails.reverse,
+      uris = san.uris.reverse,
+      dirNames = san.dirNames.reverse,
+      unprocessed = san.unprocessed
+    )
+    end for
   end parseSan
+
+  private def sanEntry(s: Slice, tag: Int, t: Der.Tlv, acc: San): Either[PathInvalid, San] =
+    // RFC 5280 section 4.2.1.6 gives no meaning to a zero-length GeneralName; reading one as a name
+    // that matches nothing, or everything, is the choice Go's CVE-2026-27138 made.
+    if t.contentLen == 0 then Left(PathInvalid.MalformedChain)
+    else
+      tag match
+        case 0x82 => ia5(s, t).filter(Names.validDnsName).toRight(PathInvalid.MalformedChain).map(n => acc.copy(dns = n :: acc.dns))
+        case 0x87 =>
+          IpAddress
+            .of(s.slice(t.contentOff, t.next))
+            .left
+            .map(_ => PathInvalid.MalformedChain)
+            .map(ip => acc.copy(ips = ip.bits :: acc.ips))
+        case 0x81 => ia5(s, t).filter(Names.validEmail).toRight(PathInvalid.MalformedChain).map(n => acc.copy(emails = n :: acc.emails))
+        case 0x86 =>
+          ia5(s, t)
+            .toRight(PathInvalid.MalformedChain)
+            .map(n => acc.copy(uris = n :: acc.uris, unprocessed = acc.unprocessed + UnprocessedForm.Uri))
+        case 0xa4 => distinguishedName(s, t.contentOff, t.next).map(dn => acc.copy(dirNames = dn :: acc.dirNames))
+        case 0xa0 => Right(acc.copy(unprocessed = acc.unprocessed + UnprocessedForm.Other))
+        case 0xa3 => Right(acc.copy(unprocessed = acc.unprocessed + UnprocessedForm.X400))
+        case 0xa5 => Right(acc.copy(unprocessed = acc.unprocessed + UnprocessedForm.EdiParty))
+        case 0x88 => Right(acc.copy(unprocessed = acc.unprocessed + UnprocessedForm.RegisteredId))
+        case _    => Left(PathInvalid.MalformedChain)
+
+  // NameConstraints ::= SEQUENCE { permittedSubtrees [0] GeneralSubtrees OPTIONAL,
+  // excludedSubtrees [1] GeneralSubtrees OPTIONAL }, each SEQUENCE SIZE (1..MAX).
+  private def parseNameConstraints(value: Slice): Either[PathInvalid, NameConstraints] =
+    for
+      seq <- only(value, 0x30)
+      _ <- wellFormed(seq.contentOff < seq.next)
+      permitted <- subtreeList(value, seq.contentOff, seq.next, 0xa0)
+      excluded <- subtreeList(value, permitted.next, seq.next, 0xa1)
+      _ <- wellFormed(excluded.next == seq.next)
+    yield NameConstraints(permitted.subtrees, excluded.subtrees)
+
+  private def subtreeList(s: Slice, pos: Int, limit: Int, tag: Int): Either[PathInvalid, (subtrees: Subtrees, next: Int)] =
+    if pos < limit && (s(pos) & 0xff) == tag then
+      for
+        wrapper <- read(s, pos, tag, limit)
+        _ <- wellFormed(wrapper.contentOff < wrapper.next)
+        list <- subtrees(s, wrapper.contentOff, wrapper.next, 0, Subtrees.empty)
+      yield (subtrees = list, next = wrapper.next)
+    else Right((subtrees = Subtrees.empty, next = pos))
+
+  @tailrec private def subtrees(s: Slice, pos: Int, limit: Int, count: Int, acc: Subtrees): Either[PathInvalid, Subtrees] =
+    if pos >= limit then Right(acc)
+    else if count >= maxSubtrees then Left(PathInvalid.MalformedChain)
+    else
+      val step =
+        for
+          sub <- read(s, pos, 0x30, limit)
+          _ <- wellFormed(sub.contentOff < sub.next)
+          tag = s(sub.contentOff) & 0xff
+          base <- read(s, sub.contentOff, tag, sub.next)
+          // minimum and maximum have no meaning in this walk, and an explicit `minimum = 0` is a
+          // DER DEFAULT violation besides, so either present rejects the subtree.
+          _ <- wellFormed(base.next == sub.next)
+          next <- subtreeBase(s, tag, base, acc)
+        yield (acc = next, next = sub.next)
+      step match
+        case Left(e)  => Left(e)
+        case Right(t) => subtrees(s, t.next, limit, count + 1, t.acc)
+
+  private def subtreeBase(s: Slice, tag: Int, t: Der.Tlv, acc: Subtrees): Either[PathInvalid, Subtrees] =
+    tag match
+      case 0x82 => ia5(s, t).filter(Names.validDnsBase).toRight(PathInvalid.MalformedChain).map(b => acc.copy(dns = b :: acc.dns))
+      case 0x87 => ipSubtree(s, t).map(sub => acc.copy(ips = sub :: acc.ips))
+      case 0x81 => ia5(s, t).filter(validEmailBase).toRight(PathInvalid.MalformedChain).map(b => acc.copy(emails = b :: acc.emails))
+      case 0x86 => Right(acc.copy(unprocessed = acc.unprocessed + UnprocessedForm.Uri))
+      case 0xa4 => distinguishedName(s, t.contentOff, t.next).map(dn => acc.copy(dirNames = dn :: acc.dirNames))
+      case 0xa0 => Right(acc.copy(unprocessed = acc.unprocessed + UnprocessedForm.Other))
+      case 0xa3 => Right(acc.copy(unprocessed = acc.unprocessed + UnprocessedForm.X400))
+      case 0xa5 => Right(acc.copy(unprocessed = acc.unprocessed + UnprocessedForm.EdiParty))
+      case 0x88 => Right(acc.copy(unprocessed = acc.unprocessed + UnprocessedForm.RegisteredId))
+      case _    => Left(PathInvalid.MalformedChain)
+
+  private def validEmailBase(base: String): Boolean =
+    val at = base.indexOf('@')
+    at < 0 || base.indexOf('@', at + 1) < 0
+
+  // The address and its mask, as one value of twice the family's width.
+  private def ipSubtree(s: Slice, t: Der.Tlv): Either[PathInvalid, IpSubtree] =
+    val raw = s.slice(t.contentOff, t.next)
+    if raw.length != 8 && raw.length != 32 then Left(PathInvalid.MalformedChain)
+    else
+      val half = raw.length / 2
+      for
+        base <- IpAddress.of(raw.take(half)).left.map(_ => PathInvalid.MalformedChain)
+        mask <- IpAddress.of(raw.drop(half)).left.map(_ => PathInvalid.MalformedChain)
+        _ <- wellFormed(Names.contiguousMask(mask.bits))
+      yield IpSubtree(base.bits, mask.bits)
+
+  // Name ::= RDNSequence ::= SEQUENCE OF RelativeDistinguishedName ::= SET OF AttributeTypeAndValue.
+  private def distinguishedName(s: Slice, from: Int, until: Int): Either[PathInvalid, List[List[Ava]]] =
+    for
+      seq <- read(s, from, 0x30, until)
+      _ <- wellFormed(seq.next == until)
+      rdns <- rdnSequence(s, seq.contentOff, seq.next, Nil)
+    yield rdns
+
+  @tailrec private def rdnSequence(s: Slice, pos: Int, limit: Int, acc: List[List[Ava]]): Either[PathInvalid, List[List[Ava]]] =
+    if pos >= limit then Right(acc.reverse)
+    else
+      read(s, pos, 0x31, limit).flatMap(set => avas(s, set.contentOff, set.next, Nil).map(list => (rdn = list, next = set.next))) match
+        case Left(e)  => Left(e)
+        case Right(t) => rdnSequence(s, t.next, limit, t.rdn :: acc)
+
+  @tailrec private def avas(s: Slice, pos: Int, limit: Int, acc: List[Ava]): Either[PathInvalid, List[Ava]] =
+    if pos >= limit then Right(acc.reverse)
+    else
+      val step =
+        for
+          ava <- read(s, pos, 0x30, limit)
+          oid <- read(s, ava.contentOff, 0x06, ava.next)
+          _ <- wellFormed(oid.next < ava.next)
+          tag = s(oid.next) & 0xff
+          value <- read(s, oid.next, tag, ava.next)
+          _ <- wellFormed(value.next == ava.next)
+        yield (
+          ava = Ava(s.slice(oid.contentOff, oid.next).toArray, tag, s.slice(value.contentOff, value.next).toArray),
+          next = ava.next
+        )
+      step match
+        case Left(e)  => Left(e)
+        case Right(t) => avas(s, t.next, limit, t.ava :: acc)
 
   // BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }.
   private def parseBasicConstraints(value: Slice): Either[PathInvalid, (isCa: Boolean, maxPathLen: Option[Int])] =
-    def ca(off: Int, limit: Int): Either[PathInvalid, (set: Boolean, next: Int)] =
-      if off < limit && (value(off) & 0xff) == 0x01 then
-        read(value, off, 0x01, limit).flatMap { b =>
-          if b.contentLen != 1 then Left(PathInvalid.MalformedChain)
-          else Right((set = (value(b.contentOff) & 0xff) != 0x00, next = b.next))
-        }
-      else Right((set = false, next = off))
+    def ca(off: Int, limit: Int): Either[PathInvalid, (set: Boolean, next: Int)] = booleanFlag(value, off, limit)
     def pathLen(off: Int, limit: Int): Either[PathInvalid, Option[Int]] =
       if off < limit && (value(off) & 0xff) == 0x02 then
         read(value, off, 0x02, limit).flatMap(t => smallInteger(value, t).toRight(PathInvalid.MalformedChain)).map(Some(_))
@@ -382,7 +656,10 @@ private[x509] object X509:
   // A small non-negative DER INTEGER (pathLenConstraint is 0..a handful); reject negative/oversize.
   private def smallInteger(s: Slice, t: Der.Tlv): Option[Int] =
     val raw = s.slice(t.contentOff, t.next).toArray
+    // A padding octet a minimal encoding would not carry is a second encoding of the same value,
+    // which is how two readers of one certificate are made to disagree about a version or a length.
     if raw.isEmpty || raw.length > 4 || (raw(0) & 0x80) != 0 then None
+    else if raw.length > 1 && raw(0) == 0.toByte && (raw(1) & 0x80) == 0 then None
     else Some(raw.foldLeft(0)((a, b) => (a << 8) | (b & 0xff)))
 
   private def parseEku(value: Slice): Either[PathInvalid, List[String]] =
@@ -403,8 +680,46 @@ private[x509] object X509:
       else Right((bits.contentLen - 1) * 8 - unused > 5 && (value(bits.contentOff + 1) & 0x04) != 0)
     }
 
+  // A certificate SAN or constraint list this long is pathological, and both walks are quadratic in
+  // it; real certificates carry single digits.
+  private val maxNames = 4096
+  private val maxSubtrees = 4096
+
+  // The generation floor (RFC 7518 section 3.3, "2048 bits or larger MUST be used") applied to the
+  // import side: a certificate key below it has no scheme here, so it never reaches a backend.
+  private val minRsaModulusBits = 2048
+
+  private def rsaModulusBits(spki: Array[Byte]): Option[Int] =
+    @tailrec def width(v: Int, acc: Int): Int = if v == 0 then acc else width(v >>> 1, acc + 1)
+    (for
+      key <- Der.spkiPublicBits(Slice.of(spki))
+      seq <- Der.read(key, 0, 0x30)
+      modulus <- Der.read(key, seq.contentOff, 0x02).filterOrElse(_.next <= seq.next, InvalidKey.Malformed)
+    yield
+      val leading = if modulus.contentLen > 0 && key(modulus.contentOff) == 0.toByte then 1 else 0
+      val octets = modulus.contentLen - leading
+      if octets <= 0 then 0 else (octets - 1) * 8 + width(key(modulus.contentOff + leading) & 0xff, 0)
+    ).toOption
+
+  // Subject-DN emailAddress values, for the rfc822Name fallback. A non-IA5 value cannot be a
+  // mailbox, so it is dropped rather than decoded into one.
+  def emailAttributes(subject: List[List[Ava]]): List[String] =
+    subject.flatten.collect {
+      case a if Names.bytesEqual(a.oid, oidEmailAddress) && a.content.forall(_ >= 0) => new String(a.content, "US-ASCII")
+    }
+
+  // The families kufuli implements, with the modulus floor applied to RSA. Everything else an
+  // import checks - the point being on its curve, the encoding being whole, a low-order X25519
+  // point - is backend work over the whole blob, which is why the accessor below is a peek and the
+  // verification path imports for real.
+  private def supported(spki: Array[Byte]): Option[Der.Alg] =
+    Der.peekSpki(Slice.of(spki)).toOption.filter {
+      case Der.Alg.OfRsa => rsaModulusBits(spki).exists(_ >= minRsaModulusBits)
+      case _             => true
+    }
+
   def issuerKey(spki: Array[Byte]): Option[ImportedPublicKey] =
-    Der.peekSpki(Slice.of(spki)).toOption.map {
+    supported(spki).map {
       case Der.Alg.Ed     => ImportedPublicKey.Ed(PublicKey.unsafe(keyRepr(spki)))
       case Der.Alg.X      => ImportedPublicKey.X(PublicKey.unsafe(keyRepr(spki)))
       case Der.Alg.EcP256 => ImportedPublicKey.EcP256(PublicKey.unsafe(keyRepr(spki)))
@@ -412,6 +727,13 @@ private[x509] object X509:
       case Der.Alg.EcP521 => ImportedPublicKey.EcP521(PublicKey.unsafe(keyRepr(spki)))
       case Der.Alg.OfRsa  => ImportedPublicKey.OfRsa(PublicKey.unsafe(keyRepr(spki)))
     }
+
+  // The issuer key a signature is checked with, imported through the backend rather than wrapped. A
+  // peer supplies this encoding, and a backend that meets an unvalidated key inside its own verify
+  // call reports a defect rather than a rejected signature - node does exactly that for a point off
+  // its curve - which would put a raise on a path whose channel is PathInvalid.
+  def verifyingKey(spki: Array[Byte]): EffIO[InvalidKey, ImportedPublicKey] =
+    EffIO.from(supported(spki).toRight(InvalidKey.Unsupported)).flatMap(_ => PublicKey.fromSpki(Slice.of(spki)))
 end X509
 
 /** An X.509 certificate, parsed once at construction; construct and read via
@@ -419,6 +741,9 @@ end X509
   */
 opaque type Certificate = Parsed
 object Certificate:
+  /** Two certificates are the same certificate when their DER is the same bytes. */
+  given CanEqual[Certificate, Certificate] = CanEqual.derived
+
   /** Parses one complete DER certificate; trailing bytes are rejected. */
   def fromDer(der: Array[Byte]): Either[Malformed, Certificate] =
     X509.parse(IArray.from(der)).left.map(_ => Malformed)
@@ -459,8 +784,10 @@ object Certificate:
     def der: IArray[Byte] = cert.parsed.encoded
 
     /** The subject public key, or [[InvalidKey.Unsupported]] where the SPKI names an algorithm
-      * kufuli does not implement - a certificate carrying one still parses, and its validity
-      * window, SAN entries and encoding stay readable.
+      * kufuli does not implement or carries an RSA modulus below 2048 bits.
+      *
+      * The key is read from the encoding rather than imported, so an encoding a backend refuses - a
+      * point that is not on its curve - is reported when the key is used, not here.
       */
     def publicKey: Either[InvalidKey, ImportedPublicKey] =
       X509.issuerKey(cert.parsed.spki).toRight(InvalidKey.Unsupported)
@@ -471,27 +798,65 @@ object Certificate:
     /** End of the validity window, as epoch seconds. */
     def notAfter: Long = cert.parsed.notAfter
 
-    /** The dNSName SAN entries - the only GeneralName form parsed. */
-    def subjectAltDns: List[String] = cert.parsed.sanDns
+    /** The dNSName SAN entries, wildcard patterns included. */
+    def subjectAltDns: List[String] = cert.parsed.san.fold(List.empty[String])(_.dns)
+
+    def subjectAltIps: List[IpAddress] = cert.parsed.san.fold(List.empty[IpAddress])(_.ips.map(IpAddress.wrap))
+
+    def subjectAltEmails: List[String] = cert.parsed.san.fold(List.empty[String])(_.emails)
+
+    /** The uniformResourceIdentifier SAN entries, verbatim - SPIFFE SVIDs carry their identity
+      * here. kufuli never authenticates one: a URI is not a server identity, and a URI name
+      * constraint rejects the chain rather than being interpreted.
+      */
+    def subjectAltUris: List[String] = cert.parsed.san.fold(List.empty[String])(_.uris)
+
+    /** The subject Name, as the encoded `RDNSequence`. */
+    def subjectDer: IArray[Byte] = IArray.from(cert.parsed.subjectDer.iterator)
+
+    /** The issuer Name, as the encoded `RDNSequence`. */
+    def issuerDer: IArray[Byte] = IArray.from(cert.parsed.issuerDer.iterator)
   end extension
 end Certificate
 
-/** A hostname to match against a certificate's dNSName SANs; construct via [[Hostname$ Hostname]]. */
+/** A DNS name in preferred name syntax, ASCII-folded at construction; construct via
+  * [[Hostname$ Hostname]].
+  */
 opaque type Hostname = String
 object Hostname:
-  /** Accepts any non-empty name free of spaces - a wrapper for matching, not a DNS-name validator. */
+  given CanEqual[Hostname, Hostname] = CanEqual.derived
+
+  /** Accepts a name of LDH labels, at most 253 octets, with one optional trailing root dot stripped
+    * and an all-numeric final label rejected as an IP literal. An A-label passes through as it
+    * stands; converting a U-label to its A-label is the caller's, since IDNA needs a Unicode
+    * profile kufuli does not carry.
+    */
   def of(name: String): Either[Malformed, Hostname] =
-    if name.nonEmpty && !name.contains(" ") then Right(name) else Left(Malformed)
+    val rooted = if name.endsWith(".") then name.substring(0, name.length - 1) else name
+    if rooted.isEmpty || !Names.validDnsBase(rooted) then Left(Malformed)
+    else if rooted.substring(rooted.lastIndexOf('.') + 1).forall(c => c >= '0' && c <= '9') then Left(Malformed)
+    else Right(Names.foldAscii(rooted))
+
   extension (h: Hostname) def value: String = h
+end Hostname
 
-/** The anchors a path must terminate at; construction raises when `anchors` is empty. */
-final case class TrustAnchors(anchors: List[Certificate]):
-  require(anchors.nonEmpty, "at least one trust anchor")
-
-/** What a chain is validated for; selects the extended-key-usage OID every certificate in the path
-  * must permit.
+/** The anchors a path must terminate at, non-empty by construction; build via
+  * [[TrustAnchors$ TrustAnchors]].
   */
-enum PathPurpose derives CanEqual:
+final class TrustAnchors private (val anchors: List[Certificate])
+object TrustAnchors:
+  /** The pinned-anchor flow, where the set is known at the call site. */
+  def apply(anchor: Certificate, more: Certificate*): TrustAnchors = new TrustAnchors(anchor :: more.toList)
+
+  /** The configuration flow: `Certificate.chainFromPem(pem).flatMap(TrustAnchors.of)` reports a
+    * zero-certificate bundle once, in one vocabulary.
+    */
+  def of(anchors: List[Certificate]): Either[Malformed, TrustAnchors] =
+    if anchors.isEmpty then Left(Malformed) else Right(new TrustAnchors(anchors))
+
+// What a chain is validated for; selects the extended-key-usage OID every path certificate must
+// permit. The entry point names the purpose, so this never reaches a caller.
+private[x509] enum PathPurpose derives CanEqual:
   case ServerAuth, ClientAuth
 
 /** A validated leaf together with the intermediates it was presented with. */
@@ -499,33 +864,37 @@ final case class VerifiedPath(leaf: Certificate, chain: List[Certificate])
 
 /** RFC 5280 path validation for the TLS profile, at a caller-supplied instant in epoch seconds -
   * kufuli reads no clock. Chain building, the validity window, basic constraints, key usage,
-  * extended key usage, and dNSName SAN matching are evaluated; certificate policies, name
-  * constraints, CRLs, and live OCSP are not, so a certificate marking any other extension critical
-  * is rejected rather than accepted unconstrained. A `None` hostname skips SAN matching entirely -
-  * pass the name the connection was made to whenever one exists.
+  * extended key usage, name constraints (RFC 5280 section 4.2.1.10 over dNSName, iPAddress,
+  * directoryName and rfc822Name; anchor constraints per RFC 5937) and identity matching (RFC 9525)
+  * are evaluated; certificate policies, CRLs and live OCSP are not, so a certificate marking any
+  * other extension critical is rejected rather than accepted unconstrained.
+  *
+  * A directoryName constraint compares attribute values as encoded, relaxed to ASCII case-folding
+  * and insignificant-space handling only where both are `PrintableString` or `UTF8String` and
+  * wholly ASCII; RFC 5280 section 4.2.1.10 requires a CA to state such a constraint in the encoding
+  * the subject itself uses, and one stated in another encoding does not match.
   */
 object CertPath:
-  /** Validates `chain`, leaf first, for ServerAuth at `at`. */
-  def verify(
-    chain: List[Certificate],
-    anchors: TrustAnchors,
-    at: Long,
-    hostname: Option[Hostname]
-  ): EffIO[PathInvalid, VerifiedPath] = verify(chain, anchors, at, hostname, PathPurpose.ServerAuth)
+  /** Validates `chain`, leaf first, against `id` - the name the connection was made to. */
+  def verify(chain: List[Certificate], anchors: TrustAnchors, at: Long, id: ServerId): EffIO[PathInvalid, VerifiedPath] =
+    run(chain, anchors, at, Some(id), PathPurpose.ServerAuth)
 
-  /** Validates `chain`, leaf first, for `purpose` at `at`; ClientAuth does not match `hostname`. */
-  def verify(
+  /** Validates a client chain for mTLS; the identity is read off the verified leaf afterwards. */
+  def verifyClient(chain: List[Certificate], anchors: TrustAnchors, at: Long): EffIO[PathInvalid, VerifiedPath] =
+    run(chain, anchors, at, None, PathPurpose.ClientAuth)
+
+  private def run(
     chain: List[Certificate],
     anchors: TrustAnchors,
     at: Long,
-    hostname: Option[Hostname],
+    id: Option[ServerId],
     purpose: PathPurpose
   ): EffIO[PathInvalid, VerifiedPath] =
     chain match
       case Nil                   => EffIO.fail(PathInvalid.MalformedChain)
       case leaf :: intermediates =>
         engine
-          .validate(engine.paths(leaf, intermediates, anchors), at, hostname, purpose)
+          .validate(engine.paths(leaf, intermediates, anchors), at, id, purpose)
           .map(_ => VerifiedPath(leaf, intermediates))
 end CertPath
 
@@ -535,8 +904,11 @@ private object engine:
   // candidate enumeration is capped rather than merely depth-bounded.
   private val maxCandidates = 8
 
+  // OpenSSL's NAME_CHECK_MAX. The constraint walk is names x accumulated subtrees and an attacker
+  // supplies both sides, so the product is what needs a ceiling.
+  private val maxNameChecks = 1 << 20
+
   private def bytesEq(a: Array[Byte], b: Array[Byte]): Boolean = Slice.of(a).contentEquals(Slice.of(b))
-  private def derBytes(c: Certificate): Array[Byte] = Array.from(c.der.iterator)
 
   // Candidate paths leaf-first, anchor last, produced lazily. Linking is by subject/issuer DN alone,
   // and a CA key rollover reuses the DN across two certificates, so committing to the first match
@@ -550,13 +922,9 @@ private object engine:
         val terminal = anchors.anchors.iterator.filter(a => bytesEq(a.parsed.subjectDer, issuer)).map(a => walked ::: List(a))
         val deeper = pool.iterator
           .filter(c => bytesEq(c.parsed.subjectDer, issuer))
-          .flatMap { next =>
-            val chosen = derBytes(next)
-            go(next, pool.filterNot(c => bytesEq(derBytes(c), chosen)), current :: acc, depth + 1)
-          }
+          .flatMap(next => go(next, pool.filterNot(_ == next), current :: acc, depth + 1))
         terminal ++ deeper
-    val self = derBytes(leaf)
-    if anchors.anchors.exists(a => bytesEq(derBytes(a), self)) then Iterator(List(leaf))
+    if anchors.anchors.exists(_ == leaf) then Iterator(List(leaf))
     else go(leaf, intermediates, Nil, 0)
   end paths
 
@@ -565,28 +933,46 @@ private object engine:
   def validate(
     candidates: Iterator[List[Certificate]],
     at: Long,
-    hostname: Option[Hostname],
+    id: Option[ServerId],
     purpose: PathPurpose
   ): EffIO[PathInvalid, Unit] =
     def go(rest: List[List[Certificate]], first: Option[PathInvalid]): EffIO[PathInvalid, Unit] =
       rest match
         case Nil          => EffIO.fail(first.getOrElse(PathInvalid.UntrustedAnchor))
-        case path :: tail => check(path, at, hostname, purpose).catchAll(e => go(tail, first.orElse(Some(e))))
+        case path :: tail => check(path, at, id, purpose).catchAll(e => go(tail, first.orElse(Some(e))))
     go(candidates.take(maxCandidates).toList, None)
 
-  private def check(path: List[Certificate], at: Long, hostname: Option[Hostname], purpose: PathPurpose): EffIO[PathInvalid, Unit] =
+  private def check(path: List[Certificate], at: Long, id: Option[ServerId], purpose: PathPurpose): EffIO[PathInvalid, Unit] =
     path match
-      case Nil             => EffIO.fail(PathInvalid.MalformedChain)
-      case leaf :: issuers =>
+      case Nil          => EffIO.fail(PathInvalid.MalformedChain)
+      case leaf :: rest =>
+        // RFC 5280 numbers the path [1..n] with the trust anchor outside it, so the anchor is
+        // qualified rather than validated. The peer certificate never leaves the checked set: a
+        // directly pinned leaf is the peer first and the terminus second.
+        val terminus = path.last
+        val checked = if rest.isEmpty then path else path.init
+        val intermediates = checked.drop(1)
+        val issuing = rest.nonEmpty
         if path.exists(c => at < c.notBefore || at > c.notAfter) then EffIO.fail(PathInvalid.Expired)
         else if path.exists(_.parsed.unhandledCritical) then EffIO.fail(PathInvalid.ConstraintViolated)
-        else if issuers.exists(c => !c.parsed.isCa) then EffIO.fail(PathInvalid.ConstraintViolated)
-        else if issuers.exists(_.parsed.keyCertSign.contains(false)) then EffIO.fail(PathInvalid.ConstraintViolated)
-        else if pathLenExceeded(issuers) then EffIO.fail(PathInvalid.ConstraintViolated)
-        else if !path.forall(c => ekuAllows(c.parsed.ekus, purpose)) then EffIO.fail(PathInvalid.ConstraintViolated)
-        else if !nameOk(leaf, hostname, purpose) then EffIO.fail(PathInvalid.NameMismatch)
-        else verifyChain(leaf, issuers)
+        else if intermediates.exists(c => !c.parsed.isCa.contains(true)) then EffIO.fail(PathInvalid.ConstraintViolated)
+        else if intermediates.exists(_.parsed.keyCertSign.contains(false)) then EffIO.fail(PathInvalid.ConstraintViolated)
+        else if issuing && !anchorQualifies(terminus) then EffIO.fail(PathInvalid.ConstraintViolated)
+        else if checked.exists(constrainsWithoutAuthority) then EffIO.fail(PathInvalid.ConstraintViolated)
+        else if pathLenExceeded(rest) then EffIO.fail(PathInvalid.ConstraintViolated)
+        else if !checked.forall(c => ekuAllows(c.parsed.ekus, purpose)) then EffIO.fail(PathInvalid.ConstraintViolated)
+        else if !nameOk(leaf, id) then EffIO.fail(PathInvalid.NameMismatch)
+        else verifyChain(leaf, rest).flatMap(_ => EffIO.from(constrained(path, id)))
   end check
+
+  // RFC 5937 section 3.1: an anchor is qualified by what it declares, and an anchor that declares
+  // itself not a CA cannot issue. A v1 root declares nothing at all and is still a real anchor.
+  private def anchorQualifies(anchor: Certificate): Boolean =
+    !anchor.parsed.isCa.contains(false) && !anchor.parsed.keyCertSign.contains(false)
+
+  // RFC 5280 section 4.2.1.10: name constraints "MUST be used only in a CA certificate".
+  private def constrainsWithoutAuthority(cert: Certificate): Boolean =
+    cert.parsed.constraints.isDefined && !cert.parsed.isCa.contains(true)
 
   // A CA's pathLenConstraint bounds the number of intermediate CA certs that may follow it toward
   // the leaf. Self-issued intermediates are counted here - a conservative over-count relative to
@@ -603,18 +989,18 @@ private object engine:
         case PathPurpose.ServerAuth => ekus.contains(X509.ekuServerAuth)
         case PathPurpose.ClientAuth => ekus.contains(X509.ekuClientAuth)
 
-  private def nameOk(leaf: Certificate, hostname: Option[Hostname], purpose: PathPurpose): Boolean =
-    (purpose, hostname) match
-      case (PathPurpose.ClientAuth, _)       => true
-      case (PathPurpose.ServerAuth, None)    => true
-      case (PathPurpose.ServerAuth, Some(h)) => leaf.parsed.sanDns.exists(matches(_, h.value))
+  // Each identity form consults its own SAN form only, so the rfc822/URI-authenticated-as-a-domain
+  // confusion (Envoy CVE-2022-21656) is not expressible. The CN is never read, on either side.
+  private def nameOk(leaf: Certificate, id: Option[ServerId]): Boolean =
+    id match
+      case None                  => true
+      case Some(ServerId.Dns(h)) => leaf.parsed.san.exists(_.dns.exists(matches(_, h.value)))
+      case Some(ServerId.Ip(a))  => leaf.parsed.san.exists(_.ips.exists(_ == a.bits))
 
-  // RFC 6125 SAN matching with a single leftmost wildcard label. The fold is ASCII-only: DNS labels
-  // are ASCII by construction, `toLowerCase` follows the ambient locale, and Unicode case folding
-  // maps distinct code points (U+212A KELVIN SIGN) onto ASCII letters.
+  // RFC 9525 section 6.3 SAN matching with a single leftmost wildcard label.
   private def matches(pattern: String, host: String): Boolean =
-    val p = foldCase(pattern)
-    val h = foldCase(host)
+    val p = Names.foldAscii(pattern)
+    val h = Names.foldAscii(host)
     if p == h then true
     else if p.startsWith("*.") then
       val suffix = p.substring(1) // ".example.com"
@@ -623,7 +1009,91 @@ private object engine:
       suffix.indexOf('.', 1) > 0 && dot > 0 && h.substring(dot) == suffix
     else false
 
-  private def foldCase(name: String): String = name.map(c => if c >= 'A' && c <= 'Z' then (c + 32).toChar else c)
+  // RFC 5280 section 6.1.4(g) specifies an intersection of permitted subtree sets; the equivalent
+  // conjunction over ancestors needs no empty-set representation. A name passes when, for EVERY
+  // ancestor that constrains its form, it lies within one of that ancestor's permitted subtrees,
+  // and within no excluded subtree of any ancestor. Excluded beats permitted unconditionally.
+  private def constrained(path: List[Certificate], id: Option[ServerId]): Either[PathInvalid, Unit] =
+    val state = path.flatMap(_.parsed.constraints)
+    if state.isEmpty || path.sizeIs < 2 then Right(())
+    else
+      val checked = path.init
+      val subtrees = state.map(nc => nc.permitted.size + nc.excluded.size).sum
+      val names = checked.map(nameCount).sum + id.fold(0)(_ => 1)
+      if names.toLong * subtrees.toLong > maxNameChecks then Left(PathInvalid.LimitExceeded)
+      else
+        val leafState = path.drop(1).flatMap(_.parsed.constraints)
+        val walked = checked.zipWithIndex.forall { (cert, depth) =>
+          // A self-issued certificate below the leaf is the same entity re-keyed, so RFC 5280
+          // section 6.1.3 skips its names; its own constraints still fold into the state.
+          if depth > 0 && bytesEq(cert.parsed.subjectDer, cert.parsed.issuerDer) then true
+          else namesAllowed(cert, path.drop(depth + 1).flatMap(_.parsed.constraints))
+        }
+        // The identity is walked as a name of its own form. The wildcard containment rules already
+        // place every name a permitted SAN matches inside the same subtrees, so this closes the
+        // seam RFC 5280 and RFC 9525 each leave to the other (pyca CVE-2026-34073) a second time
+        // rather than for the first - it survives either side being loosened alone.
+        val identity = id match
+          case None                  => true
+          case Some(ServerId.Dns(h)) => dnsAllowed(h.value, leafState)
+          case Some(ServerId.Ip(a))  => ipAllowed(a.bits, leafState)
+        if walked && identity then Right(()) else Left(PathInvalid.NameConstraintViolated)
+      end if
+    end if
+  end constrained
+
+  private def nameCount(cert: Certificate): Int =
+    1 + cert.parsed.san.fold(0)(s => s.dns.length + s.ips.length + s.emails.length + s.dirNames.length + s.unprocessed.size)
+
+  private def namesAllowed(cert: Certificate, state: List[NameConstraints]): Boolean =
+    val p = cert.parsed
+    // RFC 5280 section 4.2.1.10 checks the subject DN's emailAddress attributes as rfc822Names
+    // when the certificate carries no subjectAltName extension at all.
+    val fallback =
+      if p.san.isEmpty && state.exists(nc => nc.permitted.emails.nonEmpty || nc.excluded.emails.nonEmpty) then
+        X509.emailAttributes(p.subject)
+      else Nil
+    unprocessedAllowed(p.san.fold(Set.empty[UnprocessedForm])(_.unprocessed), state) &&
+    (p.subject.isEmpty || dnAllowed(p.subject, state)) &&
+    p.san.forall(s =>
+      s.dns.forall(dnsAllowed(_, state)) && s.ips.forall(ipAllowed(_, state)) &&
+        s.emails.forall(emailAllowed(_, state)) && s.dirNames.forall(dnAllowed(_, state))
+    ) &&
+    // `Names.emailWithin` splits at the first `@`, so a value carrying more than one would be
+    // matched on a domain reading past the separator. Such a value is a presented rfc822Name this
+    // walk cannot match, which the type gate rejects once rfc822 state is non-vacuous.
+    fallback.forall(v => Names.validEmail(v) && emailAllowed(v, state))
+  end namesAllowed
+
+  // A constraint on a form with no matching rule rejects a certificate presenting that form, and is
+  // vacuous otherwise - RFC 5280 section 4.2.1.10's own conjunction, not a blanket rejection.
+  private def unprocessedAllowed(presented: Set[UnprocessedForm], state: List[NameConstraints]): Boolean =
+    presented.isEmpty || state.forall(nc => presented.intersect(nc.permitted.unprocessed ++ nc.excluded.unprocessed).isEmpty)
+
+  private def dnsAllowed(name: String, state: List[NameConstraints]): Boolean =
+    val pattern = Names.isWildcard(name)
+    state.forall { nc =>
+      (nc.permitted.dns.isEmpty ||
+        nc.permitted.dns.exists(b => if pattern then Names.wildcardPermitted(name, b) else Names.dnsWithin(name, b))) &&
+      !nc.excluded.dns.exists(b => if pattern then Names.wildcardExcluded(name, b) else Names.dnsWithin(name, b))
+    }
+
+  private def ipAllowed(name: IpBits, state: List[NameConstraints]): Boolean =
+    state.forall(nc =>
+      (nc.permitted.ips.isEmpty || nc.permitted.ips.exists(Names.ipWithin(name, _))) && !nc.excluded.ips.exists(Names.ipWithin(name, _))
+    )
+
+  private def dnAllowed(name: List[List[Ava]], state: List[NameConstraints]): Boolean =
+    state.forall(nc =>
+      (nc.permitted.dirNames.isEmpty || nc.permitted.dirNames.exists(Names.dnWithin(name, _))) &&
+        !nc.excluded.dirNames.exists(Names.dnWithin(name, _))
+    )
+
+  private def emailAllowed(name: String, state: List[NameConstraints]): Boolean =
+    state.forall(nc =>
+      (nc.permitted.emails.isEmpty || nc.permitted.emails.exists(Names.emailWithin(name, _))) &&
+        !nc.excluded.emails.exists(Names.emailWithin(name, _))
+    )
 
   private def verifyChain(leaf: Certificate, issuers: List[Certificate]): EffIO[PathInvalid, Unit] =
     // each cert (subject) is signed by the next (issuer); the anchor terminates the walk
@@ -635,12 +1105,13 @@ private object engine:
 
   private def verifyOne(subject: Certificate, issuer: Certificate): EffIO[PathInvalid, Unit] =
     val sub = subject.parsed
-    (sub.sigScheme, X509.issuerKey(issuer.parsed.spki)) match
-      case (Some(scheme), Some(key)) =>
-        val tbs = Slice.of(sub.tbs)
-        val rejected = verifyBy(scheme, key, tbs, sub.signature)
-        rejected.mapError(_ => PathInvalid.BadSignature)
-      case _ => EffIO.fail(PathInvalid.BadSignature)
+    sub.sigScheme match
+      case None         => EffIO.fail(PathInvalid.BadSignature)
+      case Some(scheme) =>
+        X509
+          .verifyingKey(issuer.parsed.spki)
+          .mapError(_ => PathInvalid.BadSignature)
+          .flatMap(key => verifyBy(scheme, key, Slice.of(sub.tbs), sub.signature).mapError(_ => PathInvalid.BadSignature))
 
   private def verifyBy(scheme: SigScheme, key: ImportedPublicKey, tbs: Slice, sig: Array[Byte]): EffIO[SignatureRejected, Unit] =
     (scheme, key) match

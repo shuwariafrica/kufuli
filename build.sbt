@@ -133,7 +133,7 @@ val `kufuli-tests` =
       Seq.empty[VirtualAxis],
       (p: Project) =>
         p.enablePlugins(WycheproofPlugin)
-          .settings(wycheproofSettings ++ testDir("kat"))
+          .settings(wycheproofSettings ++ corpusSettings ++ testDir("kat"))
           .dependsOn(kufuli.jvm(scala3), `kufuli-jose`.jvm(scala3), `kufuli-x509`.jvm(scala3), `kufuli-password`.jvm(scala3))
     )
     .jsPlatform(
@@ -141,7 +141,7 @@ val `kufuli-tests` =
       Seq.empty[VirtualAxis],
       (p: Project) =>
         p.enablePlugins(WycheproofPlugin)
-          .settings(jsSettings ++ wycheproofSettings ++ testDir("kat"))
+          .settings(jsSettings ++ wycheproofSettings ++ corpusSettings ++ testDir("kat"))
           .dependsOn(kufuli.js(scala3), `kufuli-jose`.js(scala3), `kufuli-x509`.js(scala3), `kufuli-password`.js(scala3))
     )
     .jsPlatform(
@@ -157,7 +157,7 @@ val `kufuli-tests` =
       (p: Project) =>
         p.enablePlugins(WycheproofPlugin)
           .settings(
-            wycheproofSettings ++ NativePlatformPlugin.testLinkSettings ++ NativePlatformPlugin.provisionAwsLc ++
+            wycheproofSettings ++ corpusSettings ++ NativePlatformPlugin.testLinkSettings ++ NativePlatformPlugin.provisionAwsLc ++
               NativePlatformPlugin.provisionArgon2 ++ testDir("kat")
           )
           .dependsOn(
@@ -222,6 +222,48 @@ def jsBrowserSettings(base: String): List[Setting[?]] = List(
 
 def testDir(name: String): List[Setting[?]] = List(
   Test / unmanagedSourceDirectories += (Test / sourceDirectory).value / name
+)
+
+// The vendored x509-limbo and NIST PKITS slices become string constants, because JS and Native have
+// no test resources to read at run time. Each vendored file is well under a class file's per-entry
+// constant-pool limit, so no chunking is involved.
+val corpusGenerate = taskKey[Seq[File]]("Embeds the vendored X.509 conformance corpora as Scala string constants.")
+
+def corpusSettings: List[Setting[?]] = List(
+  Test / corpusGenerate := Def.uncached {
+    val out = (Test / sourceManaged).value / "corpora"
+    val root = (LocalRootProject / baseDirectory).value / "modules" / "tests" / "corpora"
+
+    def read(dir: File, suffix: String): List[(String, String)] =
+      IO.listFiles(dir)
+        .filter(_.getName.endsWith(suffix))
+        .sortBy(_.getName)
+        .toList
+        .map(f => (f.getName.stripSuffix(suffix), IO.read(f, IO.utf8)))
+
+    def entries(pairs: List[(String, String)]): String =
+      pairs.map { case (name, body) => "    (\"" + name + "\", \"\"\"" + body + "\"\"\")" }.mkString(",\n")
+
+    val limbo = read(root / "x509-limbo" / "cases", ".json")
+    val certs = read(root / "nist-pkits" / "certs", ".pem")
+    val cases = IO.read(root / "nist-pkits" / "cases.json", IO.utf8)
+    val source = new StringBuilder
+    source.append("package kufuli.tests.corpora\n\n")
+    source.append("/** Generated from modules/tests/corpora. Do not edit. */\n")
+    source.append("object Vectors:\n")
+    source.append("  val limboNameConstraints: List[(String, String)] = List(\n")
+    source.append(entries(limbo)).append("\n  )\n")
+    source.append("  val pkitsCertificates: List[(String, String)] = List(\n")
+    source.append(entries(certs)).append("\n  )\n")
+    source.append("  val pkitsCases: String = \"\"\"").append(cases).append("\"\"\"\n")
+    val rendered = source.result()
+
+    IO.createDirectory(out)
+    val file = out / "Vectors.scala"
+    if (!file.exists() || IO.read(file, IO.utf8) != rendered) IO.write(file, rendered, IO.utf8)
+    Seq(file)
+  },
+  Test / sourceGenerators += (Test / corpusGenerate).taskValue
 )
 
 def wycheproofSettings: List[Setting[?]] = List(

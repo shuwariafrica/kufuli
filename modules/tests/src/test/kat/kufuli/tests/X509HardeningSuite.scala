@@ -20,152 +20,90 @@
  */
 package kufuli.tests
 
-import boilerplate.Slice
 import boilerplate.effect.*
 import cats.effect.IO
 import cats.syntax.all.*
 
 import kufuli.*
 import kufuli.tests.support.*
+import kufuli.tests.x509fixtures.*
 import kufuli.x509 as x5
 
 class X509HardeningSuite extends munit.CatsEffectSuite:
 
-  private def tlv(tag: Int, content: Array[Byte]): Array[Byte] =
-    val len = content.length
-    val header =
-      if len < 0x80 then Array[Byte](tag.toByte, len.toByte)
-      else if len < 0x100 then Array[Byte](tag.toByte, 0x81.toByte, len.toByte)
-      else Array[Byte](tag.toByte, 0x82.toByte, (len >> 8).toByte, len.toByte)
-    header ++ content
-  private def seq(parts: Array[Byte]*): Array[Byte] = tlv(0x30, parts.foldLeft(Array.emptyByteArray)(_ ++ _))
-  private def oid(content: Array[Byte]): Array[Byte] = tlv(0x06, content)
-  private def ascii(text: String): Array[Byte] = text.getBytes("US-ASCII")
+  private def permit(bases: String*): Array[Byte] = constraints(bases.map(dnsName).toList, Nil)
 
-  private val edOid = Array[Byte](0x2b, 0x65, 0x70) // 1.3.101.112
-  private val oidKeyUsage = Array[Byte](0x55, 0x1d, 0x0f)
-  private val oidSan = Array[Byte](0x55, 0x1d, 0x11)
-  private val oidBasicConstraints = Array[Byte](0x55, 0x1d, 0x13)
-  private val oidNameConstraints = Array[Byte](0x55, 0x1d, 0x1e)
-  private val oidCertificatePolicies = Array[Byte](0x55, 0x1d, 0x20)
-  private val oidEku = Array[Byte](0x55, 0x1d, 0x25)
-  private val serverAuth = Array[Byte](0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01)
-  private val clientAuth = Array[Byte](0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02)
-
-  private def ext(id: Array[Byte], critical: Boolean, value: Array[Byte]): Array[Byte] =
-    if critical then seq(oid(id), tlv(0x01, Array[Byte](0xff.toByte)), tlv(0x04, value))
-    else seq(oid(id), tlv(0x04, value))
-
-  private val caTrue = ext(oidBasicConstraints, true, seq(tlv(0x01, Array[Byte](0xff.toByte))))
-  private val endEntity = ext(oidBasicConstraints, false, seq())
-  // KeyUsage bit 5 is keyCertSign: 0x06 with one unused bit is keyCertSign + cRLSign, 0x80 with
-  // seven unused bits is digitalSignature alone.
-  private val certSign = ext(oidKeyUsage, true, tlv(0x03, Array[Byte](0x01, 0x06)))
-  private val signOnly = ext(oidKeyUsage, true, tlv(0x03, Array[Byte](0x07, 0x80.toByte)))
-  private def san(names: String*): Array[Byte] = ext(oidSan, false, seq(names.map(n => tlv(0x82, ascii(n)))*))
-  private def eku(purposes: Array[Byte]*): Array[Byte] = ext(oidEku, false, seq(purposes.map(oid)*))
-
-  private val notBefore = "200101000000Z"
-  private val notAfter = "300101000000Z"
-  private val at = 1_800_000_000L // 2027-01-15, inside every fixture window
-
-  private def tbsOf(
-    serial: Int,
-    issuer: String,
-    subject: String,
-    spki: Array[Byte],
-    from: String,
-    until: String,
-    exts: List[Array[Byte]]
-  ): Array[Byte] =
-    tbsWith(serial, issuer, subject, spki, from, until, if exts.isEmpty then Array.emptyByteArray else tlv(0xa3, seq(exts*)))
-
-  private def tbsWith(
-    serial: Int,
-    issuer: String,
-    subject: String,
-    spki: Array[Byte],
-    from: String,
-    until: String,
-    region: Array[Byte]
-  ): Array[Byte] =
-    def name(cn: String) = seq(tlv(0x31, seq(oid(Array[Byte](0x55, 0x04, 0x03)), tlv(0x0c, ascii(cn)))))
-    seq(
-      tlv(0xa0, tlv(0x02, Array[Byte](2))), // version v3
-      tlv(0x02, Array[Byte](serial.toByte)),
-      seq(oid(edOid)),
-      name(issuer),
-      seq(tlv(0x17, ascii(from)), tlv(0x17, ascii(until))),
-      name(subject),
-      spki,
-      region
-    )
-  end tbsWith
-
-  private def assemble(tbs: Array[Byte], signature: Array[Byte]): Array[Byte] =
-    seq(tbs, seq(oid(edOid)), tlv(0x03, Array[Byte](0) ++ signature))
-
-  private type Issued = (der: Array[Byte], key: PrivateKey[Ed25519], subject: String)
-
-  private def spkiOf(key: PublicKey[Ed25519]): IO[Array[Byte]] =
-    expectRight("spki")(key.spki).map(a => Array.from(a.iterator))
-
-  private def sign(tbs: Array[Byte], key: PrivateKey[Ed25519]): IO[Array[Byte]] =
-    key.sign(Slice.of(tbs)).absolve.map(s => assemble(tbs, Array.from(s.bytes.iterator)))
-
-  private def selfSigned(subject: String, exts: List[Array[Byte]]): IO[Issued] =
-    for
-      kp <- Ed25519.generate.absolve
-      spki <- spkiOf(kp.publicKey)
-      der <- sign(tbsOf(1, subject, subject, spki, notBefore, notAfter, exts), kp.privateKey)
-    yield (der = der, key = kp.privateKey, subject = subject)
-
-  private def issuedBy(issuer: Issued, serial: Int, subject: String, exts: List[Array[Byte]]): IO[Issued] =
-    for
-      kp <- Ed25519.generate.absolve
-      spki <- spkiOf(kp.publicKey)
-      der <- sign(tbsOf(serial, issuer.subject, subject, spki, notBefore, notAfter, exts), issuer.key)
-    yield (der = der, key = kp.privateKey, subject = subject)
-
-  private def parsed(der: Array[Byte]): IO[x5.Certificate] =
-    x5.Certificate.fromDer(der) match
-      case Right(c) => IO.pure(c)
-      case Left(e)  => IO.raiseError(new AssertionError(s"expected a parsable certificate, got $e"))
-
-  private def hostname(name: String): IO[x5.Hostname] =
-    x5.Hostname.of(name) match
-      case Right(h) => IO.pure(h)
-      case Left(e)  => IO.raiseError(new AssertionError(s"hostname $name: $e"))
-
-  private def verify(chain: List[Issued], anchor: Issued, host: Option[String]): IO[Either[x5.PathInvalid, x5.VerifiedPath]] =
+  private def verify(chain: List[Issued], anchor: Issued, host: String): IO[Either[x5.PathInvalid, x5.VerifiedPath]] =
     for
       certs <- chain.traverse(i => parsed(i.der))
       root <- parsed(anchor.der)
-      h <- host.traverse(hostname)
-      result <- x5.CertPath.verify(certs, x5.TrustAnchors(List(root)), at, h).either
+      id <- serverId(host)
+      result <- x5.CertPath.verify(certs, x5.TrustAnchors(root), at, id).either
     yield result
 
   private def indexOf(haystack: Array[Byte], needle: Array[Byte]): Int =
     (0 to haystack.length - needle.length).find(i => needle.indices.forall(j => haystack(i + j) == needle(j))).getOrElse(-1)
 
   test("an unrecognised CRITICAL extension is rejected; the same extension non-critical is not") {
-    val subtrees = seq(tlv(0xa0, seq(seq(tlv(0x82, ascii(".corp.example"))))))
     val policy = seq(seq(oid(Array[Byte](0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x0d, 0x01))))
     for
       root <- selfSigned("Root", List(caTrue, certSign))
       plain <- issuedBy(root, 2, "leaf", List(endEntity, san("example.com")))
-      constrained <- issuedBy(root, 3, "leaf", List(endEntity, san("example.com"), ext(oidNameConstraints, true, subtrees)))
+      unknown <- issuedBy(root, 3, "leaf", List(endEntity, san("example.com"), ext(oidCertificatePolicies, true, policy)))
       tolerable <- issuedBy(root, 4, "leaf", List(endEntity, san("example.com"), ext(oidCertificatePolicies, false, policy)))
-      ok <- verify(List(plain), root, Some("example.com"))
+      ok <- verify(List(plain), root, "example.com")
       _ <- check(ok.isRight, s"a chain with no unknown critical extension validates, got $ok")
-      nc <- verify(List(constrained), root, Some("example.com"))
-      _ <- check(nc == Left(x5.PathInvalid.ConstraintViolated), s"critical nameConstraints -> ConstraintViolated, got $nc")
-      cp <- verify(List(tolerable), root, Some("example.com"))
-      _ <- check(cp.isRight, s"non-critical certificatePolicies is ignorable, got $cp")
-      caNc <- selfSigned("Constrained Root", List(caTrue, certSign, ext(oidNameConstraints, true, subtrees)))
-      under <- issuedBy(caNc, 2, "leaf", List(endEntity, san("example.com")))
-      anchored <- verify(List(under), caNc, Some("example.com"))
-      _ <- check(anchored == Left(x5.PathInvalid.ConstraintViolated), s"a constrained anchor -> ConstraintViolated, got $anchored")
+      cp <- verify(List(unknown), root, "example.com")
+      _ <- check(cp == Left(x5.PathInvalid.ConstraintViolated), s"critical certificatePolicies -> ConstraintViolated, got $cp")
+      lenient <- verify(List(tolerable), root, "example.com")
+      _ <- check(lenient.isRight, s"non-critical certificatePolicies is ignorable, got $lenient")
+      rootNc <- selfSigned("Root", List(caTrue, certSign, permit("corp.example")))
+      inside <- issuedBy(rootNc, 5, "leaf", List(endEntity, san("host.corp.example")))
+      recognised <- verify(List(inside), rootNc, "host.corp.example")
+      _ <- check(recognised.isRight, s"a critical nameConstraints extension is now processed, got $recognised")
+    yield ()
+    end for
+  }
+
+  test("name constraints are processed, not merely recognised, and only on a CA") {
+    for
+      rootNc <- selfSigned("Root", List(caTrue, certSign, permit("corp.example")))
+      inside <- issuedBy(rootNc, 2, "leaf", List(endEntity, san("host.corp.example")))
+      outside <- issuedBy(rootNc, 3, "leaf", List(endEntity, san("host.other.example")))
+      ok <- verify(List(inside), rootNc, "host.corp.example")
+      _ <- check(ok.isRight, s"a name inside the anchor's permitted subtree validates, got $ok")
+      no <- verify(List(outside), rootNc, "host.other.example")
+      _ <- check(no == Left(x5.PathInvalid.NameConstraintViolated), s"a name outside it -> NameConstraintViolated, got $no")
+      root <- selfSigned("Root", List(caTrue, certSign))
+      onLeaf <- issuedBy(root, 4, "leaf", List(endEntity, san("example.com"), permit("example.com")))
+      placed <- verify(List(onLeaf), root, "example.com")
+      _ <- check(placed == Left(x5.PathInvalid.ConstraintViolated), s"nameConstraints on an end entity -> ConstraintViolated, got $placed")
+    yield ()
+    end for
+  }
+
+  test("a trust anchor is qualified rather than validated: no EKU gate, basic constraints only when present") {
+    for
+      // No extensions at all, so anchor qualification has neither basicConstraints nor keyUsage to
+      // read and must fall back on tolerating both.
+      bare <- selfSigned("Bare Root", Nil)
+      leaf <- issuedBy(bare, 2, "leaf", List(endEntity, san("example.com"), eku(serverAuth)))
+      ok <- verify(List(leaf), bare, "example.com")
+      _ <- check(ok.isRight, s"an extension-less anchor is a real anchor, got $ok")
+      clientRoot <- selfSigned("Client Root", List(caTrue, certSign, eku(clientAuth)))
+      under <- issuedBy(clientRoot, 3, "leaf", List(endEntity, san("example.com"), eku(serverAuth)))
+      unGated <- verify(List(under), clientRoot, "example.com")
+      _ <- check(unGated.isRight, s"the anchor's own EKU does not gate the path, got $unGated")
+      notCa <- selfSigned("Not A CA", List(endEntity, certSign))
+      issued <- issuedBy(notCa, 4, "leaf", List(endEntity, san("example.com")))
+      refused <- verify(List(issued), notCa, "example.com")
+      _ <- check(refused == Left(x5.PathInvalid.ConstraintViolated), s"an anchor declaring cA=FALSE cannot issue, got $refused")
+      // The placement rule for name constraints governs the path, not the anchor: an anchor that
+      // declares no basic constraints is tolerated, so one carrying constraints is too.
+      undeclared <- selfSigned("Undeclared Root", List(certSign, permit("corp.example")))
+      beneath <- issuedBy(undeclared, 5, "leaf", List(endEntity, san("host.corp.example")))
+      seeded <- verify(List(beneath), undeclared, "host.corp.example")
+      _ <- check(seeded.isRight, s"a constrained anchor without basicConstraints still seeds, got $seeded")
     yield ()
     end for
   }
@@ -174,11 +112,11 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
     for
       withheld <- selfSigned("Withholding Root", List(caTrue, signOnly))
       leaf <- issuedBy(withheld, 2, "leaf", List(endEntity, san("example.com")))
-      no <- verify(List(leaf), withheld, Some("example.com"))
+      no <- verify(List(leaf), withheld, "example.com")
       _ <- check(no == Left(x5.PathInvalid.ConstraintViolated), s"no keyCertSign -> ConstraintViolated, got $no")
       granted <- selfSigned("Signing Root", List(caTrue, certSign))
       other <- issuedBy(granted, 2, "leaf", List(endEntity, san("example.com")))
-      yes <- verify(List(other), granted, Some("example.com"))
+      yes <- verify(List(other), granted, "example.com")
       _ <- check(yes.isRight, s"keyCertSign present -> valid, got $yes")
     yield ()
   }
@@ -207,11 +145,11 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
       root <- selfSigned("Root", List(caTrue, certSign))
       clientOnly <- issuedBy(root, 2, "Client CA", List(caTrue, certSign, eku(clientAuth)))
       leaf <- issuedBy(clientOnly, 3, "leaf", List(endEntity, san("example.com"), eku(serverAuth)))
-      nested <- verify(List(leaf, clientOnly), root, Some("example.com"))
+      nested <- verify(List(leaf, clientOnly), root, "example.com")
       _ <- check(nested == Left(x5.PathInvalid.ConstraintViolated), s"clientAuth intermediate -> ConstraintViolated, got $nested")
       serverOk <- issuedBy(root, 4, "Server CA", List(caTrue, certSign, eku(serverAuth)))
       under <- issuedBy(serverOk, 5, "leaf", List(endEntity, san("example.com"), eku(serverAuth)))
-      ok <- verify(List(under, serverOk), root, Some("example.com"))
+      ok <- verify(List(under, serverOk), root, "example.com")
       _ <- check(ok.isRight, s"serverAuth throughout validates, got $ok")
     yield ()
   }
@@ -257,16 +195,17 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
     for
       root <- selfSigned("Root", List(caTrue, certSign))
       leaf <- issuedBy(root, 2, "leaf", List(endEntity, san("K.example.com")))
-      folded <- verify(List(leaf), root, Some("k.EXAMPLE.com"))
+      folded <- verify(List(leaf), root, "k.EXAMPLE.com")
       _ <- check(folded.isRight, s"ASCII case folds, got $folded")
-      // U+212A KELVIN SIGN lower-cases to ASCII 'k' under Unicode folding, in every locale.
-      kelvin <- verify(List(leaf), root, Some(s"${0x212a.toChar}.example.com"))
-      _ <- check(kelvin == Left(x5.PathInvalid.NameMismatch), s"U+212A must not fold onto 'k', got $kelvin")
+      // U+212A KELVIN SIGN lower-cases to ASCII 'k' under Unicode folding, in every locale; the LDH
+      // definition keeps it out of an identity before any comparison happens.
+      kelvin = x5.ServerId.of(s"${0x212a.toChar}.example.com")
+      _ <- check(kelvin == Left(Malformed), s"U+212A is not an LDH label, got $kelvin")
       broad <- issuedBy(root, 3, "leaf", List(endEntity, san("*.com")))
-      any <- verify(List(broad), root, Some("example.com"))
+      any <- verify(List(broad), root, "example.com")
       _ <- check(any == Left(x5.PathInvalid.NameMismatch), s"`*.com` must match nothing, got $any")
       narrow <- issuedBy(root, 4, "leaf", List(endEntity, san("*.example.com")))
-      sub <- verify(List(narrow), root, Some("foo.example.com"))
+      sub <- verify(List(narrow), root, "foo.example.com")
       _ <- check(sub.isRight, s"a wildcard with a label beneath it still matches, got $sub")
     yield ()
   }
@@ -313,8 +252,8 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
       cert <- parsed(leaf.der)
       first <- parsed(retired.der)
       second <- parsed(current.der)
-      host <- hostname("example.com")
-      result <- x5.CertPath.verify(List(cert), x5.TrustAnchors(List(first, second)), at, Some(host)).either
+      host <- serverId("example.com")
+      result <- x5.CertPath.verify(List(cert), x5.TrustAnchors(first, second), at, host).either
       _ <- check(result.isRight, s"the second same-name anchor must be tried, got $result")
     yield ()
   }
@@ -353,7 +292,7 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
       seq(seq(oid(Array[Byte](0x2a, 0x86.toByte, 0x48, 0xce.toByte, 0x38, 0x04, 0x01))), tlv(0x03, Array[Byte](0) ++ Array.fill[Byte](20)(7)))
     for
       kp <- Ed25519.generate.absolve
-      der <- sign(tbsOf(9, "unsupported", "unsupported", dsaSpki, notBefore, notAfter, Nil), kp.privateKey)
+      der <- signed(tbsOf(9, "unsupported", "unsupported", dsaSpki, notBefore, notAfter, Nil), kp.privateKey)
       cert <- IO.fromEither(x5.Certificate.fromDer(der).left.map(e => new AssertionError(s"parse: $e")))
       _ <- check(cert.publicKey.swap.toOption.contains(InvalidKey.Unsupported),
                  s"unsupported SPKI reports itself, got ${cert.publicKey.isRight}"

@@ -203,22 +203,22 @@ Pv/5JMnVs9fgK3Whg6g=
   test("x509: real EC chain path validation, SAN/wildcard, EKU-by-purpose, negatives") {
     val leaf = x5.Certificate.fromPem(leafPem).toOption.get
     val ca = x5.Certificate.fromPem(caPem).toOption.get
-    val anchors = x5.TrustAnchors(List(ca))
+    val anchors = x5.TrustAnchors(ca)
     val at = 1_800_000_000L
-    val host = x5.Hostname.of("example.com").toOption.get
-    val wild = x5.Hostname.of("foo.example.com").toOption.get
-    val evil = x5.Hostname.of("evil.com").toOption.get
+    val host = x5.ServerId.of("example.com").toOption.get
+    val wild = x5.ServerId.of("foo.example.com").toOption.get
+    val evil = x5.ServerId.of("evil.com").toOption.get
     for
       _ <- check(leaf.subjectAltDns.sorted == List("*.example.com", "example.com"), "SAN parsed")
-      ok <- x5.CertPath.verify(List(leaf), anchors, at, Some(host)).either
+      ok <- x5.CertPath.verify(List(leaf), anchors, at, host).either
       _ <- check(ok.isRight, "serverauth valid")
-      w <- x5.CertPath.verify(List(leaf), anchors, at, Some(wild)).either
+      w <- x5.CertPath.verify(List(leaf), anchors, at, wild).either
       _ <- check(w.isRight, "wildcard SAN valid")
-      nm <- x5.CertPath.verify(List(leaf), anchors, at, Some(evil)).either
+      nm <- x5.CertPath.verify(List(leaf), anchors, at, evil).either
       _ <- check(nm == Left(x5.PathInvalid.NameMismatch), "wrong host -> NameMismatch")
-      ex <- x5.CertPath.verify(List(leaf), anchors, 1_600_000_000L, Some(host)).either
+      ex <- x5.CertPath.verify(List(leaf), anchors, 1_600_000_000L, host).either
       _ <- check(ex == Left(x5.PathInvalid.Expired), "expired -> Expired")
-      cu <- x5.CertPath.verify(List(leaf), anchors, at, None, x5.PathPurpose.ClientAuth).either
+      cu <- x5.CertPath.verifyClient(List(leaf), anchors, at).either
       _ <- check(cu == Left(x5.PathInvalid.ConstraintViolated), "clientauth on serverauth leaf -> ConstraintViolated")
       _ <- check(x5.Certificate.chainFromPem(leafPem + "\n" + caPem).map(_.length) == Right(2), "chainFromPem")
     yield ()
