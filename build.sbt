@@ -25,7 +25,7 @@ formattingSettings
 def scala3 = "3.8.4"
 val boilerplate: ModuleID = "africa.shuwari" %% "boilerplate" % "0.11.0"
 val boilerplateEffect: ModuleID = "africa.shuwari" %% "boilerplate-effect" % "0.11.0"
-val jsoniter: ModuleID = "com.github.plokhotnyuk.jsoniter-scala" %% "jsoniter-scala-core" % "2.39.1"
+val jsoniter: ModuleID = "com.github.plokhotnyuk.jsoniter-scala" %% "jsoniter-scala-core" % "2.40.1"
 val bouncycastle: ModuleID = "org.bouncycastle" % "bcprov-jdk18on" % "1.85"
 val munit: ModuleID = "org.scalameta" %% "munit" % "1.3.4"
 val `munit-cats-effect`: ModuleID = "org.typelevel" %% "munit-cats-effect" % "2.2.0"
