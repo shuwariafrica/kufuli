@@ -23,14 +23,14 @@
 package kufuli.unsafe
 
 import boilerplate.Slice
-import cats.effect.IO
+import boilerplate.effect.EffResource
 import cats.effect.Resource
 
 /** Raw AES-ECB single block (the QUIC AES header-protection primitive). Exactly 16 bytes. */
 trait AesBlock:
   def encrypt(src: Slice, dst: Slice): Unit
 object AesBlock:
-  def of(key: Array[Byte]): Resource[IO, AesBlock] =
+  def of(key: Array[Byte]): EffResource[Nothing, AesBlock] =
     require(key.length == 16 || key.length == 24 || key.length == 32, "AES key must be 16/24/32 bytes")
     Resource.pure(
       new AesBlock:
@@ -43,7 +43,7 @@ object AesBlock:
 trait ChaCha20Stream:
   def keystream(dst: Slice, nonce: Slice, counter: Int): Unit
 object ChaCha20:
-  def of(key: Array[Byte]): Resource[IO, ChaCha20Stream] =
+  def of(key: Array[Byte]): EffResource[Nothing, ChaCha20Stream] =
     require(key.length == 32, "ChaCha20 key must be 32 bytes")
     Resource.pure(
       new ChaCha20Stream:
@@ -59,7 +59,7 @@ object ChaCha20:
 trait HeaderProtection:
   def mask(sample: Slice, out: Slice): Unit // writes 5 bytes at out's start
 object HeaderProtection:
-  def aes(hpKey: Array[Byte]): Resource[IO, HeaderProtection] =
+  def aes(hpKey: Array[Byte]): EffResource[Nothing, HeaderProtection] =
     AesBlock
       .of(hpKey)
       .map(block =>
@@ -70,7 +70,7 @@ object HeaderProtection:
             block.encrypt(sample.take(16), full)
             val _ = full.take(5).copyInto(out)
       )
-  def chacha(hpKey: Array[Byte]): Resource[IO, HeaderProtection] =
+  def chacha(hpKey: Array[Byte]): EffResource[Nothing, HeaderProtection] =
     ChaCha20
       .of(hpKey)
       .map(stream =>

@@ -34,14 +34,14 @@ import kufuli.tests.support.*
 class JoseMalleabilitySuite extends munit.CatsEffectSuite:
 
   private val now = 1_700_000_000L
-  private val apiPolicy = JWT.Policy("api", Set(HS256))
+  private val apiPolicy = JWT.Policy("api", HS256)
   private val livePayload = """{"aud":"api","exp":9999999999}""".getBytes("UTF-8")
 
   private def b64(text: String): String = Base64Url.encode(text.getBytes("UTF-8"))
 
   // Assembles a token from raw header/payload octets so a test can present bytes the signer would
   // never emit, carrying a signature that genuinely verifies.
-  private def signed(header: Array[Byte], payload: Array[Byte], key: SecretKey[HmacSha256])(using m: Mac[HmacSha256]): IO[String] =
+  private def signed(header: Array[Byte], payload: Array[Byte], key: SecretKey[HmacSha256])(using m: MAC[HmacSha256]): IO[String] =
     val input = Base64Url.encode(header) + "." + Base64Url.encode(payload)
     m.sign(key, Slice.of(input.getBytes("US-ASCII"))).map(sig => input + "." + Base64Url.encode(Array.from(sig.bytes.iterator))).absolve
 
@@ -89,20 +89,87 @@ class JoseMalleabilitySuite extends munit.CatsEffectSuite:
     yield ()
   }
 
-  test("RFC 7515 section 4.1.11: a token declaring a crit extension is rejected, though its signature is valid") {
+  test("RFC 7515 section 4.1.11: a token declaring a crit extension is declined, though its signature is valid") {
     val crit = """{"alg":"HS256","crit":["exp"],"exp":1363284000}""".getBytes("UTF-8")
     val plain = """{"alg":"HS256","exp":1363284000}""".getBytes("UTF-8")
+    // A `crit` naming a parameter the JWS specifications define, or one the header omits, is a
+    // malformed header rather than an extension kufuli declines.
+    val critRegistered = """{"alg":"HS256","crit":["alg"]}""".getBytes("UTF-8")
+    val critAbsent = """{"alg":"HS256","crit":["ext"]}""".getBytes("UTF-8")
+    val critEmpty = """{"alg":"HS256","crit":[]}""".getBytes("UTF-8")
     for
       key <- HmacSha256.generate.absolve
       tok <- signed(crit, livePayload, key)
       r <- JWT.verify(tok, HS256, key, apiPolicy, now).either
-      _ <- check(r == Left(JWT.Malformed), s"crit header -> Malformed, got $r")
-      _ <- check(JWT.peek(tok) == Left(JWT.Malformed), "peek rejects a crit header")
+      _ <- check(r == Left(JWT.UnsupportedExtension), s"crit header -> UnsupportedExtension, got $r")
+      _ <- check(JWT.peek(tok) == Left(JWT.Malformed), "peek reports a header it will not route on")
+      registered <- signed(critRegistered, livePayload, key)
+      reg <- JWT.verify(registered, HS256, key, apiPolicy, now).either
+      _ <- check(reg == Left(JWT.Malformed), s"crit naming a registered header -> Malformed, got $reg")
+      absent <- signed(critAbsent, livePayload, key)
+      abs <- JWT.verify(absent, HS256, key, apiPolicy, now).either
+      _ <- check(abs == Left(JWT.Malformed), s"crit naming an absent header -> Malformed, got $abs")
+      empty <- signed(critEmpty, livePayload, key)
+      emp <- JWT.verify(empty, HS256, key, apiPolicy, now).either
+      _ <- check(emp == Left(JWT.Malformed), s"an empty crit array -> Malformed, got $emp")
       // the same token without `crit` verifies, so the rejection is the crit member and nothing else
       control <- signed(plain, livePayload, key)
       ok <- JWT.verify(control, HS256, key, apiPolicy, now).either
       _ <- check(ok.isRight, s"the same header without crit verifies, got $ok")
     yield ()
+    end for
+  }
+
+  test("RFC 7515 section 4: a repeated member name is rejected, in the header, the claims and a JWK") {
+    val plainHeader = """{"alg":"HS256"}""".getBytes("UTF-8")
+    for
+      key <- HmacSha256.generate.absolve
+      header <- signed("""{"alg":"HS256","alg":"none"}""".getBytes("UTF-8"), livePayload, key)
+      h <- JWT.verify(header, HS256, key, apiPolicy, now).either
+      _ <- check(h == Left(JWT.Malformed), s"a repeated header member -> Malformed, got $h")
+      // Whichever occurrence a reader keeps decides the audience: that disagreement between kufuli
+      // and a first-wins intermediary, over one signed token, is the differential itself.
+      last <- signed(plainHeader, """{"aud":"evil","aud":"api","exp":9999999999}""".getBytes("UTF-8"), key)
+      l <- JWT.verify(last, HS256, key, apiPolicy, now).either
+      _ <- check(l == Left(JWT.Malformed), s"a repeated claim -> Malformed, got $l")
+      first <- signed(plainHeader, """{"aud":"api","aud":"evil","exp":9999999999}""".getBytes("UTF-8"), key)
+      f <- JWT.verify(first, HS256, key, apiPolicy, now).either
+      _ <- check(f == Left(JWT.Malformed), s"in whichever order it is written, got $f")
+      kp <- Ed25519.generate.absolve
+      raw <- expectRight("raw")(kp.publicKey.raw)
+      x = Base64Url.encode(Array.from(raw.iterator))
+      jwk <- JWK.parse(s"""{"kty":"OKP","crv":"Ed25519","x":"$x","x":"$x"}""").either
+      _ <- check(jwk == Left(Malformed), s"a repeated member inside a JWK -> Malformed, got $jwk")
+      control <- signed(plainHeader, livePayload, key)
+      c <- JWT.verify(control, HS256, key, apiPolicy, now).either
+      _ <- check(c.isRight, s"and a document whose names are unique still verifies, got $c")
+    yield ()
+    end for
+  }
+
+  test("a numeric time claim Long cannot carry is rejected rather than saturated") {
+    val plainHeader = """{"alg":"HS256"}""".getBytes("UTF-8")
+    def token(claims: String)(key: SecretKey[HmacSha256]): IO[String] = signed(plainHeader, claims.getBytes("UTF-8"), key)
+    for
+      key <- HmacSha256.generate.absolve
+      // 1e300 narrows to Long.MaxValue: an expiry that satisfies the policy and never arrives.
+      huge <- token("""{"aud":"api","exp":1e300}""")(key)
+      e <- JWT.verify(huge, HS256, key, apiPolicy, now).either
+      _ <- check(e == Left(JWT.Malformed), s"an out-of-range exp -> Malformed, got $e")
+      frac <- token("""{"aud":"api","exp":9999999999.5}""")(key)
+      r <- JWT.verify(frac, HS256, key, apiPolicy, now).either
+      _ <- check(r == Left(JWT.Malformed), s"a non-integral exp -> Malformed, got $r")
+      early <- token("""{"aud":"api","exp":9999999999,"nbf":-1e300}""")(key)
+      n <- JWT.verify(early, HS256, key, apiPolicy, now).either
+      _ <- check(n == Left(JWT.Malformed), s"and nbf is read the same way, got $n")
+      issued <- token("""{"aud":"api","exp":9999999999,"iat":1e300}""")(key)
+      i <- JWT.verify(issued, HS256, key, apiPolicy, now).either
+      _ <- check(i == Left(JWT.Malformed), s"and iat too, got $i")
+      sound <- token("""{"aud":"api","exp":9999999999}""")(key)
+      o <- JWT.verify(sound, HS256, key, apiPolicy, now).either
+      _ <- check(o.isRight, s"a NumericDate in range still verifies, got $o")
+    yield ()
+    end for
   }
 
   test("RFC 7519 section 4: a custom claim repeating a registered name does not emit that name twice") {
@@ -142,7 +209,7 @@ class JoseMalleabilitySuite extends munit.CatsEffectSuite:
     val header = """{"alg":"EdDSA","typ":"dpop+jwt","jwk":{"crv":"Ed25519","kty":"OKP","x":"AAAA","zz":1e999}}"""
     val token = b64(header) + "." + b64("""{"exp":9999999999}""") + "." + Base64Url.encode(new Array[Byte](64))
     for
-      r <- JWT.verifyWithHeaderKey(token, "dpop+jwt", JWT.Policy.unaudienced(Set(EdDSA)), now).either
+      r <- JWT.verifyWithHeaderKey(token, "dpop+jwt", JWT.Policy.unaudienced(EdDSA), now).either
       _ <- check(r == Left(JWT.Malformed), s"1e999 in the header jwk -> Malformed, got $r")
     yield ()
   }
@@ -170,7 +237,7 @@ class JoseMalleabilitySuite extends munit.CatsEffectSuite:
       "{\"n\":1e999}",
       "{\"a\":{\"b\":{\"c\":1}}}"
     )
-    val policy = JWT.Policy.unaudienced(Set(EdDSA))
+    val policy = JWT.Policy.unaudienced(EdDSA)
     for
       kp <- Ed25519.generate.absolve
       raw <- kp.publicKey.raw.absolve
@@ -208,10 +275,10 @@ class JoseMalleabilitySuite extends munit.CatsEffectSuite:
                  s"P-521 parses to its arm, got ${r521.key}"
            )
       p384 <- JWT.sign(claims, ES384, "dpop+jwt", k384.publicKey, now)(k384.privateKey).absolve
-      v384 <- JWT.verifyWithHeaderKey(p384.compact, "dpop+jwt", JWT.Policy.unaudienced(Set(ES384)), now).either
+      v384 <- JWT.verifyWithHeaderKey(p384.compact, "dpop+jwt", JWT.Policy.unaudienced(ES384), now).either
       _ <- check(v384.exists((verified, _) => verified.id.contains("jti-ec")), s"ES384 proof verifies under its embedded key, got $v384")
       p521 <- JWT.sign(claims, ES512, "dpop+jwt", k521.publicKey, now)(k521.privateKey).absolve
-      v521 <- JWT.verifyWithHeaderKey(p521.compact, "dpop+jwt", JWT.Policy.unaudienced(Set(ES512)), now).either
+      v521 <- JWT.verifyWithHeaderKey(p521.compact, "dpop+jwt", JWT.Policy.unaudienced(ES512), now).either
       _ <- check(v521.exists((verified, _) => verified.id.contains("jti-ec")), s"ES512 proof verifies under its embedded key, got $v521")
     yield ()
     end for

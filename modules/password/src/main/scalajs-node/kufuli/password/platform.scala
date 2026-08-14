@@ -28,8 +28,7 @@ import scala.scalajs.js.annotation.JSImport
 import scala.scalajs.js.typedarray.Uint8Array
 
 import boilerplate.Slice
-import boilerplate.effect.EffIO
-import boilerplate.effect.UEffIO
+import boilerplate.effect.UEff
 import boilerplate.nullable.option
 import cats.effect.IO
 
@@ -45,10 +44,10 @@ private[password] object nodeArgon2:
   private[password] object crypto extends js.Object:
     def argon2(algorithm: String, options: js.Any, callback: js.Function2[js.Error | Null, Uint8Array, Unit]): Unit = js.native
 
-private[password] trait Argon2Platform:
+private[kufuli] trait Argon2Platform:
   given Argon2 = new Argon2:
-    def hash(password: Slice, salt: Slice, params: Argon2Params): UEffIO[Array[Byte]] =
-      EffIO.liftF(guard(IO.async_[Array[Byte]] { cb =>
+    private[kufuli] def hash(password: Slice, salt: Slice, params: Argon2Params): UEff[Array[Byte]] =
+      guard(IO.async_[Array[Byte]] { cb =>
         nodeArgon2.crypto.argon2(
           "argon2id",
           js.Dynamic.literal(
@@ -64,5 +63,5 @@ private[password] trait Argon2Platform:
               case None    => cb(Right(ba(out)))
               case Some(e) => cb(Left(js.JavaScriptException(e)))
         )
-      }))
+      })
 end Argon2Platform

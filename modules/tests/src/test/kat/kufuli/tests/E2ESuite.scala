@@ -45,7 +45,7 @@ class E2ESuite extends munit.CatsEffectSuite:
     cipher.decrypt(dst, Slice.of(wire), Slice.empty, nonce).toOption.map(n => dst.take(n).toArray)
 
   private def derive(secret: Slice, label: String): IO[SecretKey[AesGcm256]] =
-    HKDF.expandLabelKey(Sha256, Prk.unsafe(secret.toArray), label, Slice.empty, AesGcm256).absolve
+    HKDF.expandLabelKey(Sha256, PRK.unsafe(secret.toArray), label, Slice.empty, AesGcm256).absolve
 
   test("TLS/QUIC-shaped E2E: hybrid agree -> extract -> expandLabel -> records both ways -> HP mask -> key update") {
     for
@@ -81,7 +81,7 @@ class E2ESuite extends munit.CatsEffectSuite:
                        c0
                      )
                    }
-                 }
+                 }.absolve
       (r0, r1, rs0, rForged, sample) = records
       _ <- check(r0.exists(p => new String(p) == "client-hello-0"), "c->s record 0 round-trips")
       _ <- check(r1.exists(p => new String(p) == "client-hello-1"), "c->s record 1 round-trips (seq nonce)")
@@ -96,12 +96,13 @@ class E2ESuite extends munit.CatsEffectSuite:
                     m
                   }
                 )
+                .absolve
       _ <- check(mask.exists(_ != 0), "a QUIC header-protection mask was produced")
-      cNextSecret <- HKDF.expandLabel(Sha256, Prk.unsafe(cSecret.toArray), "traffic upd", Slice.empty, 32).absolve
+      cNextSecret <- HKDF.expandLabel(Sha256, PRK.unsafe(cSecret.toArray), "traffic upd", Slice.empty, 32).absolve
       cKeyGen1 <- derive(cNextSecret, "key")
       rekeyed <- (cKey.cipher, cKeyGen1.cipher).tupled.use { (before, after) =>
                    IO(seal(before, cIv.toArray, 0L, "same".getBytes).sameElements(seal(after, cIv.toArray, 0L, "same".getBytes)))
-                 }
+                 }.absolve
       _ <- check(!rekeyed, "a proactive key update rekeys the direction")
     yield ()
   }

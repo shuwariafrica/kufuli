@@ -18,18 +18,22 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-package kufuli.tests
+// Deliberately outside `kufuli.*`: `private[kufuli]` grants package access, so the same assertion
+// made from `kufuli.tests` would compile whether or not the primitive is sealed. The browser
+// artifact ships no password module, which is why this row lives beside the KAT tier.
+package seamcheck
 
-import scala.reflect.TypeTest
+import scala.compiletime.testing.typeChecks
 
-import boilerplate.effect.Eff
-import cats.effect.IO
+import kufuli.password.*
 
-object support:
-  def expectRight[E <: Throwable, A](label: String)(e: Eff[E, A])(using TypeTest[Throwable, E]): IO[A] =
-    e.either.flatMap {
-      case Right(a)  => IO.pure(a)
-      case Left(err) => IO.raiseError(new AssertionError(s"$label: unexpected error $err"))
-    }
-  def check(cond: Boolean, label: String): IO[Unit] =
-    if cond then IO.unit else IO.raiseError(new AssertionError(label))
+class PasswordSeamSuite extends munit.FunSuite:
+
+  test("the Argon2 primitive is unreachable from outside kufuli, while hashing is not") {
+    assert(typeChecks("summon[Argon2]"), "the Argon2 instance resolves")
+    assert(
+      !typeChecks("summon[Argon2].hash(boilerplate.Slice.empty, boilerplate.Slice.empty, Argon2Params.default)"),
+      "the primitive is sealed, so salt custody and PHC encoding cannot be bypassed"
+    )
+    assert(typeChecks("\"pw\".hash(Argon2Params.interactive)(using summon[Argon2], summon[kufuli.Random])"), "the audited path is public")
+  }

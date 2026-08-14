@@ -114,6 +114,10 @@ private[kufuli] object nodecrypto:
   private[kufuli] def ba(u: Uint8Array): Array[Byte] =
     int8Array2ByteArray(new Int8Array(u.buffer, u.byteOffset, u.length))
 
+  /** A window onto the same buffer, so erasing the parent erases the window with it. */
+  private[kufuli] def window(u: Uint8Array, from: Int, length: Int): Uint8Array =
+    new Uint8Array(u.buffer, u.byteOffset + from, length)
+
   private[kufuli] def zero(u: Uint8Array): Unit = (0 until u.length).foreach(i => u(i) = 0.toShort)
 
   /** The `code` node attaches to a thrown error, which is how its failure taxonomy is read. */

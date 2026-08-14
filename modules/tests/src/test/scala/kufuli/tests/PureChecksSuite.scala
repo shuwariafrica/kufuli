@@ -86,11 +86,15 @@ class PureChecksSuite extends munit.FunSuite:
     assert(Signature.fromRaw(Ed25519)(new Array[Byte](63)).isLeft, "ed25519 signature is 64 bytes")
     assert(Signature.fromRaw(P256)(new Array[Byte](64)).isRight, "P-256 raw r||s is 64 bytes")
     assertEquals(Signature.fromRaw(HmacSha256)(new Array[Byte](31)), Left(Malformed))
+    // RSA signature octets are validated against the modulus by the backend at verify, so the door
+    // admits any non-empty length and rejects only the one length no modulus can produce.
+    assert(Signature.fromRaw(RSA)(Array.emptyByteArray).isLeft, "an empty RSA signature is rejected")
+    assert(Signature.fromRaw(RSA)(new Array[Byte](1)).isRight, "and any other length is the backend's to judge")
     assertEquals(KemCiphertext.of(MlKem768)(new Array[Byte](10)), Left(Malformed))
   }
 
   test("programmer-error domains are defects (require), not error values") {
-    val _ = intercept[IllegalArgumentException](Rsa.bits(1024))
+    val _ = intercept[IllegalArgumentException](RSA.bits(1024))
     val _ = intercept[IllegalArgumentException](AeadLimits(0, 1, 1))
   }
 
@@ -123,11 +127,11 @@ class PureChecksSuite extends munit.FunSuite:
   test("the shared DER peek requires the outer TLV to span the whole blob") {
     val point = Array.tabulate[Byte](32)(i => (i + 1).toByte)
     val spki = Array[Byte](0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00) ++ point
-    assertEquals(Der.peekSpki(Slice.of(spki)), Right(Der.Alg.X), "the canonical blob dispatches")
-    assert(Der.peekSpki(Slice.of(spki ++ Array.fill[Byte](32)(0x11))).isLeft, "bytes past the SEQUENCE are rejected")
-    assert(Der.peekSpki(Slice.of(Array[Byte](0x30, 0x81.toByte, 0x2a) ++ spki.drop(2))).isLeft, "a long-form short length is rejected")
-    assert(Der.spkiPublicBits(Slice.of(spki), 32).exists(_.contentEquals(Slice.of(point))), "the point is located by walking")
-    assert(Der.spkiPublicBits(Slice.of(spki), 31).isLeft, "a point of the wrong width is rejected")
+    assertEquals(DER.peekSpki(Slice.of(spki)), Right(DER.Alg.X), "the canonical blob dispatches")
+    assert(DER.peekSpki(Slice.of(spki ++ Array.fill[Byte](32)(0x11))).isLeft, "bytes past the SEQUENCE are rejected")
+    assert(DER.peekSpki(Slice.of(Array[Byte](0x30, 0x81.toByte, 0x2a) ++ spki.drop(2))).isLeft, "a long-form short length is rejected")
+    assert(DER.spkiPublicBits(Slice.of(spki), 32).exists(_.contentEquals(Slice.of(point))), "the point is located by walking")
+    assert(DER.spkiPublicBits(Slice.of(spki), 31).isLeft, "a point of the wrong width is rejected")
   }
 
   test("Base32 (RFC 4648 s6, unpadded upper case): vectors both directions, strict rejection") {
@@ -142,5 +146,11 @@ class PureChecksSuite extends munit.FunSuite:
     assert(Base32.decode("M").isLeft && Base32.decode("MZX").isLeft && Base32.decode("MZXW6Y").isLeft, "impossible lengths rejected")
     assert(Base32.decode("MZ").isLeft, "non-canonical trailing bits rejected")
     assert(Base32.decode("M1").isLeft && Base32.decode("M0").isLeft && Base32.decode("M8").isLeft, "non-alphabet characters rejected")
+  }
+  test("Digest.of admits exactly the lengths kufuli's hashes produce") {
+    List(20, 32, 48, 64).foreach(n => assert(Digest.of(new Array[Byte](n)).isRight, s"$n bytes is a digest kufuli can produce"))
+    // SHA-224 exists nowhere in the surface, so accepting its length parsed digests no operation
+    // here can produce or verify.
+    List(0, 16, 28, 33, 65).foreach(n => assert(Digest.of(new Array[Byte](n)).isLeft, s"$n bytes is not"))
   }
 end PureChecksSuite

@@ -23,15 +23,15 @@
 package kufuli.password
 
 import boilerplate.Slice
-import boilerplate.effect.EffIO
-import boilerplate.effect.UEffIO
+import boilerplate.effect.Eff
+import boilerplate.effect.UEff
 import org.bouncycastle.crypto.generators.Argon2BytesGenerator
 import org.bouncycastle.crypto.params.Argon2Parameters
 
-private[password] trait Argon2Platform:
+private[kufuli] trait Argon2Platform:
   given Argon2 = new Argon2:
-    def hash(password: Slice, salt: Slice, params: Argon2Params): UEffIO[Array[Byte]] =
-      EffIO.suspendBlocking {
+    private[kufuli] def hash(password: Slice, salt: Slice, params: Argon2Params): UEff[Array[Byte]] =
+      Eff.suspendBlocking {
         val p = new Argon2Parameters.Builder(Argon2Parameters.ARGON2_id)
           .withVersion(Argon2Parameters.ARGON2_VERSION_13)
           .withIterations(params.iterations)

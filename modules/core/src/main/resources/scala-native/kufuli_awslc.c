@@ -420,8 +420,9 @@ static int ec_curve_nid(int type) {
   }
 }
 
-/* Copies a CBB-marshalled key into the caller's buffer. CBB_finish hands back an OPENSSL_free'd
- * buffer; on any failure CBB_cleanup releases the partial state. */
+/* Copies a CBB-marshalled key into the caller's buffer. On any failure CBB_cleanup releases the
+ * partial state. The marshalled buffer is a whole private key for EVP_marshal_private_key, so it is
+ * cleansed rather than merely freed - a plain free returns it to the allocator in the clear. */
 static int marshal_into(int (*fn)(CBB *, const EVP_PKEY *), const EVP_PKEY *pkey, uint8_t *out, size_t *out_len,
                         size_t max_out) {
   CBB cbb;
@@ -435,7 +436,7 @@ static int marshal_into(int (*fn)(CBB *, const EVP_PKEY *), const EVP_PKEY *pkey
       *out_len = len;
       ok = 1;
     }
-    OPENSSL_free(data);
+    OPENSSL_clear_free(data, len);
   } else {
     CBB_cleanup(&cbb);
   }

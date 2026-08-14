@@ -313,7 +313,7 @@ class AgreementSuite extends munit.CatsEffectSuite:
   }
 
   private def cbcHs[A <: AeadAlgorithm](spec: AeadSpec[A], k: String, iv: String, aad: String, p: String, e: String, t: String)(using
-    Aead[A]
+    AEAD[A]
   ): IO[Unit] =
     val key = SecretKey.of(spec)(hb(k)).toOption.get
     val nonce = Nonce.unsafe[A](hb(iv))
@@ -335,7 +335,7 @@ class AgreementSuite extends munit.CatsEffectSuite:
   // RFC 4231's keys are shorter than the digest, or longer than the JOSE cap, so none of them clears
   // `SecretKey.of`'s key-length policy; the vectors anchor the MAC computation, not that policy.
   // Test case 5 publishes only the leading 128 bits, hence the prefix comparison.
-  private def hmacKat[H <: MacAlgorithm](vectors: List[(Int, String, String, String)])(using Mac[H]): IO[Unit] =
+  private def hmacKat[H <: MacAlgorithm](vectors: List[(Int, String, String, String)])(using MAC[H]): IO[Unit] =
     cases(vectors, "hmac")
       .flatMap(_.traverse { (tc, k, data, expected) =>
         SecretKey.unsafe[H](hb(k)).sign(Slice.of(hb(data))).absolve.map { sig =>
@@ -413,7 +413,7 @@ class AgreementSuite extends munit.CatsEffectSuite:
     kwpKat(AesKwp256, 256)
   }
 
-  private def sealGcm[A <: AeadAlgorithm](spec: AeadSpec[A], k: String, iv: String, aad: String, msg: String)(using Aead[A]): IO[String] =
+  private def sealGcm[A <: AeadAlgorithm](spec: AeadSpec[A], k: String, iv: String, aad: String, msg: String)(using AEAD[A]): IO[String] =
     val key = SecretKey.of(spec)(hb(k)).toOption.get
     key.seal(Nonce.unsafe[A](hb(iv)), Slice.of(hb(aad)), Slice.of(hb(msg))).absolve.map(s => hex(s.toArray))
 
@@ -454,7 +454,7 @@ class AgreementSuite extends munit.CatsEffectSuite:
   // A published encapsulation key from another implementation entirely: it must import, export back
   // byte for byte, and encapsulate. Decapsulating a published ciphertext would pin the other half,
   // but no backend can import an ML-KEM decapsulation key through this surface.
-  private def kemWire[K <: KemAlgorithm](spec: KemSpec[K], ek: String)(using KemKeys[K], Kem[K]): IO[Unit] =
+  private def kemWire[K <: KemAlgorithm](spec: KemSpec[K], ek: String)(using KemKeys[K], KEM[K]): IO[Unit] =
     for
       pub <- expectRight("encapsulation key")(PublicKey.fromRaw(spec)(Slice.of(hb(ek))))
       exported <- expectRight("export")(pub.raw)

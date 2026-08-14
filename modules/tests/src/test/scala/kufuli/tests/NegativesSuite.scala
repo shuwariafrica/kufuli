@@ -37,7 +37,7 @@ class NegativesSuite extends munit.FunSuite:
   def p256Priv: PrivateKey[P256] = ???
   def p384Pub: PublicKey[P384] = ???
   def ecPub: PublicKey[P256] = ???
-  def rsaPriv: PrivateKey[Rsa] = ???
+  def rsaPriv: PrivateKey[RSA] = ???
   def box128: SealedBox[AesGcm128] = ???
   def p256Sig: Signature[P256] = ???
   def macTag: Signature[HmacSha256] = ???
@@ -67,5 +67,23 @@ class NegativesSuite extends munit.FunSuite:
     assert(!typeChecks("kemPriv.agree(kemPub)"), "KEM is encapsulation, not agreement")
     assert(!typeChecks("ecPub.encapsulate"), "encapsulation exists only for KEM algorithms")
     assert(!typeChecks("aeadKey.raw"), "symmetric keys have no raw export")
+  }
+
+  test("equality is available exactly where value semantics are real") {
+    assert(typeChecks("AeadLimits(1, 1, 1) == AeadLimits(1, 1, 1)"), "limits compare by their integers")
+    assert(!typeChecks("def d: Digest = ???; d == d"), "a digest does not, because the array behind it would compare by reference")
+    assert(!typeChecks("aeadKey == aeadKey"), "nor does a carrier, whose comparison has no meaning any consumer asked for")
+    assert(
+      !typeChecks("def b: PEM.Block = ???; b == b"),
+      "nor a PEM block, whose DER field would compare by reference and make a decode round-trip unequal to itself"
+    )
+  }
+
+  test("the key-material types name only what they can hold, and parsing names the encoding") {
+    assert(!typeChecks("def k: SecretKey[Ed25519] = ???"), "no constructor makes an asymmetric-tagged secret key nameable")
+    assert(!typeChecks("def r: Keyring[Ed25519] = ???"), "a keyring holds symmetric keys alone")
+    assert(typeChecks("def k: SecretKey[HmacSha256] = ???"), "a symmetric tag is nameable")
+    assert(!typeChecks("RSA.fromPkcs8(boilerplate.Slice.empty)"), "parsing lives on the carrier, beside its siblings")
+    assert(typeChecks("PrivateKey.fromPkcs8(RSA)(boilerplate.Slice.empty)"), "RSA private-key import is where every other family's is")
   }
 end NegativesSuite

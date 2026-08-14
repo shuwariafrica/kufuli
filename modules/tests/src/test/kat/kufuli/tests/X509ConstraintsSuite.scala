@@ -252,6 +252,24 @@ class X509ConstraintsSuite extends munit.CatsEffectSuite:
     end for
   }
 
+  test("a subject emailAddress that is not IA5 is dropped rather than decoded into a mailbox") {
+    // IA5String is 7-bit. Decoded as US-ASCII a high byte becomes a replacement character, which
+    // would make this value a mailbox outside the permitted subtree and fail the chain; dropping it
+    // leaves the fallback with nothing to check.
+    val highByte = tlv(0x31, seq(oid(oidEmailAddress), tlv(0x16, ascii("ops@") ++ Array[Byte](0xe9.toByte) ++ ascii(".example"))))
+    val outside = seq(rdn(oidEmailAddress, 0x16, "ops@other.example"), rdn(oidCommonName, 0x0c, "leaf"))
+    for
+      root <- selfSigned("Anchor", List(caTrue, certSign, permitted(emailName(".corp.example"))))
+      anchor <- parsed(root.der).map(x5.TrustAnchors(_))
+      dropped <- leafNamed(root, 2, seq(highByte, rdn(oidCommonName, 0x0c, "leaf")), List(endEntity)).flatMap(parsed)
+      decoded <- leafNamed(root, 3, outside, List(endEntity)).flatMap(parsed)
+      ignored <- x5.CertPath.verifyClient(List(dropped), anchor, at).either
+      _ <- check(ignored.isRight, s"a non-IA5 attribute is no mailbox, so the fallback has nothing to match, got $ignored")
+      checked <- x5.CertPath.verifyClient(List(decoded), anchor, at).either
+      _ <- check(violated(checked), s"while an IA5 address outside the subtree is checked and fails, got $checked")
+    yield ()
+  }
+
   test("a self-issued certificate below the leaf has its own names skipped, and a re-keyed peer does not") {
     for
       root <- selfSigned("Anchor", List(caTrue, certSign, permitted(dnsName("corp.example"))))

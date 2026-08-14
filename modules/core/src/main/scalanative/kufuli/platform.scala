@@ -26,11 +26,36 @@ private[kufuli] type KeyRepr = Array[Byte]
 private[kufuli] def keyRepr(bytes: Array[Byte]): KeyRepr = bytes
 private[kufuli] def keyBytes(r: KeyRepr): Array[Byte] = r
 
+// Bytes-backed secret custody: the carrier is boilerplate's guarded Secret. `secretAdopt` TRANSFERS
+// custody of a kufuli-internal transient (copy in, wipe the source); `secretCopy` copies a
+// caller-owned buffer and leaves its hygiene to the caller.
+private[kufuli] type SecretRepr = boilerplate.Secret
+private[kufuli] def secretAdopt(bytes: Array[Byte]): SecretRepr =
+  val s = boilerplate.Secret.fill(bytes.length) { dst =>
+    val _ = boilerplate.Slice.of(bytes).copyInto(dst)
+  }
+  boilerplate.Slice.of(bytes).wipe()
+  s
+private[kufuli] def secretCopy(bytes: Array[Byte]): SecretRepr =
+  boilerplate.Secret.fill(bytes.length) { dst =>
+    val _ = boilerplate.Slice.of(bytes).copyInto(dst)
+  }
+private[kufuli] def secretRead[B](r: SecretRepr)(f: boilerplate.Slice => B): B = boilerplate.Secret.use(r)(f)
+private[kufuli] def secretDestroy(r: SecretRepr): Unit = boilerplate.Secret.destroy(r)()
+
+// Generated keys are byte-backed and exportable here, so the backend door coincides with the view.
+private[kufuli] def secretGenerated(bytes: Array[Byte]): SecretRepr = secretAdopt(bytes)
+private[kufuli] def keyGenerated(bytes: Array[Byte]): KeyRepr = bytes
+private[kufuli] def secretExportable(r: SecretRepr): Boolean =
+  val _ = r
+  true
+private[kufuli] def secretMaterial[B](r: SecretRepr)(f: boilerplate.Slice => B): B = boilerplate.Secret.use(r)(f)
+
 private[kufuli] trait RandomPlatform extends awslc.RandomDefault
 private[kufuli] trait AeadPlatform extends awslc.AeadUniversal, awslc.AeadChaCha, awslc.AeadMisuseResistant
 private[kufuli] trait MacPlatform extends awslc.MacAll
-private[kufuli] trait SignerPlatform extends awslc.SignersAll
-private[kufuli] trait VerifierPlatform extends awslc.VerifiersAll
+private[kufuli] trait SigningPlatform extends awslc.SignersAll
+private[kufuli] trait VerifyingPlatform extends awslc.VerifiersAll
 private[kufuli] trait AgreementPlatform extends awslc.AgreementAll
 private[kufuli] trait KemPlatform extends awslc.KemAll
 private[kufuli] trait WrapPlatform extends awslc.WrapKw, awslc.WrapKwp

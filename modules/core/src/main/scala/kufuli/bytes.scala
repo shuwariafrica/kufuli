@@ -141,24 +141,23 @@ private[kufuli] object Base64:
         @tailrec def go(i: Int, o: Int): Either[Malformed, Array[Byte]] =
           if i >= body.length then Right(out)
           else
+            // `i` advances by whole groups, so the final one carries 2, 3 or 4 symbols: the
+            // length-1 residue that would leave a single symbol was rejected above.
             val chunk = math.min(4, body.length - i)
-            if chunk < 2 then Left(Malformed)
+            val values = (0 until chunk).map { j =>
+              val c = body.charAt(i + j).toInt
+              if c < 128 then table(c) else -1
+            }
+            val acc = values.foldLeft(0)((a, v) => (a << 6) | (v & 0x3f)) << (6 * (4 - chunk))
+            // A short final group carries bits below its last octet that no byte receives; unless
+            // they are zero one octet string has many encodings, defeating any defence keyed on the
+            // encoded string - a replay cache, a denylist, a unique-token column.
+            if values.exists(_ < 0) || (acc & ((1 << (8 * (4 - chunk))) - 1)) != 0 then Left(Malformed)
             else
-              val values = (0 until chunk).map { j =>
-                val c = body.charAt(i + j).toInt
-                if c < 128 then table(c) else -1
-              }
-              val acc = values.foldLeft(0)((a, v) => (a << 6) | (v & 0x3f)) << (6 * (4 - chunk))
-              // A short final group carries bits below its last octet that no byte receives; unless
-              // they are zero one octet string has many encodings, defeating any defence keyed on the
-              // encoded string - a replay cache, a denylist, a unique-token column.
-              if values.exists(_ < 0) || (acc & ((1 << (8 * (4 - chunk))) - 1)) != 0 then Left(Malformed)
-              else
-                out(o) = ((acc >> 16) & 0xff).toByte
-                if chunk >= 3 then out(o + 1) = ((acc >> 8) & 0xff).toByte
-                if chunk == 4 then out(o + 2) = (acc & 0xff).toByte
-                go(i + chunk, o + chunk - 1)
-            end if
+              out(o) = ((acc >> 16) & 0xff).toByte
+              if chunk >= 3 then out(o + 1) = ((acc >> 8) & 0xff).toByte
+              if chunk == 4 then out(o + 2) = (acc & 0xff).toByte
+              go(i + chunk, o + chunk - 1)
         go(0, 0)
     }
   end decode
@@ -171,8 +170,6 @@ end Base64
   */
 object PEM:
   final case class Block(label: String, der: IArray[Byte])
-  object Block:
-    given CanEqual[Block, Block] = CanEqual.derived
 
   def encode(block: Block): String =
     val body = Base64.encode(Array.from(block.der.iterator)).grouped(64).mkString("\n")
@@ -207,9 +204,9 @@ end PEM
   * EVP_parse_*). A wire parser over untrusted bytes: every read is bounds-checked, lengths accept
   * only definite short/1/2-byte long forms, and no recursion occurs.
   */
-private[kufuli] object Der:
+private[kufuli] object DER:
   enum Alg derives CanEqual:
-    case Ed, X, EcP256, EcP384, EcP521, OfRsa
+    case Ed, X, EcP256, EcP384, EcP521, Rsa
 
   // OID content bytes (verified against the aws-lc object registry / RFC 8410 / RFC 5480 / RFC 8017).
   private val oidEd = Array[Byte](0x2b, 0x65, 0x70) // 1.3.101.112
@@ -247,6 +244,13 @@ private[kufuli] object Der:
         else Right(Tlv(start, len, start + len))
       }
 
+  /** As [[read]], additionally bounding the TLV by the structure that contains it - the core reader
+    * bounds only by the whole buffer, so a child claiming a length past its parent would otherwise
+    * count bytes the parent does not carry.
+    */
+  private[kufuli] def within(der: Slice, off: Int, tag: Int, limit: Int): Either[InvalidKey, Tlv] =
+    read(der, off, tag).filterOrElse(_.next <= limit, InvalidKey.Malformed)
+
   private def oidAt(der: Slice, off: Int): Either[InvalidKey, (Slice, Int)] =
     read(der, off, 0x06).map(t => (der.slice(t.contentOff, t.next), t.next))
 
@@ -257,7 +261,7 @@ private[kufuli] object Der:
       oidAt(der, algId.contentOff).flatMap { (oid, next) =>
         if matches(oid, oidEd) then Right(Alg.Ed)
         else if matches(oid, oidX) then Right(Alg.X)
-        else if matches(oid, oidRsa) then Right(Alg.OfRsa)
+        else if matches(oid, oidRsa) then Right(Alg.Rsa)
         else if matches(oid, oidEcPublic) then
           oidAt(der, next).flatMap { (curve, _) =>
             if matches(curve, oidP256) then Right(Alg.EcP256)
@@ -437,4 +441,4 @@ private[kufuli] object Der:
     if der.length == prefix.length + payloadLen && der.take(prefix.length).contentEquals(Slice.of(prefix))
     then Right(der.drop(prefix.length))
     else Left(InvalidKey.Malformed)
-end Der
+end DER

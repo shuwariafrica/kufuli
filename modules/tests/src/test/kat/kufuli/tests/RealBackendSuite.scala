@@ -24,6 +24,7 @@ import scala.concurrent.duration.*
 
 import boilerplate.Slice
 import boilerplate.effect.*
+import cats.effect.IO
 
 import kufuli.*
 import kufuli.jose.*
@@ -55,6 +56,38 @@ class RealBackendSuite extends munit.CatsEffectSuite:
     yield ()
   }
 
+  test("an incremental hasher snapshots without consuming its context") {
+    val first = Slice.of("client".getBytes)
+    val second = Slice.of("hello".getBytes)
+    for
+      partial <- Sha256.digest(first).absolve
+      whole <- Sha256.digest(Slice.of("clienthello".getBytes)).absolve
+      seen <- Sha256.hasher.use { h =>
+                IO {
+                  h.update(first)
+                  val one = h.digest
+                  h.update(second)
+                  (one.hex, h.digest.hex, h.digest.hex)
+                }
+              }.absolve
+      _ <- check(seen._1 == partial.hex, s"the snapshot digests what was fed so far, got ${seen._1}")
+      _ <- check(seen._2 == whole.hex, s"and the context carried on from it rather than restarting, got ${seen._2}")
+      _ <- check(seen._3 == seen._2, "so taking it twice yields the same digest - it consumed nothing")
+    yield ()
+    end for
+  }
+
+  test("prepared RSA handles sign and verify what the one-shot ops do") {
+    for
+      rsa <- RSA.generate(RSA.bits(2048)).absolve
+      sig <- rsa.privateKey.signer(RsaPss(Sha256)).use(s => s.sign(Slice.of("m".getBytes))).absolve
+      ok <- rsa.publicKey.verifier(RsaPss(Sha256)).use(v => v.verify(Slice.of("m".getBytes), sig).either).absolve
+      _ <- check(ok == Right(()), s"a prepared RSA verifier accepts a prepared RSA signature, got $ok")
+      direct <- rsa.publicKey.verify(Slice.of("m".getBytes), sig, RsaPss(Sha256)).either
+      _ <- check(direct == Right(()), s"and the one-shot op accepts the same signature, got $direct")
+    yield ()
+  }
+
   test("signatures: ECDSA P-256 verify + DER<->raw; RSA-PSS/PKCS1/OAEP") {
     for
       p <- P256.generate.absolve
@@ -64,7 +97,7 @@ class RealBackendSuite extends munit.CatsEffectSuite:
       der = Array.from(sig.der.iterator)
       back = Signature.fromDer(P256)(der)
       _ <- check(back.exists(b => Array.from(b.bytes.iterator).sameElements(Array.from(sig.bytes.iterator))), "der round-trip")
-      rsa <- Rsa.generate(Rsa.bits(2048)).absolve
+      rsa <- RSA.generate(RSA.bits(2048)).absolve
       pss <- rsa.privateKey.sign(Slice.of("m".getBytes), RsaPss(Sha256)).absolve
       pssOk <- rsa.publicKey.verify(Slice.of("m".getBytes), pss, RsaPss(Sha256)).either
       _ <- check(pssOk == Right(()), "rsa-pss verify")
@@ -108,7 +141,7 @@ class RealBackendSuite extends munit.CatsEffectSuite:
     for
       p <- P256.generate.absolve
       jwk <- expectRight("jwk")(JWK.of("k1", p.publicKey))
-      jwks = JWKS.of(jwk)
+      jwks = JwkSet.of(jwk)
       claims = JWT.Claims.empty
                  .subject("alice")
                  .issuer("iss")
@@ -117,15 +150,15 @@ class RealBackendSuite extends munit.CatsEffectSuite:
                  .id("jti")
                  .claim("htm", JoseValue.Str("POST"))
       tok <- JWT.sign(claims, ES256, "k1", now)(p.privateKey).absolve
-      policy = JWT.Policy("api", Set(ES256, EdDSA)).issuer("iss").skew(60)
+      policy = JWT.Policy("api", ES256, EdDSA).issuer("iss").skew(60)
       v <- JWT.verify(tok.compact, jwks, policy, now).either
       _ <- check(v.exists(_.subject.contains("alice")), "es256 verify + sub")
       _ <- check(v.exists(_.claims.get("htm").contains(JoseValue.Str("POST"))), "custom claim round-trip")
       exp <- JWT.verify(tok.compact, jwks, policy, now + 7200).either
       _ <- check(exp.isLeft, "expired rejected")
-      aud <- JWT.verify(tok.compact, jwks, JWT.Policy("other", Set(ES256)), now).either
+      aud <- JWT.verify(tok.compact, jwks, JWT.Policy("other", ES256), now).either
       _ <- check(aud.isLeft, "audience mismatch rejected")
-      alg <- JWT.verify(tok.compact, jwks, JWT.Policy("api", Set(EdDSA)), now).either
+      alg <- JWT.verify(tok.compact, jwks, JWT.Policy("api", EdDSA), now).either
       _ <- check(alg.isLeft, "algorithm not allowlisted rejected")
       _ <- check(
              JWT.peek(tok.compact).exists(u => u.issuer.contains("iss") && u.kid.contains("k1") && u.algorithm == "ES256"),
@@ -134,13 +167,27 @@ class RealBackendSuite extends munit.CatsEffectSuite:
       ed <- Ed25519.generate.absolve
       edJwk <- expectRight("ed jwk")(JWK.of("e1", ed.publicKey))
       edTok <- JWT.sign(JWT.Claims.empty.audience("api").expiresIn(1.hour), EdDSA, "e1", now)(ed.privateKey).absolve
-      edOk <- JWT.verify(edTok.compact, JWKS.of(edJwk), JWT.Policy("api", Set(EdDSA)), now).either
+      edOk <- JWT.verify(edTok.compact, JwkSet.of(edJwk), JWT.Policy("api", EdDSA), now).either
       _ <- check(edOk.isRight, "eddsa verify")
       mk <- HmacSha256.generate.absolve
       hsTok <- JWT.sign(JWT.Claims.empty.audience("api").expiresIn(1.hour), HS256, now)(mk).absolve
-      hsOk <- JWT.verify(hsTok.compact, HS256, mk, JWT.Policy("api", Set(HS256)), now).either
+      hsOk <- JWT.verify(hsTok.compact, HS256, mk, JWT.Policy("api", HS256), now).either
       _ <- check(hsOk.isRight, "hs256 verify")
     yield ()
+  }
+
+  test("an RSA key's components round-trip: export, re-import, and export again to the same pair") {
+    for
+      kp <- RSA.generate(RSA.bits(2048)).absolve
+      first <- expectRight("components")(kp.publicKey.components)
+      back <- expectRight("re-import")(
+                PublicKey.fromComponents(Slice.of(Array.from(first.modulus.iterator)), Slice.of(Array.from(first.exponent.iterator)))
+              )
+      second <- expectRight("components again")(back.components)
+      _ <- check(Array.from(first.modulus.iterator).sameElements(Array.from(second.modulus.iterator)), "the modulus survives the round trip")
+      _ <- check(Array.from(first.exponent.iterator).sameElements(Array.from(second.exponent.iterator)), "and so does the exponent")
+    yield ()
+    end for
   }
 
   // Nested custom claims must survive sign -> verify verbatim: DPoP binds `cnf.jkt` and OIDC
@@ -162,7 +209,7 @@ class RealBackendSuite extends munit.CatsEffectSuite:
       ed <- Ed25519.generate.absolve
       jwk <- expectRight("jwk")(JWK.of("k", ed.publicKey))
       tok <- JWT.sign(claims, EdDSA, "k", now)(ed.privateKey).absolve
-      v <- JWT.verify(tok.compact, JWKS.of(jwk), JWT.Policy("api", Set(EdDSA)), now).either
+      v <- JWT.verify(tok.compact, JwkSet.of(jwk), JWT.Policy("api", EdDSA), now).either
       got = v.toOption.map(_.claims)
       _ <- check(got.flatMap(_.get("cnf")).contains(cnf), "nested cnf object round-trips")
       _ <- check(got.flatMap(_.get("events")).contains(events), "nested empty-object events round-trips")

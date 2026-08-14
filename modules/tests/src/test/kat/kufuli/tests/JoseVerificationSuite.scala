@@ -37,27 +37,27 @@ class JoseVerificationSuite extends munit.CatsEffectSuite:
   def xfamP256Pub: PublicKey[P256] = ???
   def xfamEdPriv: PrivateKey[Ed25519] = ???
 
-  test("jose rejections: UnknownKey (absent kid) is distinct from KeyAlgorithmMismatch (arm / symmetric-on-JWKS / pinned)") {
+  test("jose rejections: UnknownKey (absent kid) is distinct from KeyAlgorithmMismatch (arm / symmetric-on-JwkSet / pinned)") {
     val claims = JWT.Claims.empty.subject("alice").audience("api").expiresIn(1.hour)
-    val policy = JWT.Policy("api", Set(ES256, EdDSA, HS256))
+    val policy = JWT.Policy("api", ES256, EdDSA, HS256)
     for
       ec <- P256.generate.absolve
-      rsa <- Rsa.generate(Rsa.bits(2048)).absolve
+      rsa <- RSA.generate(RSA.bits(2048)).absolve
       mk <- HmacSha256.generate.absolve
       ed <- Ed25519.generate.absolve
       ecJwk <- expectRight("ec jwk")(JWK.of("k1", ec.publicKey))
       rsaJwk <- expectRight("rsa jwk")(JWK.of("k1", rsa.publicKey))
       tok <- JWT.sign(claims, ES256, "k1", now)(ec.privateKey).absolve
       hsTok <- JWT.sign(claims, HS256, now)(mk).absolve
-      // absent kid: an empty JWKS with a kid'd token -> UnknownKey (the refresh-on-miss signal)
-      unknown <- JWT.verify(tok.compact, JWKS.of(), policy, now).either
-      _ <- check(unknown == Left(JWT.UnknownKey), s"empty JWKS -> UnknownKey, got $unknown")
+      // absent kid: an empty JwkSet with a kid'd token -> UnknownKey (the refresh-on-miss signal)
+      unknown <- JWT.verify(tok.compact, JwkSet.of(), policy, now).either
+      _ <- check(unknown == Left(JWT.UnknownKey), s"empty JwkSet -> UnknownKey, got $unknown")
       // kid resolves but the key arm mismatches (RSA jwk under the same kid, ES256 token)
-      arm <- JWT.verify(tok.compact, JWKS.of(rsaJwk), policy, now).either
+      arm <- JWT.verify(tok.compact, JwkSet.of(rsaJwk), policy, now).either
       _ <- check(arm == Left(JWT.KeyAlgorithmMismatch), s"RSA jwk vs ES256 token -> KeyAlgorithmMismatch, got $arm")
       // an allowlisted symmetric alg reaching the public-key set
-      sym <- JWT.verify(hsTok.compact, JWKS.of(ecJwk), policy, now).either
-      _ <- check(sym == Left(JWT.KeyAlgorithmMismatch), s"HS256 via a JWKS -> KeyAlgorithmMismatch, got $sym")
+      sym <- JWT.verify(hsTok.compact, JwkSet.of(ecJwk), policy, now).either
+      _ <- check(sym == Left(JWT.KeyAlgorithmMismatch), s"HS256 via a JwkSet -> KeyAlgorithmMismatch, got $sym")
       // pinned single-key verify: the token alg (ES256) is allowlisted but is not the pinned alg (EdDSA)
       pinned <- JWT.verify(tok.compact, EdDSA, ed.publicKey, policy, now).either
       _ <- check(pinned == Left(JWT.KeyAlgorithmMismatch), s"pinned alg mismatch -> KeyAlgorithmMismatch, got $pinned")
@@ -70,16 +70,16 @@ class JoseVerificationSuite extends munit.CatsEffectSuite:
     for
       mk <- HmacSha256.generate.absolve
       tok <- JWT.sign(noExp, HS256, now)(mk).absolve
-      missing <- JWT.verify(tok.compact, HS256, mk, JWT.Policy("api", Set(HS256)), now).either
+      missing <- JWT.verify(tok.compact, HS256, mk, JWT.Policy("api", HS256), now).either
       _ <- check(missing == Left(JWT.MissingExpiry), s"no-exp under a default policy -> MissingExpiry, got $missing")
-      accepted <- JWT.verify(tok.compact, HS256, mk, JWT.Policy("api", Set(HS256)).unexpiring, now).either
+      accepted <- JWT.verify(tok.compact, HS256, mk, JWT.Policy("api", HS256).unexpiring, now).either
       _ <- check(accepted.exists(_.subject.contains("job-7")), s"no-exp under .unexpiring is accepted, got $accepted")
     yield ()
   }
 
   test("jose header-key (DPoP): round-trip returns the claims and the binding JWK; typ / jwk / embedded-key enforced") {
     val claims = JWT.Claims.empty.id("jti-9").claim("htm", JoseValue.Str("POST")).expiresIn(1.hour)
-    val policy = JWT.Policy.unaudienced(Set(EdDSA))
+    val policy = JWT.Policy.unaudienced(EdDSA)
     for
       kp <- Ed25519.generate.absolve
       other <- Ed25519.generate.absolve
@@ -127,11 +127,50 @@ class JoseVerificationSuite extends munit.CatsEffectSuite:
         "NjE2fQ.2-GxA6T8lP4vfrg8v-FdWP0A0zdrj8igiMLvqRMUvwnQg4PtFLbdLXiOSsX0x7NVY-FNyJK70nfbV37xRZT3Lg"
     val iat = 1562262616L
     for
-      v <- JWT.verifyWithHeaderKey(proof, "dpop+jwt", JWT.Policy.unaudienced(Set(ES256)).unexpiring, iat).either
+      v <- JWT.verifyWithHeaderKey(proof, "dpop+jwt", JWT.Policy.unaudienced(ES256).unexpiring, iat).either
       _ <- check(
              v.exists((verified, _) => verified.id.contains("-BwC3ESc6acc2lTc") && verified.claims.get("htm").contains(JoseValue.Str("POST"))),
              s"RFC 9449 section 4.1 proof verifies under its embedded key, got $v"
            )
+    yield ()
+  }
+
+  test("a set answers by kid, and a document carrying private material publishes none of it") {
+    for
+      first <- Ed25519.generate.absolve
+      second <- Ed25519.generate.absolve
+      a <- expectRight("first jwk")(JWK.of("k", first.publicKey))
+      b <- expectRight("second jwk")(JWK.of("k", second.publicKey))
+      // Two members under one kid: `find` answers with the first, so a rotating publisher that
+      // reuses an id is resolved deterministically rather than by set order.
+      _ <- check(JwkSet.of(a, b).find("k").contains(a), "a repeated kid resolves to the first member")
+      _ <- check(JwkSet.of(a, b).find("absent").isEmpty, "and an absent one resolves to nothing")
+      raw <- expectRight("raw")(first.publicKey.raw)
+      x = Base64Url.encode(Array.from(raw.iterator))
+      // RFC 7517 section 9.3: a `d` member makes this a private JWK. kufuli reads the public half
+      // and publishes only what it read, so nothing private survives a parse-then-publish.
+      priv <- JWK.parse(s"""{"kty":"OKP","crv":"Ed25519","x":"$x","d":"$x","kid":"k"}""").either
+      _ <- check(priv.exists(_.key match
+                   case ImportedPublicKey.Ed(_) => true;
+                   case _                       => false),
+                 s"a private JWK parses to its public arm, got $priv"
+           )
+      republished <- expectRight("republish")(JWK.of("k", first.publicKey))
+      _ <- check(!republished.json.contains("\"d\""), s"and republishing carries no private member, got ${republished.json}")
+    yield ()
+    end for
+  }
+
+  test("a proof presented before its own not-before is refused under its header key") {
+    val claims = JWT.Claims.empty.id("jti-nbf").notBefore(now + 300).expiresIn(1.hour)
+    val policy = JWT.Policy.unaudienced(EdDSA)
+    for
+      kp <- Ed25519.generate.absolve
+      proof <- JWT.sign(claims, EdDSA, "dpop+jwt", kp.publicKey, now)(kp.privateKey).absolve
+      early <- JWT.verifyWithHeaderKey(proof.compact, "dpop+jwt", policy, now).either
+      _ <- check(early == Left(JWT.NotYetValid), s"a proof before its nbf -> NotYetValid, got $early")
+      later <- JWT.verifyWithHeaderKey(proof.compact, "dpop+jwt", policy, now + 600).either
+      _ <- check(later.isRight, s"and the same proof verifies once its window opens, got ${later.isRight}")
     yield ()
   }
 

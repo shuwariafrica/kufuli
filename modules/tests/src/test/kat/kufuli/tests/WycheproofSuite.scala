@@ -45,7 +45,7 @@ class WycheproofSuite extends munit.CatsEffectSuite:
   // the only way to reach a decapsulation key, so without it these vectors are unexercisable. Every
   // `invalid` case in this corpus is a seed or ciphertext length violation, which kufuli refuses at
   // its own typed constructors.
-  private def runMlKem[K <: KemAlgorithm](json: String, spec: KemSpec[K])(using keys: KemKeys[K], kem: Kem[K]): IO[Unit] =
+  private def runMlKem[K <: KemAlgorithm](json: String, spec: KemSpec[K])(using keys: KemKeys[K], kem: KEM[K]): IO[Unit] =
     val cases = for
       g <- parse(json).field("testGroups").arr.toList
       t <- g.field("tests").arr.toList
@@ -92,12 +92,12 @@ class WycheproofSuite extends munit.CatsEffectSuite:
   end runVerify
 
   private def openGcm[A <: AeadAlgorithm](spec: AeadSpec[A], k: Array[Byte], iv: Array[Byte], aad: Array[Byte], ctTag: Array[Byte])(using
-    Aead[A]
+    AEAD[A]
   ): IO[Option[Array[Byte]]] =
     SecretKey.of(spec)(k) match
       case Left(_)    => IO.pure(None)
       case Right(key) =>
-        summon[Aead[A]].open(key, Nonce.unsafe[A](iv), Slice.of(aad), Slice.of(ctTag)).either.map(_.toOption.map(_.toArray))
+        summon[AEAD[A]].open(key, Nonce.unsafe[A](iv), Slice.of(aad), Slice.of(ctTag)).either.map(_.toOption.map(_.toArray))
 
   // Restricted to the 96-bit-nonce / 128-bit-tag groups the EVP_AEAD ciphers accept.
   private def runAead(json: String, open: (Int, Array[Byte], Array[Byte], Array[Byte], Array[Byte]) => IO[Option[Array[Byte]]]): IO[Unit] =

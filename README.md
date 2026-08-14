@@ -37,12 +37,12 @@ The JOSE, password, and X.509 layers are separate artifacts (`kufuli-jose`, `kuf
 | ----------------- | ----------------------------------------------------------------- |
 | `kufuli`          | Primitives, recipes, key rotation, and the `kufuli.unsafe` floor. |
 | `kufuli-browser`  | The WebCrypto build of the core, for browser bundles.             |
-| `kufuli-jose`     | JWT/JWS/JWE/JWK(S) and COSE key import.                            |
+| `kufuli-jose`     | JWT/JWS, JWK sets, and COSE key import.                            |
 | `kufuli-password` | Argon2id password hashing with the PHC format.                    |
 | `kufuli-x509`     | Certificate path validation and stapled-OCSP verification.        |
 
-Every operation is a value in `boilerplate.effect`: `UEffIO[A]` when it cannot fail, and
-`EffIO[E, A]` when `E` is its typed error. Both run as ordinary cats-effect `IO`.
+Every operation is a value in `boilerplate.effect`: `UEff[A]` when it cannot fail, and
+`Eff[E, A]` when `E` is its typed error. Both run as ordinary cats-effect `IO`.
 
 ## Usage
 
@@ -63,7 +63,7 @@ val aad = Slice.of("user-42".getBytes)
 for
   key   <- AesGcm256.generate                     // SecretKey.of(AesGcm256)(raw) parses a stored key
   box   <- key.seal(Slice.of(accountNumber), aad)
-  plain <- key.open(box, aad)                     // EffIO[AuthFailed, Slice]
+  plain <- key.open(box, aad)                     // Eff[AuthFailed, Slice]
 yield box.bytes                                   // the stored form; SealedBox.of parses it back
 ```
 
@@ -72,7 +72,7 @@ Ring construction and rotation are pure, and reject a duplicate id:
 
 ```scala
 for
-  ring <- EffIO.from(Keyring.of(KeyId.of(1) -> key2024).flatMap(_.rotated(KeyId.of(2) -> key2025)))
+  ring <- Eff.from(Keyring.of(KeyId.of(1) -> key2024).flatMap(_.rotated(KeyId.of(2) -> key2025)))
   box  <- ring.seal(Slice.of(secret))             // under the new primary; retired keys still open
 yield box
 ```
@@ -87,7 +87,7 @@ Algorithm-typed keys make cross-algorithm and weak-hash misuse a type error:
 for
   kp  <- Ed25519.generate
   sig <- kp.privateKey.sign(Slice.of(message))
-  _   <- kp.publicKey.verify(Slice.of(message), sig)           // EffIO[SignatureRejected, Unit]
+  _   <- kp.publicKey.verify(Slice.of(message), sig)           // Eff[SignatureRejected, Unit]
 yield ()
 ```
 
@@ -101,12 +101,12 @@ Nothing here reads a clock: sign and verify take the instant (epoch seconds) fro
 import kufuli.jose.*
 
 val claims = JWT.Claims.empty.subject("user-1").audience("api").expiresIn(1.hour)
-val policy = JWT.Policy("api", Set(ES256, EdDSA))
+val policy = JWT.Policy("api", ES256, EdDSA)
 
 for
   kp    <- P256.generate
   token <- JWT.sign(claims, ES256, "key-1", now)(kp.privateKey) // only accepts a P-256 private key
-  who   <- JWT.verify(token.compact, jwks, policy, now)         // EffIO[JWT.Rejected, JWT.Verified]
+  who   <- JWT.verify(token.compact, jwks, policy, now)         // Eff[JWT.Rejected, JWT.Verified]
 yield who
 ```
 

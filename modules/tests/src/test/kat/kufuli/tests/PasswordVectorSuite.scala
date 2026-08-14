@@ -78,4 +78,32 @@ class PasswordVectorSuite extends munit.CatsEffectSuite:
       _ <- check(bad == PasswordCheck.Rejected, "wrong password rejected cross-backend")
     yield ()
   }
+  test("a stored PHC column has exactly one spelling") {
+    val ok = jvmProducedPhc
+    assert(PasswordHash.of(ok).isRight, "the canonical column parses")
+    assert(PasswordHash.of(ok + "$").isLeft, "a trailing separator is not a second spelling of it")
+    assert(PasswordHash.of(ok.replace("m=512,", "m=512,x=9,")).isLeft, "an unknown parameter is refused")
+    assert(PasswordHash.of(ok.replace("m=512,", "m=512,m=8,")).isLeft, "a repeated one leaves the cost to the reader")
+    assert(PasswordHash.of(ok.replace("m=512,t=3,p=1", "t=3,m=512,p=1")).isLeft, "and so does a reordered list")
+    assert(PasswordHash.of(ok.replace("m=512", "m=0512")).isLeft, "a non-canonical decimal is refused")
+    assert(PasswordHash.of(ok.dropRight(4)).isLeft, "a tag of another width could never match a recomputation")
+    assert(PasswordHash.of(ok) == PasswordHash.of(ok), "one column compares equal to itself")
+  }
+
+  test("a stored PHC column with a salt no conformant hasher produces is refused at parse") {
+    val short = "$argon2id$v=19$m=512,t=3,p=1$AgICAgIC$zJ3cVXILOjRG0mQdTE5AQYvj4vQBlDsS8e0/JD7VIXA"
+    val floor = "$argon2id$v=19$m=512,t=3,p=1$AgICAgICAgI$zJ3cVXILOjRG0mQdTE5AQYvj4vQBlDsS8e0/JD7VIXA"
+    assert(PasswordHash.of(short).isLeft, "a 6-byte salt is below Argon2's own minimum")
+    assert(PasswordHash.of(floor).isRight, "an 8-byte salt is at the minimum and parses")
+    assert(PasswordHash.of(jvmProducedPhc).isRight, "a 16-byte salt is unaffected")
+  }
+
+  test("Argon2 parameters are validated at their edges, not merely at the presets") {
+    assert(Argon2Params.of(8, 1, 1).isRight, "memory at exactly 8x the lane count is the floor Argon2 states")
+    assert(Argon2Params.of(7, 1, 1).isLeft, "a kibibyte below it is refused")
+    assert(Argon2Params.of(2040, 1, 255).isRight, "255 lanes is the widest the format encodes")
+    assert(Argon2Params.of(2048, 1, 256).isLeft, "256 is one past it")
+    assert(Argon2Params.of(8, 0, 1).isLeft, "a pass count of zero hashes nothing")
+    assert(Argon2Params.of(8, 1, 0).isLeft, "and no lanes is not a configuration")
+  }
 end PasswordVectorSuite

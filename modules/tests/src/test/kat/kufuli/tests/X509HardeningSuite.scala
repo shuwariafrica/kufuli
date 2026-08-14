@@ -258,34 +258,32 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
     yield ()
   }
 
-  private def gtime(value: String): Array[Byte] = tlv(0x18, ascii(value))
-  private val ocspBasicOid = oid(Array[Byte](0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01))
-  private val ocspCertId =
-    seq(oid(Array[Byte](0x2b, 0x0e, 0x03, 0x02, 0x1a)), tlv(0x04, Array[Byte](1)), tlv(0x04, Array[Byte](2)), tlv(0x02, Array[Byte](3)))
-
-  private def staple(status: Array[Byte], thisUpdate: String, nextUpdate: Option[String]): Array[Byte] =
-    val single = seq((List(ocspCertId, status, gtime(thisUpdate)) ++ nextUpdate.map(n => tlv(0xa0, gtime(n))))*)
-    val responseData = seq(tlv(0xa2, tlv(0x04, Array[Byte](1, 2, 3, 4))), gtime("20260101000000Z"), seq(single))
-    val basic = seq(responseData, seq(ocspBasicOid), tlv(0x03, Array[Byte](0, 0)))
-    seq(tlv(0x0a, Array[Byte](0)), tlv(0xa0, seq(ocspBasicOid, tlv(0x04, basic))))
-
-  test("a stapled response outside its own update window carries no Good verdict") {
-    val good = Array[Byte](0x80.toByte, 0x00)
-    val revoked = tlv(0xa1, gtime("20250601000000Z"))
+  test("the path walk spends its budget over the whole enumeration, not only over the candidates it finds") {
     for
-      root <- selfSigned("Root", List(caTrue, certSign))
-      cert <- parsed(root.der)
-      fresh <- x5.OCSP.verifyStapled(staple(good, "20260101000000Z", Some("20360101000000Z")), cert, cert, at).either
-      _ <- check(fresh == Right(x5.OCSP.Status.Good), s"a current Good staple is honoured, got $fresh")
-      expired <- x5.OCSP.verifyStapled(staple(good, "20200101000000Z", Some("20200102000000Z")), cert, cert, at).either
-      _ <- check(expired == Right(x5.OCSP.Status.Unknown), s"a Good staple past nextUpdate -> Unknown, got $expired")
-      early <- x5.OCSP.verifyStapled(staple(good, "20360101000000Z", None), cert, cert, at).either
-      _ <- check(early == Right(x5.OCSP.Status.Unknown), s"a Good staple before thisUpdate -> Unknown, got $early")
-      stale <- x5.OCSP.verifyStapled(staple(revoked, "20200101000000Z", Some("20200102000000Z")), cert, cert, at).either
-      _ <- check(stale.exists { case x5.OCSP.Status.Revoked(_) => true; case _ => false }, s"a stale Revoked still stands, got $stale")
+      unrelated <- selfSigned("Real Root", List(caTrue, certSign))
+      head <- selfSigned("Filler CA", List(caTrue, certSign))
+      leaf <- issuedBy(head, 2, "leaf", List(endEntity, san("example.com")))
+      // Every filler carries the leaf's issuer DN as its own subject and none reaches the anchor, so
+      // the walk produces no candidate at all - a ceiling on candidates never fills - while the
+      // orderings of fifteen certificates are more than any machine enumerates.
+      fillers <- (1 to 14).toList.traverse(_ => selfSigned("Filler CA", List(caTrue, certSign)))
+      result <- verify(leaf :: head :: fillers, unrelated, "example.com")
+      _ <- check(result == Left(x5.PathInvalid.LimitExceeded), s"the walk reports its own bound rather than running on, got $result")
     yield ()
     end for
   }
+
+  test("the budget does not cut a real chain short: same-DN decoys are walked past to the issuer that signed") {
+    for
+      root <- selfSigned("Root", List(caTrue, certSign))
+      decoys <- (3 to 8).toList.traverse(i => issuedBy(root, i, "Sub CA", List(caTrue, certSign)))
+      real <- issuedBy(root, 2, "Sub CA", List(caTrue, certSign))
+      leaf <- issuedBy(real, 9, "leaf", List(endEntity, san("example.com")))
+      result <- verify(leaf :: (decoys :+ real), root, "example.com")
+      _ <- check(result.isRight, s"the issuer that signed the leaf is reached past six same-DN decoys, got $result")
+    yield ()
+  }
+
   test("a certificate whose subject key kufuli cannot import still parses and says so") {
     // A DSA SubjectPublicKeyInfo (1.2.840.10040.4.1): well-formed X.509, outside kufuli's families.
     val dsaSpki =
@@ -294,13 +292,13 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
       kp <- Ed25519.generate.absolve
       der <- signed(tbsOf(9, "unsupported", "unsupported", dsaSpki, notBefore, notAfter, Nil), kp.privateKey)
       cert <- IO.fromEither(x5.Certificate.fromDer(der).left.map(e => new AssertionError(s"parse: $e")))
-      _ <- check(cert.publicKey.swap.toOption.contains(InvalidKey.Unsupported),
-                 s"unsupported SPKI reports itself, got ${cert.publicKey.isRight}"
-           )
+      unsupported <- cert.publicKey.either
+      _ <- check(unsupported == Left(InvalidKey.Unsupported), s"unsupported SPKI reports itself, got $unsupported")
       _ <- check(cert.subjectAltDns.isEmpty && cert.der.length == der.length, "the certificate stays inspectable")
       mine <- selfSigned("ok.example", List(endEntity))
       good <- IO.fromEither(x5.Certificate.fromDer(mine.der).left.map(e => new AssertionError(s"parse: $e")))
-      _ <- check(good.publicKey.isRight, "a supported SPKI yields its key")
+      supported <- good.publicKey.either
+      _ <- check(supported.isRight, s"a supported SPKI yields its key, got $supported")
     yield ()
     end for
   }

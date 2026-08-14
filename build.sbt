@@ -22,9 +22,11 @@ initialize := {
 
 formattingSettings
 
+KufuliBuild.fixtureSettings
+
 def scala3 = "3.8.4"
-val boilerplate: ModuleID = "africa.shuwari" %% "boilerplate" % "0.11.0"
-val boilerplateEffect: ModuleID = "africa.shuwari" %% "boilerplate-effect" % "0.11.0"
+val boilerplate: ModuleID = "africa.shuwari" %% "boilerplate" % "0.12.1"
+val boilerplateEffect: ModuleID = "africa.shuwari" %% "boilerplate-effect" % "0.12.1"
 val jsoniter: ModuleID = "com.github.plokhotnyuk.jsoniter-scala" %% "jsoniter-scala-core" % "2.39.1"
 val bouncycastle: ModuleID = "org.bouncycastle" % "bcprov-jdk18on" % "1.85"
 val munit: ModuleID = "org.scalameta" %% "munit" % "1.3.4"
@@ -290,6 +292,7 @@ def baseCompilerOptions = List(
   "-deprecation",
   "-feature",
   "-explain",
+  "-Wall",
   "-Wvalue-discard",
   "-Wnonunit-statement",
   "-Wunused:all",
@@ -305,11 +308,22 @@ def compilerOptions = baseCompilerOptions ++ List(
   "-Werror"
 )
 
+// `-Wall` enables `-Wtostring-interpolated`, which fires on every interpolated non-String value -
+// the shape every assertion message in the suites is built from.
+def testCompilerOptions = compilerOptions.filterNot(_ == "-Wall")
+
 def compilerSettings = List(
   Compile / compile / scalacOptions ++= compilerOptions,
-  Test / compile / scalacOptions ++= compilerOptions,
+  Test / compile / scalacOptions ++= testCompilerOptions,
   Compile / doc / scalacOptions := Nil,
   Test / doc / scalacOptions := Nil
+) ++ scalafixSourceSettings
+
+// scalafix's parser rejects the capture-checking `^` syntax outright, so the sources carrying it are
+// withheld by content; `.scalafmt.conf` withholds the same set by path.
+def scalafixSourceSettings = List(
+  Compile / scalafix / unmanagedSources := (Compile / unmanagedSources).value.filterNot(KufuliBuild.captureChecked),
+  Test / scalafix / unmanagedSources := (Test / unmanagedSources).value.filterNot(KufuliBuild.captureChecked)
 )
 
 def formattingSettings = List(
@@ -355,4 +369,7 @@ def publishSettings: List[Setting[?]] = List(
 )
 
 addCommandAlias("format", "scalafixAll; scalafmtAll; scalafmtSbt; headerCreateAll")
-addCommandAlias("check", "scalafixAll --check; scalafmtCheckAll; scalafmtSbtCheck; headerCheckAll")
+addCommandAlias(
+  "check",
+  "scalafixAll --check; scalafmtCheckAll; scalafmtSbtCheck; headerCheckAll; checkCaptureCheckedExclusions; checkCaptureEscapes"
+)

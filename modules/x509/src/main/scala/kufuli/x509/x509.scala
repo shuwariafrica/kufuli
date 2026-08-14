@@ -23,14 +23,16 @@
 package kufuli.x509
 
 import scala.annotation.tailrec
-import scala.util.control.NoStackTrace
 
 import boilerplate.Slice
-import boilerplate.effect.EffIO
+import boilerplate.TypedError
+import boilerplate.effect.Eff
+import boilerplate.effect.UEff
 
 import kufuli.*
 
-sealed abstract class X509Error(message: String) extends Exception(message) with NoStackTrace derives CanEqual
+sealed abstract class X509Error(message: String, cause: Option[Throwable]) extends TypedError(message, cause):
+  def this(message: String) = this(message, None)
 
 // Payload-free cases are a class plus a co-named object, and type positions name the CLASS: a union
 // of singleton types does not survive the TypeTest reification `either`/`catchAll` rely on.
@@ -52,6 +54,10 @@ object PathInvalid:
   case object NameConstraintViolated extends NameConstraintViolated
   sealed abstract class LimitExceeded private[x509] () extends PathInvalid("certificate path exceeds a validation resource bound")
   case object LimitExceeded extends LimitExceeded
+  sealed abstract class UnsupportedAlgorithm private[x509] () extends PathInvalid("signature algorithm not supported")
+  case object UnsupportedAlgorithm extends UnsupportedAlgorithm
+  sealed abstract class ResponseMismatch private[x509] () extends PathInvalid("status response does not match the certificate")
+  case object ResponseMismatch extends ResponseMismatch
 end PathInvalid
 
 // Every GeneralName a certificate presents. The four forms RFC 5280 defines no matching rule for
@@ -73,6 +79,7 @@ final private[x509] case class Parsed(
   encoded: IArray[Byte],
   hash: Int,
   tbs: Array[Byte],
+  serial: Array[Byte],
   spki: Array[Byte],
   issuerDer: Array[Byte],
   subjectDer: Array[Byte],
@@ -140,11 +147,12 @@ private[x509] object X509:
   // EKU purpose OIDs.
   val ekuServerAuth = "1.3.6.1.5.5.7.3.1"
   val ekuClientAuth = "1.3.6.1.5.5.7.3.2"
+  val ekuOcspSigning = "1.3.6.1.5.5.7.3.9"
 
   private def eq(a: Slice, b: Array[Byte]): Boolean = a.contentEquals(Slice.of(b))
 
   // The whole AlgorithmIdentifier, because RSASSA-PSS carries its digest in the parameters.
-  private def sigScheme(s: Slice, algId: Der.Tlv): Option[SigScheme] =
+  private[x509] def sigScheme(s: Slice, algId: DER.Tlv): Option[SigScheme] =
     read(s, algId.contentOff, 0x06, algId.next).toOption.flatMap { t =>
       val oid = s.slice(t.contentOff, t.next)
       if eq(oid, ed25519) then Some(SigScheme.Ed)
@@ -158,8 +166,8 @@ private[x509] object X509:
       else None
     }
 
-  private def hashOid(s: Slice, algId: Der.Tlv): Option[Sha2] =
-    read(s, algId.contentOff, 0x06, algId.next).toOption.flatMap { t =>
+  private def hashOid(s: Slice, algId: DER.Tlv): Option[Sha2] =
+    read(s, algId.contentOff, 0x06, algId.next).toOption.flatMap[Sha2] { t =>
       val oid = s.slice(t.contentOff, t.next)
       if eq(oid, sha256Oid) then Some(Sha256)
       else if eq(oid, sha384Oid) then Some(Sha384)
@@ -264,16 +272,16 @@ private[x509] object X509:
       go(1, 0L)
       sb.toString
 
-  private def read(der: Slice, off: Int, tag: Int): Either[PathInvalid, Der.Tlv] =
-    Der.read(der, off, tag).left.map(_ => PathInvalid.MalformedChain)
+  private def read(der: Slice, off: Int, tag: Int): Either[PathInvalid, DER.Tlv] =
+    DER.read(der, off, tag).left.map(_ => PathInvalid.MalformedChain)
 
   // The core reader bounds a TLV by the whole buffer, not by the structure that contains it, so a
   // child claiming a length past its parent would otherwise read a sibling's bytes as its own.
-  private def read(der: Slice, off: Int, tag: Int, limit: Int): Either[PathInvalid, Der.Tlv] =
+  private def read(der: Slice, off: Int, tag: Int, limit: Int): Either[PathInvalid, DER.Tlv] =
     read(der, off, tag).filterOrElse(_.next <= limit, PathInvalid.MalformedChain)
 
   // One TLV occupying the whole slice, for extension values, which carry exactly one encoding.
-  private def only(der: Slice, tag: Int): Either[PathInvalid, Der.Tlv] =
+  private def only(der: Slice, tag: Int): Either[PathInvalid, DER.Tlv] =
     read(der, 0, tag).filterOrElse(_.next == der.length, PathInvalid.MalformedChain)
 
   private def wellFormed(ok: Boolean): Either[PathInvalid, Unit] =
@@ -300,6 +308,7 @@ private[x509] object X509:
       encoded = der,
       hash = Parsed.hashOf(der, 0, 1),
       tbs = s.slice(cert.contentOff, tbs.next).toArray,
+      serial = fields.serial,
       spki = fields.spki,
       issuerDer = fields.issuerDer,
       subjectDer = fields.subjectDer,
@@ -323,6 +332,7 @@ private[x509] object X509:
   // Array[Byte] and notBefore/notAfter both Long, so a positional slip would type-check and break
   // chain linking or invert the validity window silently.
   private type TbsFields = (
+    serial: Array[Byte],
     issuerDer: Array[Byte],
     subjectDer: Array[Byte],
     subjectRange: (from: Int, until: Int),
@@ -331,13 +341,13 @@ private[x509] object X509:
     notBefore: Long,
     notAfter: Long,
     spki: Array[Byte],
-    exts: Option[Der.Tlv]
+    exts: Option[DER.Tlv]
   )
 
   // Version is [0] EXPLICIT and absent for v1. RFC 5280 section 4.1.2.1 admits 0, 1 and 2, but DER
   // omits a DEFAULT value, so a present [0] encoding v1 is an alternative encoding of the same
   // certificate.
-  private def afterVersion(s: Slice, tbs: Der.Tlv): Either[PathInvalid, (next: Int, version: Option[Int])] =
+  private def afterVersion(s: Slice, tbs: DER.Tlv): Either[PathInvalid, (next: Int, version: Option[Int])] =
     if tbs.contentOff < tbs.next && (s(tbs.contentOff) & 0xff) == 0xa0 then
       for
         wrapper <- read(s, tbs.contentOff, 0xa0, tbs.next)
@@ -348,7 +358,7 @@ private[x509] object X509:
       yield (next = wrapper.next, version = Some(n))
     else Right((next = tbs.contentOff, version = None))
 
-  private def tbsFields(s: Slice, tbs: Der.Tlv): Either[PathInvalid, TbsFields] =
+  private def tbsFields(s: Slice, tbs: DER.Tlv): Either[PathInvalid, TbsFields] =
     for
       start <- afterVersion(s, tbs)
       serial <- read(s, start.next, 0x02, tbs.next)
@@ -360,6 +370,7 @@ private[x509] object X509:
       times <- parseValidity(s, validity)
       exts <- scanExtensions(s, spki.next, tbs.next)
     yield (
+      serial = s.slice(serial.contentOff, serial.next).toArray,
       issuerDer = s.slice(sigAlgId.next, issuer.next).toArray,
       subjectDer = s.slice(validity.next, subject.next).toArray,
       subjectRange = (from = validity.next, until = subject.next),
@@ -373,7 +384,7 @@ private[x509] object X509:
     end for
   end tbsFields
 
-  private def parseValidity(s: Slice, validity: Der.Tlv): Either[PathInvalid, (notBefore: Long, notAfter: Long)] =
+  private def parseValidity(s: Slice, validity: DER.Tlv): Either[PathInvalid, (notBefore: Long, notAfter: Long)] =
     def time(off: Int): Either[PathInvalid, (epoch: Long, next: Int)] =
       if off >= validity.next then Left(PathInvalid.MalformedChain)
       else
@@ -395,7 +406,7 @@ private[x509] object X509:
   // optional. `None` is a certificate that carries no extensions; an unreadable TLV is a rejection,
   // because reading past it drops every extension the certificate does carry - a leaf's EKU and SAN
   // included.
-  @tailrec private def scanExtensions(s: Slice, start: Int, end: Int): Either[PathInvalid, Option[Der.Tlv]] =
+  @tailrec private def scanExtensions(s: Slice, start: Int, end: Int): Either[PathInvalid, Option[DER.Tlv]] =
     if start >= end then Right(None)
     else
       val tag = s(start) & 0xff
@@ -424,7 +435,7 @@ private[x509] object X509:
   // Extension ::= SEQUENCE { extnID OID, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING }.
   // Every failure is a rejection: a partial parse leaves an empty EKU list or an absent path-length
   // constraint, both of which read as "unrestricted".
-  private def extensions(s: Slice, exts: Option[Der.Tlv]): Either[PathInvalid, Extensions] =
+  private def extensions(s: Slice, exts: Option[DER.Tlv]): Either[PathInvalid, Extensions] =
     val empty =
       Extensions(san = None, isCa = None, maxPathLen = None, ekus = Nil, keyCertSign = None, constraints = None, unhandledCritical = false)
     exts match
@@ -478,7 +489,7 @@ private[x509] object X509:
 
   // IA5String is 7-bit: decoding a high byte as US-ASCII substitutes a replacement character, which
   // folds two distinct names onto one string.
-  private def ia5(s: Slice, t: Der.Tlv): Option[String] =
+  private def ia5(s: Slice, t: DER.Tlv): Option[String] =
     val raw = s.slice(t.contentOff, t.next).toArray
     if raw.forall(_ >= 0) then Some(new String(raw, "US-ASCII")) else None
 
@@ -512,7 +523,7 @@ private[x509] object X509:
     end for
   end parseSan
 
-  private def sanEntry(s: Slice, tag: Int, t: Der.Tlv, acc: San): Either[PathInvalid, San] =
+  private def sanEntry(s: Slice, tag: Int, t: DER.Tlv, acc: San): Either[PathInvalid, San] =
     // RFC 5280 section 4.2.1.6 gives no meaning to a zero-length GeneralName; reading one as a name
     // that matches nothing, or everything, is the choice Go's CVE-2026-27138 made.
     if t.contentLen == 0 then Left(PathInvalid.MalformedChain)
@@ -576,7 +587,7 @@ private[x509] object X509:
         case Left(e)  => Left(e)
         case Right(t) => subtrees(s, t.next, limit, count + 1, t.acc)
 
-  private def subtreeBase(s: Slice, tag: Int, t: Der.Tlv, acc: Subtrees): Either[PathInvalid, Subtrees] =
+  private def subtreeBase(s: Slice, tag: Int, t: DER.Tlv, acc: Subtrees): Either[PathInvalid, Subtrees] =
     tag match
       case 0x82 => ia5(s, t).filter(Names.validDnsBase).toRight(PathInvalid.MalformedChain).map(b => acc.copy(dns = b :: acc.dns))
       case 0x87 => ipSubtree(s, t).map(sub => acc.copy(ips = sub :: acc.ips))
@@ -594,7 +605,7 @@ private[x509] object X509:
     at < 0 || base.indexOf('@', at + 1) < 0
 
   // The address and its mask, as one value of twice the family's width.
-  private def ipSubtree(s: Slice, t: Der.Tlv): Either[PathInvalid, IpSubtree] =
+  private def ipSubtree(s: Slice, t: DER.Tlv): Either[PathInvalid, IpSubtree] =
     val raw = s.slice(t.contentOff, t.next)
     if raw.length != 8 && raw.length != 32 then Left(PathInvalid.MalformedChain)
     else
@@ -654,7 +665,7 @@ private[x509] object X509:
   end parseBasicConstraints
 
   // A small non-negative DER INTEGER (pathLenConstraint is 0..a handful); reject negative/oversize.
-  private def smallInteger(s: Slice, t: Der.Tlv): Option[Int] =
+  private def smallInteger(s: Slice, t: DER.Tlv): Option[Int] =
     val raw = s.slice(t.contentOff, t.next).toArray
     // A padding octet a minimal encoding would not carry is a second encoding of the same value,
     // which is how two readers of one certificate are made to disagree about a version or a length.
@@ -685,22 +696,6 @@ private[x509] object X509:
   private val maxNames = 4096
   private val maxSubtrees = 4096
 
-  // The generation floor (RFC 7518 section 3.3, "2048 bits or larger MUST be used") applied to the
-  // import side: a certificate key below it has no scheme here, so it never reaches a backend.
-  private val minRsaModulusBits = 2048
-
-  private def rsaModulusBits(spki: Array[Byte]): Option[Int] =
-    @tailrec def width(v: Int, acc: Int): Int = if v == 0 then acc else width(v >>> 1, acc + 1)
-    (for
-      key <- Der.spkiPublicBits(Slice.of(spki))
-      seq <- Der.read(key, 0, 0x30)
-      modulus <- Der.read(key, seq.contentOff, 0x02).filterOrElse(_.next <= seq.next, InvalidKey.Malformed)
-    yield
-      val leading = if modulus.contentLen > 0 && key(modulus.contentOff) == 0.toByte then 1 else 0
-      val octets = modulus.contentLen - leading
-      if octets <= 0 then 0 else (octets - 1) * 8 + width(key(modulus.contentOff + leading) & 0xff, 0)
-    ).toOption
-
   // Subject-DN emailAddress values, for the rfc822Name fallback. A non-IA5 value cannot be a
   // mailbox, so it is dropped rather than decoded into one.
   def emailAttributes(subject: List[List[Ava]]): List[String] =
@@ -708,32 +703,21 @@ private[x509] object X509:
       case a if Names.bytesEqual(a.oid, oidEmailAddress) && a.content.forall(_ >= 0) => new String(a.content, "US-ASCII")
     }
 
-  // The families kufuli implements, with the modulus floor applied to RSA. Everything else an
-  // import checks - the point being on its curve, the encoding being whole, a low-order X25519
-  // point - is backend work over the whole blob, which is why the accessor below is a peek and the
-  // verification path imports for real.
-  private def supported(spki: Array[Byte]): Option[Der.Alg] =
-    Der.peekSpki(Slice.of(spki)).toOption.filter {
-      case Der.Alg.OfRsa => rsaModulusBits(spki).exists(_ >= minRsaModulusBits)
-      case _             => true
-    }
+  // Every key a certificate yields. A peer supplies the encoding, and a backend that meets an
+  // unvalidated key inside its own call reports a defect rather than a typed outcome - node does
+  // exactly that for a point off its curve - so the import has to happen before the key is handed
+  // out, `agree` having no channel to carry a refusal at all. Every arm returned here is the import's
+  // own verdict, so this accessor and the core door cannot name one encoding differently.
+  def verifyingKey(spki: Array[Byte]): Eff[InvalidKey, ImportedPublicKey] =
+    PublicKey.fromSpki(Slice.of(spki))
 
-  def issuerKey(spki: Array[Byte]): Option[ImportedPublicKey] =
-    supported(spki).map {
-      case Der.Alg.Ed     => ImportedPublicKey.Ed(PublicKey.unsafe(keyRepr(spki)))
-      case Der.Alg.X      => ImportedPublicKey.X(PublicKey.unsafe(keyRepr(spki)))
-      case Der.Alg.EcP256 => ImportedPublicKey.EcP256(PublicKey.unsafe(keyRepr(spki)))
-      case Der.Alg.EcP384 => ImportedPublicKey.EcP384(PublicKey.unsafe(keyRepr(spki)))
-      case Der.Alg.EcP521 => ImportedPublicKey.EcP521(PublicKey.unsafe(keyRepr(spki)))
-      case Der.Alg.OfRsa  => ImportedPublicKey.OfRsa(PublicKey.unsafe(keyRepr(spki)))
-    }
-
-  // The issuer key a signature is checked with, imported through the backend rather than wrapped. A
-  // peer supplies this encoding, and a backend that meets an unvalidated key inside its own verify
-  // call reports a defect rather than a rejected signature - node does exactly that for a point off
-  // its curve - which would put a raise on a path whose channel is PathInvalid.
-  def verifyingKey(spki: Array[Byte]): EffIO[InvalidKey, ImportedPublicKey] =
-    EffIO.from(supported(spki).toRight(InvalidKey.Unsupported)).flatMap(_ => PublicKey.fromSpki(Slice.of(spki)))
+  // BadSignature is reserved for a verification that ran and failed, which is the only outcome an
+  // auditor can read as a forgery signal; a key that will not import means none ran. The match is
+  // exhaustive, so a new InvalidKey arm is a compile error here.
+  def keyFailure(reason: InvalidKey): PathInvalid = reason match
+    case InvalidKey.Unsupported => PathInvalid.UnsupportedAlgorithm
+    case InvalidKey.Malformed | InvalidKey.NotOnCurve | InvalidKey.WeakPoint | InvalidKey.WrongLength(_, _) =>
+      PathInvalid.MalformedChain
 end X509
 
 /** An X.509 certificate, parsed once at construction; construct and read via
@@ -783,14 +767,12 @@ object Certificate:
     private[x509] def parsed: Parsed = cert
     def der: IArray[Byte] = cert.parsed.encoded
 
-    /** The subject public key, or [[InvalidKey.Unsupported]] where the SPKI names an algorithm
-      * kufuli does not implement or carries an RSA modulus below 2048 bits.
-      *
-      * The key is read from the encoding rather than imported, so an encoding a backend refuses - a
-      * point that is not on its curve - is reported when the key is used, not here.
+    /** The subject public key, imported through the backend, so what it yields is a key every
+      * operation can be handed: [[InvalidKey.Unsupported]] names an algorithm kufuli does not
+      * implement or an RSA modulus below 2048 bits, and the remaining cases report the encoding the
+      * backend refused.
       */
-    def publicKey: Either[InvalidKey, ImportedPublicKey] =
-      X509.issuerKey(cert.parsed.spki).toRight(InvalidKey.Unsupported)
+    def publicKey: Eff[InvalidKey, ImportedPublicKey] = X509.verifyingKey(cert.parsed.spki)
 
     /** Start of the validity window, as epoch seconds. */
     def notBefore: Long = cert.parsed.notBefore
@@ -860,7 +842,7 @@ private[x509] enum PathPurpose derives CanEqual:
   case ServerAuth, ClientAuth
 
 /** A validated leaf together with the intermediates it was presented with. */
-final case class VerifiedPath(leaf: Certificate, chain: List[Certificate])
+final case class VerifiedPath(leaf: Certificate, chain: List[Certificate]) derives CanEqual
 
 /** RFC 5280 path validation for the TLS profile, at a caller-supplied instant in epoch seconds -
   * kufuli reads no clock. Chain building, the validity window, basic constraints, key usage,
@@ -876,11 +858,11 @@ final case class VerifiedPath(leaf: Certificate, chain: List[Certificate])
   */
 object CertPath:
   /** Validates `chain`, leaf first, against `id` - the name the connection was made to. */
-  def verify(chain: List[Certificate], anchors: TrustAnchors, at: Long, id: ServerId): EffIO[PathInvalid, VerifiedPath] =
+  def verify(chain: List[Certificate], anchors: TrustAnchors, at: Long, id: ServerId): Eff[PathInvalid, VerifiedPath] =
     run(chain, anchors, at, Some(id), PathPurpose.ServerAuth)
 
   /** Validates a client chain for mTLS; the identity is read off the verified leaf afterwards. */
-  def verifyClient(chain: List[Certificate], anchors: TrustAnchors, at: Long): EffIO[PathInvalid, VerifiedPath] =
+  def verifyClient(chain: List[Certificate], anchors: TrustAnchors, at: Long): Eff[PathInvalid, VerifiedPath] =
     run(chain, anchors, at, None, PathPurpose.ClientAuth)
 
   private def run(
@@ -889,9 +871,9 @@ object CertPath:
     at: Long,
     id: Option[ServerId],
     purpose: PathPurpose
-  ): EffIO[PathInvalid, VerifiedPath] =
+  ): Eff[PathInvalid, VerifiedPath] =
     chain match
-      case Nil                   => EffIO.fail(PathInvalid.MalformedChain)
+      case Nil                   => Eff.fail(PathInvalid.MalformedChain)
       case leaf :: intermediates =>
         engine
           .validate(engine.paths(leaf, intermediates, anchors), at, id, purpose)
@@ -900,9 +882,12 @@ end CertPath
 
 private object engine:
   private val maxDepth = 16
-  // An attacker supplies the intermediate pool, and same-DN certificates permute factorially, so the
-  // candidate enumeration is capped rather than merely depth-bounded.
   private val maxCandidates = 8
+
+  // The ceiling is on edges FOLLOWED across the whole walk, not on candidates found: an attacker
+  // supplies the intermediate pool, same-DN certificates permute factorially, and a pool reaching no
+  // anchor yields no candidates for a candidate ceiling to bind on.
+  private val maxSteps = 128
 
   // OpenSSL's NAME_CHECK_MAX. The constraint walk is names x accumulated subtrees and an attacker
   // supplies both sides, so the product is what needs a ceiling.
@@ -910,41 +895,47 @@ private object engine:
 
   private def bytesEq(a: Array[Byte], b: Array[Byte]): Boolean = Slice.of(a).contentEquals(Slice.of(b))
 
-  // Candidate paths leaf-first, anchor last, produced lazily. Linking is by subject/issuer DN alone,
-  // and a CA key rollover reuses the DN across two certificates, so committing to the first match
-  // would fail a chain that a later match verifies.
-  def paths(leaf: Certificate, intermediates: List[Certificate], anchors: TrustAnchors): Iterator[List[Certificate]] =
-    def go(current: Certificate, pool: List[Certificate], acc: List[Certificate], depth: Int): Iterator[List[Certificate]] =
-      if depth > maxDepth then Iterator.empty
+  // `bounded` separates a walk that reached no anchor from one stopped before it could: the two are
+  // different verdicts about the chain.
+  private type Walk = (found: List[List[Certificate]], steps: Int, bounded: Boolean)
+
+  // Candidate paths leaf-first, anchor last, in the order the walk meets them. Linking is by
+  // subject/issuer DN alone, and a CA key rollover reuses the DN across two certificates, so
+  // committing to the first match would fail a chain that a later match verifies.
+  def paths(leaf: Certificate, intermediates: List[Certificate], anchors: TrustAnchors): Walk =
+    def go(current: Certificate, pool: List[Certificate], acc: List[Certificate], depth: Int, state: Walk): Walk =
+      val issuer = current.parsed.issuerDer
+      val walked = (current :: acc).reverse
+      val reached = anchors.anchors.foldLeft(state) { (s, anchor) =>
+        if s.found.sizeIs >= maxCandidates || !bytesEq(anchor.parsed.subjectDer, issuer) then s
+        else (found = s.found :+ (walked ::: List(anchor)), steps = s.steps, bounded = s.bounded)
+      }
+      if depth >= maxDepth then reached
       else
-        val issuer = current.parsed.issuerDer
-        val walked = (current :: acc).reverse
-        val terminal = anchors.anchors.iterator.filter(a => bytesEq(a.parsed.subjectDer, issuer)).map(a => walked ::: List(a))
-        val deeper = pool.iterator
-          .filter(c => bytesEq(c.parsed.subjectDer, issuer))
-          .flatMap(next => go(next, pool.filterNot(_ == next), current :: acc, depth + 1))
-        terminal ++ deeper
-    if anchors.anchors.exists(_ == leaf) then Iterator(List(leaf))
-    else go(leaf, intermediates, Nil, 0)
+        pool.foldLeft(reached) { (s, next) =>
+          if s.found.sizeIs >= maxCandidates || !bytesEq(next.parsed.subjectDer, issuer) then s
+          else if s.steps <= 0 then (found = s.found, steps = s.steps, bounded = true)
+          else go(next, pool.filterNot(_ == next), current :: acc, depth + 1, (found = s.found, steps = s.steps - 1, bounded = s.bounded))
+        }
+    end go
+    if anchors.anchors.exists(_ == leaf) then (found = List(List(leaf)), steps = maxSteps, bounded = false)
+    else go(leaf, intermediates, Nil, 0, (found = Nil, steps = maxSteps, bounded = false))
   end paths
 
   // The first candidate's failure is the one reported: it is the path the chain was assembled for,
-  // so its error describes what the peer actually presented.
-  def validate(
-    candidates: Iterator[List[Certificate]],
-    at: Long,
-    id: Option[ServerId],
-    purpose: PathPurpose
-  ): EffIO[PathInvalid, Unit] =
-    def go(rest: List[List[Certificate]], first: Option[PathInvalid]): EffIO[PathInvalid, Unit] =
+  // so its error describes what the peer actually presented. A walk the budget cut short reports the
+  // bound, because an absent anchor is a fact it did not establish.
+  def validate(walk: Walk, at: Long, id: Option[ServerId], purpose: PathPurpose): Eff[PathInvalid, Unit] =
+    def exhausted: PathInvalid = if walk.bounded then PathInvalid.LimitExceeded else PathInvalid.UntrustedAnchor
+    def go(rest: List[List[Certificate]], first: Option[PathInvalid]): Eff[PathInvalid, Unit] =
       rest match
-        case Nil          => EffIO.fail(first.getOrElse(PathInvalid.UntrustedAnchor))
+        case Nil          => Eff.fail(first.getOrElse(exhausted))
         case path :: tail => check(path, at, id, purpose).catchAll(e => go(tail, first.orElse(Some(e))))
-    go(candidates.take(maxCandidates).toList, None)
+    go(walk.found, None)
 
-  private def check(path: List[Certificate], at: Long, id: Option[ServerId], purpose: PathPurpose): EffIO[PathInvalid, Unit] =
+  private def check(path: List[Certificate], at: Long, id: Option[ServerId], purpose: PathPurpose): Eff[PathInvalid, Unit] =
     path match
-      case Nil          => EffIO.fail(PathInvalid.MalformedChain)
+      case Nil          => Eff.fail(PathInvalid.MalformedChain)
       case leaf :: rest =>
         // RFC 5280 numbers the path [1..n] with the trust anchor outside it, so the anchor is
         // qualified rather than validated. The peer certificate never leaves the checked set: a
@@ -953,16 +944,16 @@ private object engine:
         val checked = if rest.isEmpty then path else path.init
         val intermediates = checked.drop(1)
         val issuing = rest.nonEmpty
-        if path.exists(c => at < c.notBefore || at > c.notAfter) then EffIO.fail(PathInvalid.Expired)
-        else if path.exists(_.parsed.unhandledCritical) then EffIO.fail(PathInvalid.ConstraintViolated)
-        else if intermediates.exists(c => !c.parsed.isCa.contains(true)) then EffIO.fail(PathInvalid.ConstraintViolated)
-        else if intermediates.exists(_.parsed.keyCertSign.contains(false)) then EffIO.fail(PathInvalid.ConstraintViolated)
-        else if issuing && !anchorQualifies(terminus) then EffIO.fail(PathInvalid.ConstraintViolated)
-        else if checked.exists(constrainsWithoutAuthority) then EffIO.fail(PathInvalid.ConstraintViolated)
-        else if pathLenExceeded(rest) then EffIO.fail(PathInvalid.ConstraintViolated)
-        else if !checked.forall(c => ekuAllows(c.parsed.ekus, purpose)) then EffIO.fail(PathInvalid.ConstraintViolated)
-        else if !nameOk(leaf, id) then EffIO.fail(PathInvalid.NameMismatch)
-        else verifyChain(leaf, rest).flatMap(_ => EffIO.from(constrained(path, id)))
+        if path.exists(c => at < c.notBefore || at > c.notAfter) then Eff.fail(PathInvalid.Expired)
+        else if path.exists(_.parsed.unhandledCritical) then Eff.fail(PathInvalid.ConstraintViolated)
+        else if intermediates.exists(c => !c.parsed.isCa.contains(true)) then Eff.fail(PathInvalid.ConstraintViolated)
+        else if intermediates.exists(_.parsed.keyCertSign.contains(false)) then Eff.fail(PathInvalid.ConstraintViolated)
+        else if issuing && !anchorQualifies(terminus) then Eff.fail(PathInvalid.ConstraintViolated)
+        else if checked.exists(constrainsWithoutAuthority) then Eff.fail(PathInvalid.ConstraintViolated)
+        else if pathLenExceeded(rest) then Eff.fail(PathInvalid.ConstraintViolated)
+        else if !checked.forall(c => ekuAllows(c.parsed.ekus, purpose)) then Eff.fail(PathInvalid.ConstraintViolated)
+        else if !nameOk(leaf, id) then Eff.fail(PathInvalid.NameMismatch)
+        else verifyChain(leaf, rest).flatMap(_ => Eff.from(constrained(path, id)))
   end check
 
   // RFC 5937 section 3.1: an anchor is qualified by what it declares, and an anchor that declares
@@ -1095,36 +1086,36 @@ private object engine:
         !nc.excluded.emails.exists(Names.emailWithin(name, _))
     )
 
-  private def verifyChain(leaf: Certificate, issuers: List[Certificate]): EffIO[PathInvalid, Unit] =
+  private def verifyChain(leaf: Certificate, issuers: List[Certificate]): Eff[PathInvalid, Unit] =
     // each cert (subject) is signed by the next (issuer); the anchor terminates the walk
     val pairs = (leaf :: issuers).zip(issuers)
-    pairs.foldLeft(EffIO.succeed(()): EffIO[PathInvalid, Unit]) { (acc, pair) =>
+    pairs.foldLeft(Eff.succeed(()): Eff[PathInvalid, Unit]) { (acc, pair) =>
       val (subject, issuer) = pair
       acc.flatMap(_ => verifyOne(subject, issuer))
     }
 
-  private def verifyOne(subject: Certificate, issuer: Certificate): EffIO[PathInvalid, Unit] =
+  private def verifyOne(subject: Certificate, issuer: Certificate): Eff[PathInvalid, Unit] =
     val sub = subject.parsed
     sub.sigScheme match
-      case None         => EffIO.fail(PathInvalid.BadSignature)
+      case None         => Eff.fail(PathInvalid.UnsupportedAlgorithm)
       case Some(scheme) =>
         X509
           .verifyingKey(issuer.parsed.spki)
-          .mapError(_ => PathInvalid.BadSignature)
+          .mapError(X509.keyFailure)
           .flatMap(key => verifyBy(scheme, key, Slice.of(sub.tbs), sub.signature).mapError(_ => PathInvalid.BadSignature))
 
-  private def verifyBy(scheme: SigScheme, key: ImportedPublicKey, tbs: Slice, sig: Array[Byte]): EffIO[SignatureRejected, Unit] =
+  private[x509] def verifyBy(scheme: SigScheme, key: ImportedPublicKey, tbs: Slice, sig: Array[Byte]): Eff[SignatureRejected, Unit] =
     (scheme, key) match
       case (SigScheme.Ed, ImportedPublicKey.Ed(k)) =>
-        EffIO.from(Signature.fromRaw(Ed25519)(sig)).mapError(_ => SignatureRejected).flatMap(s => k.verify(tbs, s))
-      case (SigScheme.Ec(h), ImportedPublicKey.EcP256(k))      => ecVerify(P256, k, tbs, sig, h)
-      case (SigScheme.Ec(h), ImportedPublicKey.EcP384(k))      => ecVerify(P384, k, tbs, sig, h)
-      case (SigScheme.Ec(h), ImportedPublicKey.EcP521(k))      => ecVerify(P521, k, tbs, sig, h)
-      case (SigScheme.RsaPkcs1(h), ImportedPublicKey.OfRsa(k)) =>
-        EffIO.from(Signature.fromRaw(Rsa)(sig)).mapError(_ => SignatureRejected).flatMap(s => k.verify(tbs, s, kufuli.RsaPkcs1(h)))
-      case (SigScheme.RsaPss(h), ImportedPublicKey.OfRsa(k)) =>
-        EffIO.from(Signature.fromRaw(Rsa)(sig)).mapError(_ => SignatureRejected).flatMap(s => k.verify(tbs, s, kufuli.RsaPss(h)))
-      case _ => EffIO.fail(SignatureRejected)
+        Eff.from(Signature.fromRaw(Ed25519)(sig)).mapError(_ => SignatureRejected).flatMap(s => k.verify(tbs, s))
+      case (SigScheme.Ec(h), ImportedPublicKey.EcP256(k))    => ecVerify(P256, k, tbs, sig, h)
+      case (SigScheme.Ec(h), ImportedPublicKey.EcP384(k))    => ecVerify(P384, k, tbs, sig, h)
+      case (SigScheme.Ec(h), ImportedPublicKey.EcP521(k))    => ecVerify(P521, k, tbs, sig, h)
+      case (SigScheme.RsaPkcs1(h), ImportedPublicKey.Rsa(k)) =>
+        Eff.from(Signature.fromRaw(RSA)(sig)).mapError(_ => SignatureRejected).flatMap(s => k.verify(tbs, s, kufuli.RsaPkcs1(h)))
+      case (SigScheme.RsaPss(h), ImportedPublicKey.Rsa(k)) =>
+        Eff.from(Signature.fromRaw(RSA)(sig)).mapError(_ => SignatureRejected).flatMap(s => k.verify(tbs, s, kufuli.RsaPss(h)))
+      case _ => Eff.fail(SignatureRejected)
 
   private def ecVerify[C <: EcCurve](
     curve: EcSpec[C],
@@ -1132,8 +1123,8 @@ private object engine:
     tbs: Slice,
     sig: Array[Byte],
     hash: Sha2
-  )(using Verifier[C]): EffIO[SignatureRejected, Unit] =
-    EffIO.from(Signature.fromDer(curve)(sig)).mapError(_ => SignatureRejected).flatMap(s => key.verify(tbs, s, hash))
+  )(using Verifying[C]): Eff[SignatureRejected, Unit] =
+    Eff.from(Signature.fromDer(curve)(sig)).mapError(_ => SignatureRejected).flatMap(s => key.verify(tbs, s, hash))
 end engine
 
 /** Verifies a stapled OCSP response the caller supplies (from the TLS handshake). No network I/O is
@@ -1145,50 +1136,43 @@ object OCSP:
     case Revoked(at: Long)
     case Unknown
 
-  /** Reads the first single-response certStatus from a stapled OCSP response, reporting `Unknown`
-    * where a `Good` falls outside the response's own thisUpdate/nextUpdate window at `at`.
+  /** The certificate status a stapled OCSP response asserts about `leaf`, once the response is
+    * shown to come from a responder `issuer` authorises and to carry an entry naming `leaf` under
+    * `issuer`.
     *
-    * The response signature, producer identity, nonce, and certID-to-leaf binding are NOT verified,
-    * so a `Good` result is advisory and MUST NOT be trusted on its own until that binding lands - a
-    * forged staple can claim any status. It exists so a genuine `Revoked` staple is honoured.
+    * The signer is `issuer` itself, or a responder `issuer` delegated: a certificate the response
+    * carries, signed by `issuer`, valid at `at`, and marked with the OCSP-signing extended key
+    * usage (RFC 6960 section 4.2.2.2). A responder may batch, so every SingleResponse is read and
+    * the one whose certID names `leaf` decides; a response carrying no such entry is
+    * [[PathInvalid.ResponseMismatch]], since it attests nothing about this certificate, and one
+    * carrying more than 64 is [[PathInvalid.LimitExceeded]] whatever it says about this leaf.
+    * [[Status.Unknown]] means the responder itself declined to answer - an `unknown` status, a
+    * responseStatus other than successful, or a `good` outside the response's own
+    * thisUpdate/nextUpdate window at `at`.
     */
-  def verifyStapled(response: Array[Byte], leaf: Certificate, issuer: Certificate, at: Long): EffIO[PathInvalid, OCSP.Status] =
-    val _ = (leaf, issuer)
-    parseStatus(response, at) match
-      case Some(s) => EffIO.succeed(s)
-      case None    => EffIO.fail(PathInvalid.MalformedChain)
+  def verifyStapled(response: Array[Byte], leaf: Certificate, issuer: Certificate, at: Long): Eff[PathInvalid, OCSP.Status] =
+    Eff.from(parseResponse(response, at)).flatMap {
+      case None    => Eff.succeed(OCSP.Status.Unknown)
+      case Some(r) =>
+        signerKeys(r, issuer, at)
+          .flatMap(keys => verifiedBy(keys, r))
+          .flatMap(_ => select(r.entries, leaf, issuer))
+          .map(entry => if entry.current then entry.status else stale(entry.status))
+    }
 
-  // OCSPResponse ::= SEQUENCE { responseStatus ENUMERATED, responseBytes [0] EXPLICIT ResponseBytes }.
-  // A responseStatus other than successful(0) carries no body; anything else is descended to the
-  // first SingleResponse's certStatus. Structural deviation is Malformed (None).
-  private def parseStatus(response: Array[Byte], at: Long): Option[OCSP.Status] =
-    if response.isEmpty then None
-    else
-      val s = Slice.of(response)
-      (for
-        outer <- Der.read(s, 0, 0x30)
-        respStatus <- Der.read(s, outer.contentOff, 0x0a)
-        code = if respStatus.contentLen > 0 then s(respStatus.contentOff) & 0xff else -1
-        status <- if code != 0 then Right(OCSP.Status.Unknown) else certStatus(s, respStatus.next, at)
-      yield status).toOption
+  // One SingleResponse: the certificate it names, the status it carries, and whether that status
+  // speaks for `at`.
+  final private case class Entry(
+    hashOid: Array[Byte],
+    issuerNameHash: Array[Byte],
+    issuerKeyHash: Array[Byte],
+    serial: Array[Byte],
+    status: OCSP.Status,
+    current: Boolean
+  )
 
-  // OCSPResponse -> responseBytes [0] -> ResponseBytes { OID, OCTET STRING } -> BasicOCSPResponse ->
-  // tbsResponseData (ResponseData) -> responses -> first SingleResponse -> certStatus. The OCTET
-  // STRING content is DER in place, so the inner reads continue over the same slice.
-  private def certStatus(s: Slice, afterStatus: Int, at: Long): Either[InvalidKey, OCSP.Status] =
-    for
-      rb <- Der.read(s, afterStatus, 0xa0) // responseBytes [0] EXPLICIT
-      rbSeq <- Der.read(s, rb.contentOff, 0x30) // ResponseBytes
-      oid <- Der.read(s, rbSeq.contentOff, 0x06) // responseType OID
-      octet <- Der.read(s, oid.next, 0x04) // response OCTET STRING (DER BasicOCSPResponse)
-      basic <- Der.read(s, octet.contentOff, 0x30) // BasicOCSPResponse
-      tbs <- Der.read(s, basic.contentOff, 0x30) // tbsResponseData (ResponseData)
-      responses <- toResponses(s, tbs)
-      single <- Der.read(s, responses.contentOff, 0x30) // first SingleResponse
-      certId <- Der.read(s, single.contentOff, 0x30) // certID
-      status <- statusTag(s, certId.next, single.next)
-      current <- fresh(s, status.next, single.next, at)
-    yield if current then status.value else stale(status.value)
+  // Everything a verified decision reads, taken in one pass over the response.
+  final private case class Basic(tbs: Slice, scheme: SigScheme, signature: Array[Byte], certs: List[Array[Byte]], entries: List[Entry])
 
   // A response outside its own validity window asserts nothing about now, so its `Good` is not
   // honoured; `Revoked` stands, since ageing does not undo a revocation.
@@ -1197,17 +1181,222 @@ object OCSP:
       case OCSP.Status.Good => OCSP.Status.Unknown
       case other            => other
 
+  // OCSPResponse ::= SEQUENCE { responseStatus ENUMERATED, responseBytes [0] EXPLICIT ResponseBytes }.
+  // A responseStatus other than successful(0) carries no body, so there is nothing to verify and
+  // `None` stands for "the responder declined".
+  private def parseResponse(response: Array[Byte], at: Long): Either[PathInvalid, Option[Basic]] =
+    if response.isEmpty then Left(PathInvalid.MalformedChain)
+    else
+      val s = Slice.of(response)
+      val outcome =
+        for
+          outer <- DER.read(s, 0, 0x30)
+          // Anything past the OCSPResponse is a second encoding of one staple, which is what lets a
+          // cache or an audit log keyed on the bytes stop identifying the response.
+          _ <- if outer.next == s.length then Right(()) else Left(InvalidKey.Malformed)
+          respStatus <- within(s, outer.contentOff, 0x0a, outer.next)
+          // The status is one octet, so a longer ENUMERATED whose first octet is zero is not a
+          // second spelling of successful(0).
+          _ <- if respStatus.contentLen == 1 then Right(()) else Left(InvalidKey.Malformed)
+        yield if (s(respStatus.contentOff) & 0xff) != 0 then None else Some((respStatus.next, outer.next))
+      outcome.left.map(_ => PathInvalid.MalformedChain).flatMap {
+        case None                => Right(None)
+        case Some((next, limit)) => basic(s, next, limit, at).map(Some(_))
+      }
+
+  // OCSPResponse -> responseBytes [0] -> ResponseBytes { OID, OCTET STRING } -> BasicOCSPResponse
+  // { tbsResponseData, signatureAlgorithm, signature BIT STRING, certs [0] EXPLICIT OPTIONAL }. The
+  // OCTET STRING content is DER in place, so the inner reads continue over the same slice.
+  // Every element is bounded by the one that contains it: the shared reader bounds a TLV by the
+  // whole buffer, so a child claiming a length past its parent would otherwise read a sibling's
+  // bytes - here, entries from outside the region the signature covers.
+  private def basic(s: Slice, afterStatus: Int, limit: Int, at: Long): Either[PathInvalid, Basic] =
+    val structure =
+      for
+        rb <- within(s, afterStatus, 0xa0, limit) // responseBytes [0] EXPLICIT
+        rbSeq <- within(s, rb.contentOff, 0x30, rb.next) // ResponseBytes
+        oid <- within(s, rbSeq.contentOff, 0x06, rbSeq.next) // responseType OID
+        octet <- within(s, oid.next, 0x04, rbSeq.next) // response OCTET STRING (DER BasicOCSPResponse)
+        basicSeq <- within(s, octet.contentOff, 0x30, octet.next) // BasicOCSPResponse
+        tbs <- within(s, basicSeq.contentOff, 0x30, basicSeq.next) // tbsResponseData (ResponseData)
+        sigAlg <- within(s, tbs.next, 0x30, basicSeq.next) // signatureAlgorithm
+        sigBits <- within(s, sigAlg.next, 0x03, basicSeq.next) // signature BIT STRING
+        _ <- if sigBits.contentLen >= 1 then Right(()) else Left(InvalidKey.Malformed)
+        certs <- responderCerts(s, sigBits.next, basicSeq.next)
+        responses <- toResponses(s, tbs)
+      yield (sigAlg = sigAlg, tbs = tbs, basicSeq = basicSeq, sigBits = sigBits, certs = certs, responses = responses)
+    structure.left.map(_ => PathInvalid.MalformedChain).flatMap { r =>
+      readEntries(s, r.responses.contentOff, r.responses.next, at, Nil).flatMap { entries =>
+        // A conforming response naming an algorithm kufuli does not implement is unsupported, not
+        // unparseable; an auditor cannot act on the two the same way.
+        X509
+          .sigScheme(s, r.sigAlg)
+          .toRight(PathInvalid.UnsupportedAlgorithm)
+          .map(scheme =>
+            Basic(
+              // The signature covers the tbsResponseData element whole, so the verified bytes start
+              // at its tag, not at its content.
+              tbs = s.slice(r.basicSeq.contentOff, r.tbs.next),
+              scheme = scheme,
+              signature = s.slice(r.sigBits.contentOff + 1, r.sigBits.next).toArray,
+              certs = r.certs,
+              entries = entries
+            )
+          )
+      }
+    }
+  end basic
+
+  // A responder may answer for many certificates in one response, so every entry is read; the cap
+  // bounds the hashing the binding search costs. Entries are read before any is selected, so a
+  // response carrying more than this is refused whole - the position of this leaf's entry within it
+  // does not matter.
+  private inline val maxEntries = 64
+
+  private def readEntries(s: Slice, off: Int, end: Int, at: Long, acc: List[Entry]): Either[PathInvalid, List[Entry]] =
+    if off >= end then Right(acc.reverse)
+    else if acc.length >= maxEntries then Left(PathInvalid.LimitExceeded)
+    else
+      val entry =
+        for
+          single <- within(s, off, 0x30, end) // SingleResponse
+          certId <- within(s, single.contentOff, 0x30, single.next) // certID
+          id <- certIdentity(s, certId)
+          status <- statusTag(s, certId.next, single.next)
+          current <- fresh(s, status.next, single.next, at)
+        yield (
+          next = single.next,
+          entry = Entry(id.hashOid, id.nameHash, id.keyHash, id.serial, status.value, current)
+        )
+      entry match
+        case Left(_)  => Left(PathInvalid.MalformedChain)
+        case Right(e) => readEntries(s, e.next, end, at, e.entry :: acc)
+
+  // RFC 6960 section 4.1.1: the certID names the certificate by the hash of its issuer's name, the
+  // hash of its issuer's public key, and its own serial. Selecting on all three is what makes a
+  // signed response about one certificate unable to answer for another; an entry whose hash
+  // algorithm kufuli does not implement cannot be shown to name `leaf` and so does not select it.
+  private def select(entries: List[Entry], leaf: Certificate, issuer: Certificate): Eff[PathInvalid, Entry] =
+    entries match
+      case Nil          => Eff.fail(PathInvalid.ResponseMismatch)
+      case head :: rest =>
+        binds(head, leaf, issuer).flatMap(matched => if matched then Eff.succeed(head) else select(rest, leaf, issuer))
+
+  private def binds(entry: Entry, leaf: Certificate, issuer: Certificate): Eff[PathInvalid, Boolean] =
+    if !Slice.of(entry.serial).contentEquals(Slice.of(leaf.parsed.serial)) then Eff.succeed(false)
+    else
+      Eff.from(DER.spkiPublicBits(Slice.of(issuer.parsed.spki))).mapError(_ => PathInvalid.MalformedChain).flatMap { keyBits =>
+        digestBy(entry.hashOid, Slice.of(leaf.parsed.issuerDer)).flatMap { nameHash =>
+          digestBy(entry.hashOid, keyBits).map { keyHash =>
+            (nameHash, keyHash) match
+              case (Some(n), Some(k)) =>
+                Slice.of(Array.from(n.bytes.iterator)).contentEquals(Slice.of(entry.issuerNameHash)) &&
+                Slice.of(Array.from(k.bytes.iterator)).contentEquals(Slice.of(entry.issuerKeyHash))
+              case _ => false
+          }
+        }
+      }
+
+  private val oidSha1 = Array[Byte](0x2b, 0x0e, 0x03, 0x02, 0x1a)
+  private val oidSha256 = Array[Byte](0x60, 0x86.toByte, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01)
+  private val oidSha384 = Array[Byte](0x60, 0x86.toByte, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02)
+  private val oidSha512 = Array[Byte](0x60, 0x86.toByte, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03)
+
+  private def digestBy(oid: Array[Byte], data: Slice): Eff[PathInvalid, Option[Digest]] =
+    val id = Slice.of(oid)
+    if id.contentEquals(Slice.of(oidSha1)) then Sha1.digest(data).map(Some(_))
+    else if id.contentEquals(Slice.of(oidSha256)) then Sha256.digest(data).map(Some(_))
+    else if id.contentEquals(Slice.of(oidSha384)) then Sha384.digest(data).map(Some(_))
+    else if id.contentEquals(Slice.of(oidSha512)) then Sha512.digest(data).map(Some(_))
+    else Eff.succeed(None)
+
+  // CertID ::= SEQUENCE { hashAlgorithm AlgorithmIdentifier, issuerNameHash OCTET STRING,
+  // issuerKeyHash OCTET STRING, serialNumber INTEGER }.
+  private def certIdentity(
+    s: Slice,
+    certId: DER.Tlv
+  ): Either[InvalidKey, (hashOid: Array[Byte], nameHash: Array[Byte], keyHash: Array[Byte], serial: Array[Byte])] =
+    for
+      algId <- within(s, certId.contentOff, 0x30, certId.next)
+      oid <- within(s, algId.contentOff, 0x06, algId.next)
+      nameHash <- within(s, algId.next, 0x04, certId.next)
+      keyHash <- within(s, nameHash.next, 0x04, certId.next)
+      serial <- within(s, keyHash.next, 0x02, certId.next)
+    yield (
+      hashOid = s.slice(oid.contentOff, oid.next).toArray,
+      nameHash = s.slice(nameHash.contentOff, nameHash.next).toArray,
+      keyHash = s.slice(keyHash.contentOff, keyHash.next).toArray,
+      serial = s.slice(serial.contentOff, serial.next).toArray
+    )
+
+  // certs [0] EXPLICIT SEQUENCE OF Certificate. A real staple carries none or one; the cap bounds
+  // the signature attempts an unauthenticated response can demand.
+  private inline val maxResponderCerts = 8
+
+  private def responderCerts(s: Slice, off: Int, end: Int): Either[InvalidKey, List[Array[Byte]]] =
+    if off >= end || (s(off) & 0xff) != 0xa0 then Right(Nil)
+    else
+      for
+        wrapper <- within(s, off, 0xa0, end)
+        list <- within(s, wrapper.contentOff, 0x30, wrapper.next)
+        certs <- readCerts(s, list.contentOff, list.next, Nil)
+      yield certs
+
+  @tailrec private def readCerts(s: Slice, off: Int, end: Int, acc: List[Array[Byte]]): Either[InvalidKey, List[Array[Byte]]] =
+    if off >= end || acc.length >= maxResponderCerts then Right(acc.reverse)
+    else
+      DER.read(s, off, 0x30) match
+        case Left(e)  => Left(e)
+        case Right(c) => readCerts(s, c.next, end, s.slice(off, c.next).toArray :: acc)
+
+  // RFC 6960 section 4.2.2.2: the responder is the issuing CA, or a certificate that CA signed and
+  // marked for OCSP signing. Anything else in `certs` is ignored, so an attacker-supplied
+  // certificate cannot become a signer by being carried along.
+  // A candidate the issuer signed but whose own key kufuli cannot import contributes no signer.
+  // That is not a rejected signature, so it never enters the signature channel.
+  private def candidateKey(spki: Array[Byte]): UEff[Option[ImportedPublicKey]] =
+    X509.verifyingKey(spki).map(Some(_)).catchAll(_ => Eff.succeed(None))
+
+  private def signerKeys(r: Basic, issuer: Certificate, at: Long): Eff[PathInvalid, List[ImportedPublicKey]] =
+    val own = X509.verifyingKey(issuer.parsed.spki).mapError(X509.keyFailure)
+    val candidates = r.certs.flatMap(der => X509.parse(IArray.from(der)).toOption).filter(c => at >= c.notBefore && at <= c.notAfter)
+    own.flatMap { issuerKey =>
+      candidates
+        // RFC 5280 section 6.1.4: a certificate marking an extension kufuli cannot process is not
+        // one to proceed past, and a delegated responder is a certificate like any other.
+        .filter(c => c.ekus.contains(X509.ekuOcspSigning) && !c.unhandledCritical)
+        .foldLeft(Eff.succeed(List(issuerKey)): Eff[PathInvalid, List[ImportedPublicKey]]) { (acc, candidate) =>
+          acc.flatMap { keys =>
+            candidate.sigScheme match
+              case None         => Eff.succeed(keys)
+              case Some(scheme) =>
+                engine
+                  .verifyBy(scheme, issuerKey, Slice.of(candidate.tbs), candidate.signature)
+                  .flatMap(_ => candidateKey(candidate.spki))
+                  .map(_.fold(keys)(_ :: keys))
+                  .catchAll(_ => Eff.succeed(keys))
+          }
+        }
+    }
+  end signerKeys
+
+  private def verifiedBy(keys: List[ImportedPublicKey], r: Basic): Eff[PathInvalid, Unit] =
+    keys
+      .map(key => engine.verifyBy(r.scheme, key, r.tbs, r.signature).mapError(_ => PathInvalid.BadSignature))
+      .reduceOption((first, next) => first.catchAll(_ => next))
+      .getOrElse(Eff.fail(PathInvalid.BadSignature))
+
   // ResponseData ::= SEQUENCE { version [0] OPTIONAL, responderID CHOICE([1] byName/[2] byKey),
   // producedAt GeneralizedTime, responses SEQUENCE OF SingleResponse, ... }.
-  private def toResponses(s: Slice, tbs: Der.Tlv): Either[InvalidKey, Der.Tlv] =
+  private def toResponses(s: Slice, tbs: DER.Tlv): Either[InvalidKey, DER.Tlv] =
     def tagAt(off: Int): Int = if off < tbs.next then s(off) & 0xff else -1
     val afterVersion =
-      if tagAt(tbs.contentOff) == 0xa0 then Der.read(s, tbs.contentOff, 0xa0).map(_.next)
+      if tagAt(tbs.contentOff) == 0xa0 then within(s, tbs.contentOff, 0xa0, tbs.next).map(_.next)
       else Right(tbs.contentOff)
     afterVersion.flatMap { av =>
       val rid = tagAt(av)
-      (if rid == 0xa1 || rid == 0xa2 then Der.read(s, av, rid).map(_.next) else Left(InvalidKey.Malformed))
-        .flatMap(ar => Der.read(s, ar, 0x18).flatMap(pa => Der.read(s, pa.next, 0x30)))
+      (if rid == 0xa1 || rid == 0xa2 then within(s, av, rid, tbs.next).map(_.next) else Left(InvalidKey.Malformed))
+        .flatMap(ar => within(s, ar, 0x18, tbs.next).flatMap(pa => within(s, pa.next, 0x30, tbs.next)))
     }
 
   // CertStatus ::= CHOICE { good [0] IMPLICIT NULL, revoked [1] IMPLICIT RevokedInfo,
@@ -1216,8 +1405,14 @@ object OCSP:
     if off >= end then Left(InvalidKey.Malformed)
     else
       (s(off) & 0xff) match
-        case 0x80 => within(s, off, 0x80, end).map(t => (value = OCSP.Status.Good, next = t.next))
-        case 0x82 => within(s, off, 0x82, end).map(t => (value = OCSP.Status.Unknown, next = t.next))
+        // good and unknown are IMPLICIT NULL, so their content is empty; a status carrying octets
+        // is a second spelling of a verdict that already has exactly one.
+        case 0x80 =>
+          within(s, off, 0x80, end).filterOrElse(_.contentLen == 0, InvalidKey.Malformed).map(t => (value = OCSP.Status.Good, next = t.next))
+        case 0x82 =>
+          within(s, off, 0x82, end)
+            .filterOrElse(_.contentLen == 0, InvalidKey.Malformed)
+            .map(t => (value = OCSP.Status.Unknown, next = t.next))
         case 0xa1 =>
           within(s, off, 0xa1, end).flatMap { info =>
             within(s, info.contentOff, 0x18, info.next).flatMap { t =>
@@ -1243,10 +1438,9 @@ object OCSP:
         else Right(None)
     yield at >= from && until.forall(at <= _)
 
-  private def generalizedTime(s: Slice, t: Der.Tlv): Either[InvalidKey, Long] =
+  private def generalizedTime(s: Slice, t: DER.Tlv): Either[InvalidKey, Long] =
     val str = new String(s.slice(t.contentOff, t.next).toArray, "US-ASCII")
     X509.parseTime(str, generalized = true).toRight(InvalidKey.Malformed)
 
-  private def within(s: Slice, off: Int, tag: Int, limit: Int): Either[InvalidKey, Der.Tlv] =
-    Der.read(s, off, tag).filterOrElse(_.next <= limit, InvalidKey.Malformed)
+  private def within(s: Slice, off: Int, tag: Int, limit: Int): Either[InvalidKey, DER.Tlv] = DER.within(s, off, tag, limit)
 end OCSP

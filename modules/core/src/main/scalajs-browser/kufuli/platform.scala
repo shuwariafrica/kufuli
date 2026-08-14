@@ -26,20 +26,67 @@
 // keys export what the caller supplied. Instance bodies are the stub backend.
 package kufuli
 
-// Placeholder for a browser WebCrypto CryptoKey handle.
-final class CryptoKeyHandle
+/** A live WebCrypto `CryptoKey`. `material` stands in for the key bytes the runtime holds, which
+  * the backend reaches exactly as `subtle.*` reaches a handle's internal material.
+  */
+final class CryptoKeyHandle(private[kufuli] val material: Array[Byte])
 
 private[kufuli] type KeyRepr = Array[Byte] | CryptoKeyHandle
 private[kufuli] def keyRepr(bytes: Array[Byte]): KeyRepr = bytes
 private[kufuli] def keyBytes(r: KeyRepr): Array[Byte] = r match
-  case b: Array[Byte]     => b
-  case _: CryptoKeyHandle => Array.emptyByteArray // stub: handle-only keys never reach a byte op here
+  case b: Array[Byte] => b
+  // W3C WebCrypto fixes `generateKey`'s `extractable` to the private key alone: a public key is
+  // always extractable, whatever the caller asked for.
+  case h: CryptoKeyHandle => h.material
+
+// Handle-backed secret custody: a WebCrypto private or secret key is a live CryptoKey the runtime
+// owns. It has no byte view, and destroy drops the reference and flips liveness so that further use
+// raises exactly as on the bytes arm - the lifecycle is universal, only the view is arm-specific.
+final private[kufuli] class SecretHandle(h: CryptoKeyHandle):
+  private val ref = new java.util.concurrent.atomic.AtomicReference[Option[CryptoKeyHandle]](Some(h))
+  private[kufuli] def handle: CryptoKeyHandle =
+    ref.get().getOrElse(throw new IllegalStateException("secret already destroyed")) // scalafix:ok DisableSyntax.throw
+  private[kufuli] def material: Array[Byte] = handle.material
+  private[kufuli] def kill(): Unit = ref.set(None)
+
+private[kufuli] type SecretRepr = boilerplate.Secret | SecretHandle
+private[kufuli] def secretAdopt(bytes: Array[Byte]): SecretRepr =
+  val s = boilerplate.Secret.fill(bytes.length) { dst =>
+    val _ = boilerplate.Slice.of(bytes).copyInto(dst)
+  }
+  boilerplate.Slice.of(bytes).wipe()
+  s
+private[kufuli] def secretCopy(bytes: Array[Byte]): SecretRepr =
+  boilerplate.Secret.fill(bytes.length) { dst =>
+    val _ = boilerplate.Slice.of(bytes).copyInto(dst)
+  }
+private[kufuli] def secretRead[B](r: SecretRepr)(f: boilerplate.Slice => B): B = r match
+  case s: boilerplate.Secret => boilerplate.Secret.use(s)(f)
+  case h: SecretHandle       =>
+    val _ = h.handle // liveness first, so a destroyed handle reports destruction rather than absence
+    throw new IllegalStateException("handle-backed key has no byte view") // scalafix:ok DisableSyntax.throw
+private[kufuli] def secretDestroy(r: SecretRepr): Unit = r match
+  case s: boilerplate.Secret => boilerplate.Secret.destroy(s)()
+  case h: SecretHandle       => h.kill()
+
+// WebCrypto generation yields live handles: the private key non-extractable, the public key one that
+// always exports.
+private[kufuli] def secretGenerated(bytes: Array[Byte]): SecretRepr = new SecretHandle(new CryptoKeyHandle(bytes))
+private[kufuli] def keyGenerated(bytes: Array[Byte]): KeyRepr = new CryptoKeyHandle(bytes)
+private[kufuli] def secretExportable(r: SecretRepr): Boolean = r match
+  case _: boilerplate.Secret => true
+  case _: SecretHandle       => false
+
+// The BACKEND door: an operation on a handle routes the handle; the shared byte view keeps raising.
+private[kufuli] def secretMaterial[B](r: SecretRepr)(f: boilerplate.Slice => B): B = r match
+  case s: boilerplate.Secret => boilerplate.Secret.use(s)(f)
+  case h: SecretHandle       => f(boilerplate.Slice.of(h.material))
 
 private[kufuli] trait RandomPlatform extends stubs.RandomDefault
 private[kufuli] trait AeadPlatform extends stubs.AeadUniversal // no ChaCha in WebCrypto
 private[kufuli] trait MacPlatform extends stubs.MacAll
-private[kufuli] trait SignerPlatform extends stubs.SignersAll
-private[kufuli] trait VerifierPlatform extends stubs.VerifiersAll
+private[kufuli] trait SigningPlatform extends stubs.SignersAll
+private[kufuli] trait VerifyingPlatform extends stubs.VerifiersAll
 private[kufuli] trait AgreementPlatform extends stubs.AgreementAll
 private[kufuli] trait KemPlatform // no WebCrypto ML-KEM
 private[kufuli] trait WrapPlatform extends stubs.WrapKw // AES-KW only, no KWP
@@ -48,8 +95,8 @@ private[kufuli] trait HashPlatform extends stubs.HashAll
 private[kufuli] trait HashingPlatform // async-only: no incremental hashing
 private[kufuli] trait CipheringPlatform // async-only: no record machine
 private[kufuli] trait OaepPlatform extends stubs.OaepDefault
-private[kufuli] trait EdKeysPlatform extends stubs.EdKeysHandles
-private[kufuli] trait XKeysPlatform extends stubs.XKeysHandles
-private[kufuli] trait EcKeysPlatform extends stubs.EcKeysHandles
-private[kufuli] trait RsaKeysPlatform extends stubs.RsaKeysHandles
+private[kufuli] trait EdKeysPlatform extends stubs.EdKeysAll
+private[kufuli] trait XKeysPlatform extends stubs.XKeysAll
+private[kufuli] trait EcKeysPlatform extends stubs.EcKeysAll
+private[kufuli] trait RsaKeysPlatform extends stubs.RsaKeysAll
 private[kufuli] trait KemKeysPlatform // no WebCrypto ML-KEM

@@ -21,15 +21,16 @@
 package kufuli.password
 
 import scala.annotation.targetName
-import scala.util.control.NoStackTrace
 
 import boilerplate.Slice
-import boilerplate.effect.EffIO
-import boilerplate.effect.UEffIO
+import boilerplate.TypedError
+import boilerplate.effect.Eff
+import boilerplate.effect.UEff
 
 import kufuli.*
 
-sealed abstract class PasswordError(message: String) extends Exception(message) with NoStackTrace derives CanEqual
+sealed abstract class PasswordError(message: String, cause: Option[Throwable]) extends TypedError(message, cause):
+  def this(message: String) = this(message, None)
 sealed abstract class InvalidParams private[password] () extends PasswordError("invalid Argon2 parameters")
 case object InvalidParams extends InvalidParams
 sealed abstract class MalformedHash private[password] () extends PasswordError("not a PHC argon2id string")
@@ -58,6 +59,7 @@ object PasswordHash:
   def of(stored: String): Either[MalformedHash, PasswordHash] =
     Phc.parse(stored).map(_ => stored)
   extension (h: PasswordHash) def value: String = h
+  given CanEqual[PasswordHash, PasswordHash] = CanEqual.derived
 
 enum PasswordCheck derives CanEqual:
   case Rejected
@@ -70,7 +72,7 @@ enum PasswordCheck derives CanEqual:
   */
 @annotation.implicitNotFound("Argon2id is not provided by this kufuli backend (JVM = BouncyCastle, Native = libargon2, Node >= 24.7; the browser ships no password module)")
 trait Argon2:
-  def hash(password: Slice, salt: Slice, params: Argon2Params): UEffIO[Array[Byte]]
+  private[kufuli] def hash(password: Slice, salt: Slice, params: Argon2Params): UEff[Array[Byte]]
 
 // The provider is per-platform (JVM = BouncyCastle, Native = libargon2, Node >= 24.7) but its
 // presence is uniform across the module's platforms; the companion extends a per-platform trait
@@ -80,27 +82,50 @@ object Argon2 extends Argon2Platform
 // PHC string codec (one audited site; providers are KAT-verified against it). PHC B64 is the
 // STANDARD alphabet, unpadded.
 private[password] object Phc:
+  // Argon2's own minimum (ARGON2_MIN_SALT_LENGTH): a shorter stored salt cannot have been produced
+  // by any conformant hasher, and accepting it would let a tampered column drive verification with
+  // a salt an attacker precomputed against.
+  private[password] val minimumSaltBytes: Int = 8
+
+  // Every provider here is driven at 32 bytes, so a column of another width could never match a
+  // recomputation: it is corruption, and corruption surfaces at parse.
+  private[password] val tagBytes: Int = 32
+
   final case class Parsed(params: Argon2Params, salt: Array[Byte], hash: Array[Byte])
+
+  // `split` drops trailing empty fields, so a column ending in `$` would otherwise read as the same
+  // hash without it - one stored value with two spellings.
   def parse(s: String): Either[MalformedHash, Parsed] =
-    s.split('$') match
-      case Array("", "argon2id", "v=19", p, saltB64, hashB64) =>
-        val kv = p
-          .split(',')
-          .flatMap { part =>
-            part.split('=') match
-              case Array(k, v) => v.toIntOption.map(k -> _)
-              case _           => None
-          }
-          .toMap
-        (for
-          m <- kv.get("m")
-          t <- kv.get("t")
-          par <- kv.get("p")
-          params <- Argon2Params.of(m, t, par).toOption
-          salt <- b64(saltB64)
-          hash <- b64(hashB64)
-        yield Parsed(params, salt, hash)).toRight(MalformedHash)
-      case _ => Left(MalformedHash)
+    if s.endsWith("$") then Left(MalformedHash)
+    else
+      s.split('$') match
+        case Array("", "argon2id", "v=19", p, saltB64, hashB64) =>
+          (for
+            params <- cost(p)
+            salt <- b64(saltB64).filter(_.length >= minimumSaltBytes)
+            hash <- b64(hashB64).filter(_.length == tagBytes)
+          yield Parsed(params, salt, hash)).toRight(MalformedHash)
+        case _ => Left(MalformedHash)
+
+  // The three parameters in the order the Argon2 reference emits them. An unknown or reordered
+  // field would give one stored hash several spellings, and a repeated one leaves which occurrence
+  // governs the cost to whoever reads the column.
+  private def cost(text: String): Option[Argon2Params] =
+    if text.endsWith(",") then None
+    else
+      text.split(',') match
+        case Array(s"m=$m", s"t=$t", s"p=$parallel") =>
+          for
+            memory <- decimal(m)
+            iterations <- decimal(t)
+            lanes <- decimal(parallel)
+            params <- Argon2Params.of(memory, iterations, lanes).toOption
+          yield params
+        case _ => None
+
+  private def decimal(text: String): Option[Int] =
+    if text.isEmpty || (text.length > 1 && text.charAt(0) == '0') || !text.forall(c => c >= '0' && c <= '9') then None
+    else text.toIntOption
   def emit(params: Argon2Params, salt: Array[Byte], hash: Array[Byte]): String =
     s"$$argon2id$$v=19$$m=${params.memoryKib},t=${params.iterations},p=${params.parallelism}$$${b64e(salt)}$$${b64e(hash)}"
   private def b64(s: String): Option[Array[Byte]] =
@@ -110,7 +135,7 @@ end Phc
 
 extension (pw: Array[Byte])
   /** Hash under `params` with a fresh CSPRNG salt; the result is the PHC string for storage. */
-  def hash(params: Argon2Params)(using a: Argon2, r: Random): UEffIO[PasswordHash] =
+  def hash(params: Argon2Params)(using a: Argon2, r: Random): UEff[PasswordHash] =
     r.bytes(16).flatMap { s =>
       val salt = s.toArray
       a.hash(Slice.of(pw), Slice.of(salt), params).map(h => PasswordHash.unsafe(Phc.emit(params, salt, h)))
@@ -119,15 +144,19 @@ extension (pw: Array[Byte])
   /** Recompute against the stored salt/params and compare constant-time. `rehash` recommends the
     * CURRENT policy when the stored parameters are weaker in any dimension.
     */
-  def verify(against: PasswordHash, policy: Argon2Params)(using a: Argon2): UEffIO[PasswordCheck] =
-    val p = Phc.parse(against).toOption.get // validated at construction (PasswordHash.of)
-    a.hash(Slice.of(pw), Slice.of(p.salt), p.params).map { computed =>
-      if !Slice.of(computed).constantTimeEquals(Slice.of(p.hash)) then PasswordCheck.Rejected
-      else
-        val weaker =
-          p.params.memoryKib < policy.memoryKib || p.params.iterations < policy.iterations ||
-            p.params.parallelism < policy.parallelism
-        PasswordCheck.Verified(Option.when(weaker)(policy))
+  def verify(against: PasswordHash, policy: Argon2Params)(using a: Argon2): UEff[PasswordCheck] =
+    Eff.defer {
+      // Every PasswordHash was parsed at its construction door, so a failure here is a broken
+      // invariant: it belongs raised as a defect, never returned as a rejection.
+      val p = demand(Phc.parse(against))
+      a.hash(Slice.of(pw), Slice.of(p.salt), p.params).map { computed =>
+        if !Slice.of(computed).constantTimeEquals(Slice.of(p.hash)) then PasswordCheck.Rejected
+        else
+          val weaker =
+            p.params.memoryKib < policy.memoryKib || p.params.iterations < policy.iterations ||
+              p.params.parallelism < policy.parallelism
+          PasswordCheck.Verified(Option.when(weaker)(policy))
+      }
     }
 end extension
 
@@ -135,8 +164,8 @@ end extension
 // OpaqueString is the caller's concern and is documented, not silently applied).
 extension (pw: String)
   @targetName("hashString")
-  def hash(params: Argon2Params)(using Argon2, Random): UEffIO[PasswordHash] =
+  def hash(params: Argon2Params)(using Argon2, Random): UEff[PasswordHash] =
     pw.getBytes(java.nio.charset.StandardCharsets.UTF_8).hash(params)
   @targetName("verifyString")
-  def verify(against: PasswordHash, policy: Argon2Params)(using Argon2): UEffIO[PasswordCheck] =
+  def verify(against: PasswordHash, policy: Argon2Params)(using Argon2): UEff[PasswordCheck] =
     pw.getBytes(java.nio.charset.StandardCharsets.UTF_8).verify(against, policy)
