@@ -44,6 +44,32 @@ class NegativesSuite extends munit.FunSuite:
   def kemPriv: PrivateKey[MlKem768] = ???
   def kemPub: PublicKey[MlKem768] = ???
 
+  // Every negative below rejects for a REASON, and a rename would make it reject for another one.
+  // These are the paired positives: each names the same member on the type that is entitled to it,
+  // so a suite that still passes after `sign`, `seal`, `agree`, `open`, `verify`, `encapsulate` or
+  // `raw` moved or vanished is a suite this test fails first.
+  test("the operations the negatives are about all exist on the types entitled to them") {
+    assert(typeChecks("edPriv.sign(boilerplate.Slice.empty)"), "a signing key signs")
+    assert(typeChecks("hmacKey.sign(boilerplate.Slice.empty)"), "and so does a MAC key")
+    assert(typeChecks("rsaPriv.sign(boilerplate.Slice.empty, RsaPss(Sha256))"), "RSA signs under a named padding")
+    assert(typeChecks("p256Priv.sign(boilerplate.Slice.empty, Sha384)"), "and an EC key under an explicit Sha2")
+    assert(typeChecks("aeadKey.seal(boilerplate.Slice.empty)"), "an AEAD key seals")
+    assert(typeChecks("def r: Keyring[AesGcm256] = ???; r.seal(boilerplate.Slice.empty)"), "and so does an AEAD keyring")
+    assert(
+      typeChecks("def c: Cipher[AesGcm256] = ???; c.encrypt(boilerplate.Slice.empty, boilerplate.Slice.empty, boilerplate.Slice.empty, boilerplate.Slice.empty)"),
+      "record encrypt exists on the Cipher handle"
+    )
+    assert(typeChecks("xPriv.agree(??? : PublicKey[X25519])"), "X25519 agrees with its own family")
+    assert(typeChecks("p256Priv.agree(ecPub)"), "and a P-256 key with a P-256 peer")
+    assert(typeChecks("def b: SealedBox[AesGcm256] = ???; aeadKey.open(b)"), "a box of the key's own algorithm opens")
+    assert(typeChecks("def s: Signature[Ed25519] = ???; edPub.verify(boilerplate.Slice.empty, s)"), "a public key verifies its own family")
+    // `ecPub.encapsulate` has no universal positive twin: the browser artifact provides no KEM
+    // instance at all, so `kemPub.encapsulate` would not compile there. The KAT tier pairs it on
+    // the rows that do provide one.
+    assert(typeChecks("edPub.raw"), "an asymmetric public key exports raw")
+    assert(typeChecks("def k: SecretKey[AesGcm256] = aeadKey"), "and a key of matching tag assigns")
+  }
+
   test("19 structural misuse patterns rejected at compile time") {
     assert(!typeChecks("aeadKey.sign(boilerplate.Slice.empty)"), "an AEAD key must not sign")
     assert(
@@ -67,6 +93,7 @@ class NegativesSuite extends munit.FunSuite:
     assert(!typeChecks("kemPriv.agree(kemPub)"), "KEM is encapsulation, not agreement")
     assert(!typeChecks("ecPub.encapsulate"), "encapsulation exists only for KEM algorithms")
     assert(!typeChecks("aeadKey.raw"), "symmetric keys have no raw export")
+    assert(!typeChecks("edPriv.raw"), "nor does a private key: export is the typed, backend-decided path")
   }
 
   test("equality is available exactly where value semantics are real") {
@@ -84,6 +111,6 @@ class NegativesSuite extends munit.FunSuite:
     assert(!typeChecks("def r: Keyring[Ed25519] = ???"), "a keyring holds symmetric keys alone")
     assert(typeChecks("def k: SecretKey[HmacSha256] = ???"), "a symmetric tag is nameable")
     assert(!typeChecks("RSA.fromPkcs8(boilerplate.Slice.empty)"), "parsing lives on the carrier, beside its siblings")
-    assert(typeChecks("PrivateKey.fromPkcs8(RSA)(boilerplate.Slice.empty)"), "RSA private-key import is where every other family's is")
+    assert(typeChecks("PrivateKey.parse(RSA)(PKCS8(boilerplate.Slice.empty))"), "RSA private-key import is where every other family's is")
   }
 end NegativesSuite

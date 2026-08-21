@@ -58,7 +58,7 @@ class WycheproofSuite extends munit.CatsEffectSuite:
         else
           val ct = KemCiphertext.of(spec)(hb(c)).toOption.get
           for
-            kp <- keys.fromSeed(Slice.of(hb(seed))).either
+            kp <- keys.fromSeed(Slice.of(hb(seed))).either.absolve
             pair <- IO.fromOption(kp.toOption)(new AssertionError(s"tc$tc seed import failed: $kp"))
             ek <- keys.raw(pair.publicKey).absolve
             shared <- kem.decapsulate(pair.privateKey, ct).absolve
@@ -97,7 +97,7 @@ class WycheproofSuite extends munit.CatsEffectSuite:
     SecretKey.of(spec)(k) match
       case Left(_)    => IO.pure(None)
       case Right(key) =>
-        summon[AEAD[A]].open(key, Nonce.unsafe[A](iv), Slice.of(aad), Slice.of(ctTag)).either.map(_.toOption.map(_.toArray))
+        summon[AEAD[A]].open(key, Nonce.unsafe[A](iv), Slice.of(aad), Slice.of(ctTag)).either.absolve.map(_.toOption.map(_.toArray))
 
   // Restricted to the 96-bit-nonce / 128-bit-tag groups the EVP_AEAD ciphers accept.
   private def runAead(json: String, open: (Int, Array[Byte], Array[Byte], Array[Byte], Array[Byte]) => IO[Option[Array[Byte]]]): IO[Unit] =
@@ -152,10 +152,10 @@ class WycheproofSuite extends munit.CatsEffectSuite:
       EcdsaSecp256r1Sha256P1363TestJson.json,
       g => g.field("publicKey").field("uncompressed").str,
       (point, msg, sig) =>
-        PublicKey.fromSec1(P256)(Slice.of(hb(point))).either.flatMap {
+        PublicKey.parse(P256)(SEC1(Slice.of(hb(point)))).either.absolve.flatMap {
           case Right(k) =>
-            Signature.fromRaw(P256)(hb(sig)) match
-              case Right(s) => k.verify(Slice.of(hb(msg)), s).either.map(_.isRight)
+            Signature.of(P256)(hb(sig)) match
+              case Right(s) => k.verify(Slice.of(hb(msg)), s).either.absolve.map(_.isRight)
               case Left(_)  => IO.pure(false)
           case Left(_) => IO.pure(false)
         }
@@ -171,10 +171,10 @@ class WycheproofSuite extends munit.CatsEffectSuite:
       Ed25519TestJson.json,
       g => g.field("publicKey").field("pk").str,
       (pk, msg, sig) =>
-        PublicKey.fromRaw(Ed25519)(Slice.of(hb(pk))).either.flatMap {
+        PublicKey.parse(Ed25519)(Raw(Slice.of(hb(pk)))).either.absolve.flatMap {
           case Right(k) =>
-            Signature.fromRaw(Ed25519)(hb(sig)) match
-              case Right(s) => k.verify(Slice.of(hb(msg)), s).either.map(_.isRight)
+            Signature.of(Ed25519)(hb(sig)) match
+              case Right(s) => k.verify(Slice.of(hb(msg)), s).either.absolve.map(_.isRight)
               case Left(_)  => IO.pure(false)
           case Left(_) => IO.pure(false)
         }

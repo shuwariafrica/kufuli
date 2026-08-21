@@ -1,12 +1,11 @@
-import sbt.*
+import sbt.{Def, *}
 import sbt.Keys.*
-
 import xsbti.FileConverter
 
 /** Build-internal verification for the capture-checked carrier sources: the escape fixture and the
   * formatter-exclusion divergence check, both wired into the `check` alias by `build.sbt`.
   */
-object KufuliBuild extends AutoPlugin {
+object KufuliBuild extends AutoPlugin:
 
   // Capture-checking negatives cannot be suite rows: `typeChecks` compiles its snippet in a nested
   // scope, where the language import is rejected and the body is never capture-checked.
@@ -17,6 +16,13 @@ object KufuliBuild extends AutoPlugin {
   // withheld from one and not the other, breaking `format`.
   val checkCaptureCheckedExclusions =
     taskKey[Unit]("Verify .scalafmt.conf's exclusion list matches the capture-checked sources on disk.")
+
+  val corpusGenerate = taskKey[Seq[File]]("Embeds the vendored X.509 conformance corpora as Scala string constants.")
+
+  enum Optimisation:
+    case Full, Fast
+
+  val optimisation: SettingKey[Optimisation] = settingKey("Defines linker optimisation mode for applicable platforms")
 
   /** True for a source carrying the capture-checking language import - the predicate the
     * per-project scalafix withholding and the exclusion divergence check share.
@@ -41,7 +47,7 @@ object KufuliBuild extends AutoPlugin {
         .filter(captureChecked)
         .map(file => root.toPath.relativize(file.toPath).toString.replace('\\', '/'))
         .toSet
-      if (declared != present)
+      if declared != present then
         sys.error(
           s"""|.scalafmt.conf's capture-checking exclusions are out of step with the sources:
               |  declared but not capture-checked: ${(declared -- present).toList.sorted.mkString(", ")}
@@ -66,7 +72,7 @@ object KufuliBuild extends AutoPlugin {
         IO.createDirectory(dest)
         assertEscape(label, expected, compileEscape(loader, classpath, dest, source))
       }
-      if (failures.nonEmpty) sys.error(s"Capture-checking escape fixture failed:\n${failures.mkString("\n")}")
+      if failures.nonEmpty then sys.error(s"Capture-checking escape fixture failed:\n${failures.mkString("\n")}")
     }
   )
 
@@ -95,30 +101,33 @@ object KufuliBuild extends AutoPlugin {
 
   // Diagnostics come back through the compiler's own SimpleReporter, not by capturing stdout: the
   // compiler loader has its own `scala.Console`, so redirection from here captures nothing.
-  private def compileEscape(loader: ClassLoader, classpath: String, dest: File, source: File): String = {
+  private def compileEscape(loader: ClassLoader, classpath: String, dest: File, source: File): String =
     val module = loader.loadClass("dotty.tools.dotc.Main$").getField("MODULE$").get(null)
     val reporterClass = loader.loadClass("dotty.tools.dotc.interfaces.SimpleReporter")
     val callbackClass = loader.loadClass("dotty.tools.dotc.interfaces.CompilerCallback")
     val diagnosticClass = loader.loadClass("dotty.tools.dotc.interfaces.Diagnostic")
     val messageMethod = diagnosticClass.getMethod("message")
     val collected = new java.util.ArrayList[String]()
-    val handler = new java.lang.reflect.InvocationHandler {
-      def invoke(proxy: Object, method: java.lang.reflect.Method, args: Array[Object]): Object = {
-        if (method.getName == "report") collected.add(String.valueOf(messageMethod.invoke(args(0))))
+    val handler = new java.lang.reflect.InvocationHandler:
+      def invoke(proxy: Object, method: java.lang.reflect.Method, args: Array[Object]): Object =
+        if method.getName == "report" then collected.add(String.valueOf(messageMethod.invoke(args(0))))
         null
-      }
-    }
     val reporter = java.lang.reflect.Proxy.newProxyInstance(loader, Array(reporterClass), handler)
     val process = module.getClass.getMethod("process", classOf[Array[String]], reporterClass, callbackClass)
     val args = Array("-classpath", classpath, "-d", dest.getAbsolutePath, source.getAbsolutePath)
     val _ = process.invoke(module, args, reporter, null)
     collected.toArray.mkString("\n")
-  }
+  end compileEscape
+
+  override def trigger = allRequirements
+
+  override def buildSettings: Seq[Def.Setting[?]] = List(
+    optimisation := (if sys.env.get("KUFULI_RELEASE_GATE").contains("true") then Optimisation.Full else Optimisation.Fast)
+  )
 
   private def assertEscape(label: String, expected: String, output: String): Option[String] =
-    if (expected.isEmpty)
-      if (output.trim.isEmpty) None else Some(s"  - $label: expected a clean compile, got:\n${output.take(600)}")
-    else if (output.trim.isEmpty) Some(s"  - $label: expected the diagnostic to contain '$expected', but the compiler reported nothing")
-    else if (output.contains(expected)) None
+    if expected.isEmpty then if output.trim.isEmpty then None else Some(s"  - $label: expected a clean compile, got:\n${output.take(600)}")
+    else if output.trim.isEmpty then Some(s"  - $label: expected the diagnostic to contain '$expected', but the compiler reported nothing")
+    else if output.contains(expected) then None
     else Some(s"  - $label: expected the diagnostic to contain '$expected', got:\n${output.take(600)}")
-}
+end KufuliBuild

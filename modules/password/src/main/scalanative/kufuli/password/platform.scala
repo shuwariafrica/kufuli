@@ -45,9 +45,9 @@ end argon2ffi
 
 private[kufuli] trait Argon2Platform:
   given Argon2 = new Argon2:
-    private[kufuli] def hash(password: Slice, salt: Slice, params: Argon2Params): UEff[Array[Byte]] =
+    private[kufuli] def hash(password: Slice, salt: Slice, params: Argon2Params, length: Int): UEff[Array[Byte]] =
       guard(IO.blocking {
-        val out = new Array[Byte](32)
+        val out = new Array[Byte](length)
         val rc = argon2ffi.argon2id_hash_raw(
           params.iterations.toUInt,
           params.memoryKib.toUInt,
@@ -57,7 +57,7 @@ private[kufuli] trait Argon2Platform:
           salt.unsafePtr,
           salt.length.toCSize,
           Slice.of(out).unsafePtr,
-          32.toCSize
+          length.toCSize
         )
         // Inputs are pre-validated, so a non-zero return is an anomaly; guard sanitises the raise so
         // the password never surfaces.

@@ -31,6 +31,8 @@ import scala.concurrent.duration.FiniteDuration
 
 import boilerplate.Slice
 import boilerplate.TypedError
+import boilerplate.ValueCodec
+import boilerplate.codec.Base64Url
 import boilerplate.effect.Eff
 import boilerplate.effect.UEff
 import com.github.plokhotnyuk.jsoniter_scala.core.*
@@ -196,6 +198,19 @@ object JwsAlg:
   sealed abstract class Asymmetric[K <: SignatureAlgorithm](val name: String, val scheme: Scheme[K]) extends JwsAlg
   sealed abstract class Symmetric[H <: MacAlgorithm](val name: String) extends JwsAlg
 
+  private val values: List[JwsAlg] = List(ES256, ES384, ES512, EdDSA, PS256, RS256, HS256, HS384, HS512)
+
+  /** The wire-text contract: RFC 7518/9864 registry names, serving configuration-driven algorithm
+    * allowlists (`Policy` construction from configuration). Decode accepts what an arm verifies -
+    * the Ed25519/EdDSA duality normalises to the arm - and encode emits the one registry name the
+    * arm emits, so decode is idempotent through re-encoding.
+    */
+  given valueCodec: ValueCodec.Aux[JwsAlg, ValueCodec.Invalid] = ValueCodec(
+    text => values.find(_.accepts(text)).toRight(ValueCodec.Invalid("not a registered JWS algorithm name")),
+    alg => alg.name
+  )
+end JwsAlg
+
 case object ES256 extends JwsAlg.Asymmetric[P256]("ES256", ECDSA(Sha256))
 case object ES384 extends JwsAlg.Asymmetric[P384]("ES384", ECDSA(Sha384))
 case object ES512 extends JwsAlg.Asymmetric[P521]("ES512", ECDSA(Sha512))
@@ -217,7 +232,9 @@ opaque type JWT = String
 object JWT:
   given CanEqual[JWT, JWT] = CanEqual.derived
   // Payload-free rejections are a class plus a co-named object, and type positions name the CLASS:
-  // a union of singleton types does not survive the TypeTest reification `either`/`catchAll` rely on.
+  // a union of singleton types does not survive the TypeTest reification `either`/`catchAll` rely on
+// (re-tested at each toolchain adoption, last at Scala 3.9.0-RC5: still broken; drop the
+// class+object shape for plain case objects when the erasure defect is fixed).
   sealed abstract class Rejected(message: String) extends JoseError(message)
   sealed abstract class Malformed private[jose] () extends Rejected("not a JWS compact serialization")
   case object Malformed extends Malformed
@@ -307,7 +324,14 @@ object JWT:
     private[jose] val requiredIssuer: Option[String],
     private[jose] val clockSkew: Long,
     private[jose] val requireExpiry: Boolean
-  )
+  ):
+    override def equals(other: Any): Boolean = other match
+      case that: Policy =>
+        audience == that.audience && algorithms == that.algorithms && requiredIssuer == that.requiredIssuer &&
+        clockSkew == that.clockSkew && requireExpiry == that.requireExpiry
+      case _ => false
+    override def hashCode: Int = (audience, algorithms, requiredIssuer, clockSkew, requireExpiry).hashCode
+  end Policy
   object Policy:
     def apply(audience: String, algorithm: JwsAlg, more: JwsAlg*): Policy =
       new Policy(Some(audience), more.toSet + algorithm, None, 0L, true)
@@ -425,7 +449,7 @@ object JWT:
   def sign(claims: Claims, alg: JwsAlg.Asymmetric[Ed25519], typ: String, headerKey: PublicKey[Ed25519], at: Long)(
     key: PrivateKey[Ed25519]
   )(using s: Signing[Ed25519], ks: EdKeys): Eff[KeyNotExportable, JWT] =
-    headerKey.raw.flatMap(x => signWithHeader(claims, alg, typ, Json.obj(JWK.canonicalEd(x)), at)(key))
+    headerKey.raw.flatMap(x => signWithHeader(claims, alg, typ, Json.obj(JWK.canonicalEd(x.bytes)), at)(key))
 
   @targetName("signHeaderEc")
   def sign[C <: EcCurve](claims: Claims, alg: JwsAlg.Asymmetric[C], typ: String, headerKey: PublicKey[C], at: Long)(
@@ -435,7 +459,7 @@ object JWT:
       case 32 => "P-256"
       case 48 => "P-384"
       case _  => "P-521"
-    headerKey.sec1.flatMap(s1 => signWithHeader(claims, alg, typ, Json.obj(JWK.canonicalEc(crv, s1, spec.fieldLength)), at)(key))
+    headerKey.sec1.flatMap(s1 => signWithHeader(claims, alg, typ, Json.obj(JWK.canonicalEc(crv, s1.bytes, spec.fieldLength)), at)(key))
 
   @targetName("signHeaderRsa")
   def sign(claims: Claims, alg: JwsAlg.Asymmetric[RSA], typ: String, headerKey: PublicKey[RSA], at: Long)(
@@ -479,6 +503,11 @@ object JWT:
     else
       val _ = out.flip()
       Some(out.toString)
+
+  // Deferred, because a 64 KiB token's base64 and JSON work is the largest thing on this path and
+  // CONSTRUCTING a verify effect must stay free: a request pipeline that builds one per request and
+  // hands it to a scheduler would otherwise do the parse on whatever thread built it.
+  private def parsed(token: String): Eff[Rejected, Parsed] = Eff.defer(Eff.from(parse(token)))
 
   private def parse(token: String): Either[Rejected, Parsed] =
     // RFC 7515 section 5.2 step 1: exactly two delimiting periods. `split` drops trailing empty
@@ -579,7 +608,7 @@ object JWT:
     p521: Verifying[P521],
     rsa: Verifying[RSA]
   ): Eff[Rejected, Verified] =
-    Eff.from(parse(token)).flatMap { parsed =>
+    parsed(token).flatMap { parsed =>
       policy.algorithms.find(_.accepts(parsed.algName)) match
         case None                            => Eff.fail(UntrustedAlgorithm)
         case Some(alg: JwsAlg.Asymmetric[?]) =>
@@ -601,15 +630,15 @@ object JWT:
   ): Eff[Rejected, Unit] =
     val outcome: Either[Rejected, Eff[SignatureRejected, Unit]] = (alg, key) match
       case (EdDSA, ImportedPublicKey.Ed(k)) =>
-        Signature.fromRaw(Ed25519)(parsed.signature).map(s => ed.verify(k, parsed.input, s, EdDSA.scheme)).left.map(_ => Malformed)
+        Signature.of(Ed25519)(parsed.signature).map(s => ed.verify(k, parsed.input, s, EdDSA.scheme)).left.map(_ => Malformed)
       case (ES256, ImportedPublicKey.EcP256(k)) =>
-        Signature.fromRaw(P256)(parsed.signature).map(s => p256.verify(k, parsed.input, s, ES256.scheme)).left.map(_ => Malformed)
+        Signature.of(P256)(parsed.signature).map(s => p256.verify(k, parsed.input, s, ES256.scheme)).left.map(_ => Malformed)
       case (ES384, ImportedPublicKey.EcP384(k)) =>
-        Signature.fromRaw(P384)(parsed.signature).map(s => p384.verify(k, parsed.input, s, ES384.scheme)).left.map(_ => Malformed)
+        Signature.of(P384)(parsed.signature).map(s => p384.verify(k, parsed.input, s, ES384.scheme)).left.map(_ => Malformed)
       case (ES512, ImportedPublicKey.EcP521(k)) =>
-        Signature.fromRaw(P521)(parsed.signature).map(s => p521.verify(k, parsed.input, s, ES512.scheme)).left.map(_ => Malformed)
+        Signature.of(P521)(parsed.signature).map(s => p521.verify(k, parsed.input, s, ES512.scheme)).left.map(_ => Malformed)
       case (a @ (PS256 | RS256), ImportedPublicKey.Rsa(k)) =>
-        Signature.fromRaw(RSA)(parsed.signature).map(s => rsa.verify(k, parsed.input, s, a.scheme)).left.map(_ => Malformed)
+        Signature.of(RSA)(parsed.signature).map(s => rsa.verify(k, parsed.input, s, a.scheme)).left.map(_ => Malformed)
       case _ => Left(KeyAlgorithmMismatch)
     outcome match
       case Left(r)  => Eff.fail(r)
@@ -636,7 +665,7 @@ object JWT:
     p521K: EcKeys[P521],
     rsaK: RsaKeys
   ): Eff[Rejected, (Verified, JWK)] =
-    Eff.from(parse(token)).flatMap { parsed =>
+    parsed(token).flatMap { parsed =>
       policy.algorithms.find(_.accepts(parsed.algName)) match
         case None                            => Eff.fail(UntrustedAlgorithm)
         case Some(alg: JwsAlg.Asymmetric[?]) =>
@@ -659,7 +688,7 @@ object JWT:
   def verify[K <: SignatureAlgorithm](token: String, alg: JwsAlg.Asymmetric[K], key: PublicKey[K], policy: Policy, now: Long)(using
     v: Verifying[K]
   ): Eff[Rejected, Verified] =
-    Eff.from(parse(token)).flatMap { parsed =>
+    parsed(token).flatMap { parsed =>
       if !policy.algorithms.exists(_.accepts(parsed.algName)) then Eff.fail(UntrustedAlgorithm)
       else if !alg.accepts(parsed.algName) then Eff.fail(KeyAlgorithmMismatch)
       else
@@ -674,7 +703,7 @@ object JWT:
   def verify[H <: MacAlgorithm](token: String, alg: JwsAlg.Symmetric[H], key: SecretKey[H], policy: Policy, now: Long)(using
     m: MAC[H]
   ): Eff[Rejected, Verified] =
-    Eff.from(parse(token)).flatMap { parsed =>
+    parsed(token).flatMap { parsed =>
       if !policy.algorithms.exists(_.accepts(parsed.algName)) then Eff.fail(UntrustedAlgorithm)
       else if !alg.accepts(parsed.algName) then Eff.fail(KeyAlgorithmMismatch)
       else
@@ -686,31 +715,39 @@ object JWT:
     }
 
   // Re-tag the validated octets to the algorithm the alg match proves (Signature is opaque
-  // Array[Byte]; fromRaw validated the length, then the original bytes carry the algorithm K).
+  // Array[Byte]; `of` validated the length, then the original bytes carry the algorithm K).
   private def sigOf[K <: SignatureAlgorithm](alg: JwsAlg.Asymmetric[K], bytes: Array[Byte]): Either[Rejected, Signature[K]] =
     def retag(v: Either[kufuli.Malformed, ?]): Either[kufuli.Malformed, Signature[K]] = v.map(_ => Signature.unsafe[K](bytes.clone))
     val parsed: Either[kufuli.Malformed, Signature[K]] = alg match
-      case ES256 => retag(Signature.fromRaw(P256)(bytes))
-      case ES384 => retag(Signature.fromRaw(P384)(bytes))
-      case ES512 => retag(Signature.fromRaw(P521)(bytes))
-      case EdDSA => retag(Signature.fromRaw(Ed25519)(bytes))
-      case _     => retag(Signature.fromRaw(RSA)(bytes))
+      case ES256 => retag(Signature.of(P256)(bytes))
+      case ES384 => retag(Signature.of(P384)(bytes))
+      case ES512 => retag(Signature.of(P521)(bytes))
+      case EdDSA => retag(Signature.of(Ed25519)(bytes))
+      case _     => retag(Signature.of(RSA)(bytes))
     parsed.left.map(_ => Malformed)
 end JWT
 
 /** A public key in JWK form (RFC 7517/7518): its JSON document plus the parsed key arm. Build the
   * PUBLISHING direction with `JWK.of` (the /jwks endpoint, OIDC discovery); read the wire direction
-  * with `JWK.parse`. `json` is the document this JWK came from - what `of` published (the required
-  * members lexicographically, then `kid`) or exactly what `parse` was given, including members
-  * outside the required set. It is NOT an RFC 7638 canonical form: hashing it yields a thumbprint
-  * that does not match the key's, which the `thumbprint` extension computes.
+  * with `JWK.parse`. `json` is the document this JWK came from - what `of` published (all members
+  * lexicographically) or exactly what `parse` was given, including members outside the required
+  * set. It is NOT an RFC 7638 canonical form: hashing it yields a thumbprint that does not match
+  * the key's, which the `thumbprint` extension computes. Equality is DOCUMENT identity -
+  * `(kid, json)` - because the key arm reaches Array-backed material whose `==` is reference
+  * identity; KEY identity is `thumbprint`.
   */
-final case class JWK(kid: Option[String], key: ImportedPublicKey, json: String)
+final case class JWK(kid: Option[String], key: ImportedPublicKey, json: String):
+  override def equals(other: Any): Boolean = other match
+    case that: JWK => kid == that.kid && json == that.json
+    case _         => false
+  override def hashCode: Int = (kid, json).hashCode
 object JWK:
   given CanEqual[JWK, JWK] = CanEqual.derived
 
+  // One member order everywhere (lexicographic - the canonical writer's own), so a document kufuli
+  // publishes re-parses to an EQUAL value.
   private def withKid(kid: Option[String], canonical: List[(String, String)]): String =
-    Json.obj(canonical ++ kid.map(k => "kid" -> Json.str(k)).toList)
+    Json.obj((canonical ++ kid.map(k => "kid" -> Json.str(k)).toList).sortBy(_._1))
 
   private[jose] def canonicalEd(x: IArray[Byte]): List[(String, String)] =
     List("crv" -> Json.str("Ed25519"), "kty" -> Json.str("OKP"), "x" -> Json.str(Base64Url.encode(Array.from(x.iterator))))
@@ -732,7 +769,7 @@ object JWK:
 
   /** Publish an Ed25519 verification key (RFC 8037 OKP form). */
   def of(kid: String, key: PublicKey[Ed25519])(using k: EdKeys): Eff[KeyNotExportable, JWK] =
-    key.raw.map(x => JWK(Some(kid), ImportedPublicKey.Ed(key), withKid(Some(kid), canonicalEd(x))))
+    key.raw.map(x => JWK(Some(kid), ImportedPublicKey.Ed(key), withKid(Some(kid), canonicalEd(x.bytes))))
 
   /** Publish an EC verification key; the curve name follows the spec (`P-256`/`P-384`/`P-521`). */
   @targetName("ofEc")
@@ -745,7 +782,7 @@ object JWK:
       case 32 => c => ImportedPublicKey.EcP256(PublicKey.unsafe[P256](c.repr))
       case 48 => c => ImportedPublicKey.EcP384(PublicKey.unsafe[P384](c.repr))
       case _  => c => ImportedPublicKey.EcP521(PublicKey.unsafe[P521](c.repr))
-    key.sec1.map(s => JWK(Some(kid), arm(key), withKid(Some(kid), canonicalEc(crv, s, spec.fieldLength))))
+    key.sec1.map(s => JWK(Some(kid), arm(key), withKid(Some(kid), canonicalEc(crv, s.bytes, spec.fieldLength))))
 
   /** Publish an RSA verification key (the JWK `n`/`e` pair). */
   @targetName("ofRsa")
@@ -768,7 +805,8 @@ object JWK:
         def str(n: String) = fields.get(n) match
           case Some(JoseValue.Str(s)) => Some(s)
           case _                      => None
-        def b64(n: String): Either[Malformed | InvalidKey, Array[Byte]] = str(n).toRight(Malformed).flatMap(Base64Url.decode)
+        def b64(n: String): Either[Malformed | InvalidKey, Array[Byte]] =
+          str(n).toRight(Malformed).flatMap(t => Base64Url.decode(t).left.map(_ => Malformed))
         // RFC 7518 section 6.2.1.2/6.2.1.3: each coordinate is the full curve size, left-padded.
         // Without the check a short `x` and a long `y` reassemble into a point of the right total
         // length, so two documents name one key.
@@ -782,23 +820,25 @@ object JWK:
         val kid = str("kid")
         (str("kty"), str("crv")) match
           case (Some("OKP"), Some("Ed25519")) =>
-            Eff.from(b64("x")).flatMap(x => ed.fromRaw(Slice.of(x)).map(k => JWK(kid, ImportedPublicKey.Ed(k), json)))
+            Eff.from(b64("x")).flatMap(x => PublicKey.parse(Ed25519)(Raw(Slice.of(x))).map(k => JWK(kid, ImportedPublicKey.Ed(k), json)))
           case (Some("EC"), Some("P-256")) =>
             Eff
               .from(point(P256.fieldLength))
-              .flatMap(pt => p256.fromSec1(Slice.of(pt)).map(k => JWK(kid, ImportedPublicKey.EcP256(k), json)))
+              .flatMap(pt => PublicKey.parse(P256)(SEC1(Slice.of(pt))).map(k => JWK(kid, ImportedPublicKey.EcP256(k), json)))
           case (Some("EC"), Some("P-384")) =>
             Eff
               .from(point(P384.fieldLength))
-              .flatMap(pt => p384.fromSec1(Slice.of(pt)).map(k => JWK(kid, ImportedPublicKey.EcP384(k), json)))
+              .flatMap(pt => PublicKey.parse(P384)(SEC1(Slice.of(pt))).map(k => JWK(kid, ImportedPublicKey.EcP384(k), json)))
           case (Some("EC"), Some("P-521")) =>
             Eff
               .from(point(P521.fieldLength))
-              .flatMap(pt => p521.fromSec1(Slice.of(pt)).map(k => JWK(kid, ImportedPublicKey.EcP521(k), json)))
+              .flatMap(pt => PublicKey.parse(P521)(SEC1(Slice.of(pt))).map(k => JWK(kid, ImportedPublicKey.EcP521(k), json)))
           case (Some("RSA"), _) =>
             Eff
               .from(for n <- b64("n"); e <- b64("e") yield (n, e))
-              .flatMap((n, e) => rsa.fromComponents(Slice.of(n), Slice.of(e)).map(k => JWK(kid, ImportedPublicKey.Rsa(k), json)))
+              .flatMap((n, e) =>
+                PublicKey.of(RSA.Components(IArray.from(n), IArray.from(e))).map(k => JWK(kid, ImportedPublicKey.Rsa(k), json))
+              )
           case _ => Eff.fail(InvalidKey.Unsupported)
         end match
 end JWK
@@ -809,12 +849,62 @@ end JWK
 final case class JwkSet(keys: List[JWK])
 object JwkSet:
   given CanEqual[JwkSet, JwkSet] = CanEqual.derived
-  def of(keys: JWK*): JwkSet = JwkSet(keys.toList)
+  def apply(keys: JWK*): JwkSet = new JwkSet(keys.toList)
+
+  /** Reads an RFC 7517 `{"keys": [...]}` document - the fetched-JWKS direction of the bearer flow.
+    * A member is SKIPPED only when its own declaration says kufuli does not serve it: a `kty` it
+    * has no arm for, or a `crv` outside its curve set (RFC 7517 section 5: clients ignore JWKs they
+    * do not understand), so a provider mixing supported and exotic keys stays consumable. ANY
+    * failure on a member of a served family - a declaration that is not even readable, a
+    * malformation, or a strength kufuli declines - fails the set. A skipped member's kid then
+    * surfaces as `UnknownKey` at verify - the refresh signal. Member `json` re-emits canonically:
+    * byte fidelity of a FOREIGN document is not preserved (kufuli's own published documents
+    * round-trip exactly).
+    */
+  // The skip decision is made from the member's DECLARED type alone, never from a failure arm:
+  // InvalidKey.Unsupported also names a key kufuli declines on STRENGTH (the RSA floor), and
+  // skipping on the arm would erase that signal from an operator's set. An UNREADABLE declaration
+  // is not a skip either - `kty` is REQUIRED (RFC 7517 section 4.1) and `crv` is REQUIRED of EC and
+  // OKP keys (RFC 7518 section 6.2.1.1, RFC 8037 section 2), so a member missing one is malformed,
+  // not exotic. Skipping it would turn an operator's typo into a permanent UnknownKey and, for the
+  // consumer that refetches on UnknownKey, into an unbounded refetch loop against the provider.
+  private def served(o: JoseValue.Obj): Either[Malformed, Boolean] =
+    def str(n: String): Option[String] = o.fields.get(n) match
+      case Some(JoseValue.Str(s)) => Some(s)
+      case _                      => None
+    def curve(serves: String => Boolean): Either[Malformed, Boolean] = str("crv").toRight(Malformed).map(serves)
+    str("kty") match
+      case None        => Left(Malformed)
+      case Some("OKP") => curve(_ == "Ed25519")
+      case Some("EC")  => curve(c => c == "P-256" || c == "P-384" || c == "P-521")
+      case Some("RSA") => Right(true)
+      case Some(_)     => Right(false)
+
+  def parse(json: String): Eff[Malformed | InvalidKey, JwkSet] =
+    Json.parse(json) match
+      case None         => Eff.fail(Malformed)
+      case Some(fields) =>
+        fields.get("keys") match
+          case Some(JoseValue.Arr(members)) =>
+            members
+              .foldLeft(Eff.succeed(List.empty[JWK]): Eff[Malformed | InvalidKey, List[JWK]]) { (acc, m) =>
+                m match
+                  case o: JoseValue.Obj =>
+                    served(o) match
+                      case Left(e)      => acc.flatMap(_ => Eff.fail(e))
+                      case Right(false) => acc
+                      case Right(true)  => acc.flatMap(ks => JWK.parse(Json.value(o)).map(k => k :: ks))
+                  case _ => acc.flatMap(_ => Eff.fail(Malformed))
+              }
+              .map(ks => new JwkSet(ks.reverse))
+          case _ => Eff.fail(Malformed)
+
   extension (set: JwkSet)
     def find(kid: String): Option[JWK] = set.keys.find(_.kid.contains(kid))
 
     /** The RFC 7517 `{"keys": [...]}` document, each member exactly as its [[JWK]] carries it. */
     def json: String = set.keys.map(_.json).mkString("""{"keys":[""", ",", "]}")
+end JwkSet
 
 private def canonJson(fields: List[(String, String)]): Slice =
   Slice.of(fields.map((k, v) => s"\"$k\":$v").mkString("{", ",", "}").getBytes("UTF-8"))
@@ -826,7 +916,7 @@ extension (pub: PublicKey[Ed25519])
   def thumbprint(using EdKeys, Hash[Sha256]): Eff[KeyNotExportable, Digest] = pub.thumbprint(Sha256)
   @targetName("thumbprintEdSpec")
   def thumbprint[D <: HashAlgorithm](spec: HashSpec[D])(using k: EdKeys, h: Hash[D]): Eff[KeyNotExportable, Digest] =
-    pub.raw.flatMap(x => spec.digest(canonJson(JWK.canonicalEd(x))))
+    pub.raw.flatMap(x => spec.digest(canonJson(JWK.canonicalEd(x.bytes))))
 extension [C <: EcCurve](pub: PublicKey[C])
   @targetName("thumbprintEc")
   def thumbprint(using EcKeys[C], EcSpec[C], Hash[Sha256]): Eff[KeyNotExportable, Digest] = pub.thumbprint(Sha256)
@@ -836,7 +926,7 @@ extension [C <: EcCurve](pub: PublicKey[C])
       case 32 => "P-256"
       case 48 => "P-384"
       case _  => "P-521"
-    pub.sec1.flatMap(s => hs.digest(canonJson(JWK.canonicalEc(crv, s, spec.fieldLength))))
+    pub.sec1.flatMap(s => hs.digest(canonJson(JWK.canonicalEc(crv, s.bytes, spec.fieldLength))))
 extension (pub: PublicKey[RSA])
   @targetName("thumbprintRsa")
   def thumbprint(using RsaKeys, Hash[Sha256]): Eff[KeyNotExportable, Digest] = pub.thumbprint(Sha256)
@@ -948,10 +1038,10 @@ object CoseKey:
         // OKP(1)/Ed25519(6); EC2(2)/P-256(1) reassembled to an uncompressed SEC1 point. RFC 9053
         // section 7.1.1 fixes each coordinate at the full curve size, so a short `x` padded by a
         // long `y` must not reassemble into a point of the right total length.
-        if f.kty == 1 && f.crv == 6 then ed.fromRaw(Slice.of(f.x)).map(ImportedPublicKey.Ed(_))
+        if f.kty == 1 && f.crv == 6 then PublicKey.parse(Ed25519)(Raw(Slice.of(f.x))).map(ImportedPublicKey.Ed(_))
         else if f.kty == 2 && f.crv == 1 then
           if f.x.length != P256.fieldLength then Eff.fail(InvalidKey.WrongLength(P256.fieldLength, f.x.length))
           else if f.y.length != P256.fieldLength then Eff.fail(InvalidKey.WrongLength(P256.fieldLength, f.y.length))
-          else p256.fromSec1(Slice.of(Array[Byte](4) ++ f.x ++ f.y)).map(ImportedPublicKey.EcP256(_))
+          else PublicKey.parse(P256)(SEC1(Slice.of(Array[Byte](4) ++ f.x ++ f.y))).map(ImportedPublicKey.EcP256(_))
         else Eff.fail(InvalidKey.Unsupported)
 end CoseKey

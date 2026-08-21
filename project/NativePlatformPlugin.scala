@@ -1,12 +1,16 @@
 import sbt.*
 import sbt.Keys.*
 
+import scala.scalanative.build.LTO
+import scala.scalanative.build.Mode
+import KufuliBuild.{optimisation, Optimisation}
+
 import snx.sbt.SNXImports.*
 
 /** sbt-snx wiring for kufuli's native rows: test-interface eviction scheme and static test
   * binaries.
   */
-object NativePlatformPlugin {
+object NativePlatformPlugin:
 
   // Set by CI for the musl-static cells; absent or unset for every dynamic build.
   private val staticLink: Boolean = sys.env.get("KUFULI_STATIC_LINK").contains("true")
@@ -51,7 +55,15 @@ object NativePlatformPlugin {
   val testLinkSettings: Seq[Setting[?]] = schemeSettings ++ Seq(
     Test / SNX.modifiers += Modifier.platform {
       case runtime @ Linux(_, Musl) if staticLink => SNX.staticRuntime(runtime)
-    }
+    },
+    Test / SNX.modifiers ++= (if optimisation.value == Optimisation.Full then Seq(releaseOptimisation) else Nil)
   )
 
-}
+  private def releaseOptimisation: Modifier[Native] = Modifier.platform {
+    // GNU ld performs LTO only through LLVMgold.so, which is packaged separately from clang and is
+    // absent on ordinary LLVM installs; lld links LLVM bitcode natively and ships with the toolchain
+    // Scala Native already requires. ld64 and lld-link need no such flag on the other two platforms.
+    case Linux(_, _) => native => native.mode(Mode.releaseFull).lto(LTO.thin).linkOptions("-fuse-ld=lld")
+    case _           => native => native.mode(Mode.releaseFull).lto(LTO.thin)
+  }
+end NativePlatformPlugin

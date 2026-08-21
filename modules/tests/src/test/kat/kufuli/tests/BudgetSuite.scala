@@ -93,4 +93,38 @@ class BudgetSuite extends munit.CatsEffectSuite:
     yield ()
     end for
   }
+
+  test("a forged record leaves no unauthenticated plaintext in the caller's buffer") {
+    // The engines decrypt before they authenticate, and a `Left` carries no length to tell a caller
+    // the buffer was touched at all - so a consumer reusing one record buffer would otherwise find
+    // attacker-chosen plaintext there after every forgery. The three backends reach the guarantee
+    // differently (the JVM erases, aws-lc erases by its own contract, node never copies out), so
+    // what is asserted is the guarantee itself: every octet is still either the caller's own fill
+    // or an erasure, and none of them is this record's plaintext.
+    val aad = Slice.of("aad".getBytes)
+    val fill = 1.toByte
+    // A full TLS-sized record, with every octet outside {0, fill} so a leak cannot pass as either.
+    val plaintext = Slice.of(Array.tabulate[Byte](1300)(i => (100 + (i % 100)).toByte))
+    for
+      key <- AesGcm256.generate.absolve
+      seen <- key.cipher.use { c =>
+                IO {
+                  val dst = Slice.of(Array.fill[Byte](1400)(fill))
+                  val n = c.encrypt(dst, plaintext, aad, nonce(1)).toOption.get
+                  val forged = Slice.of(dst.take(n).toArray)
+                  forged(0) = (forged(0) ^ 0xff).toByte
+                  val out = Slice.of(Array.fill[Byte](1400)(fill))
+                  val verdict = c.decrypt(out, forged, aad, nonce(2))
+                  (verdict = verdict.isLeft, residue = out.take(plaintext.length).toArray)
+                }
+              }.absolve
+      _ <- check(seen.verdict, "a forged record is rejected")
+      _ <- check(
+             seen.residue.forall(b => b == 0.toByte || b == fill),
+             s"and no plaintext reaches the buffer, got ${seen.residue.count(b => b != 0.toByte && b != fill)} foreign octets"
+           )
+    yield ()
+    end for
+  }
+
 end BudgetSuite

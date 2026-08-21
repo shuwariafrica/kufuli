@@ -38,7 +38,7 @@ class X509CorpusSuite extends munit.CatsEffectSuite:
   private def parse(json: String): Js = readFromString[Js](json)
 
   private def certificates(pems: List[String]): Either[String, List[x5.Certificate]] =
-    pems.traverse(pem => x5.Certificate.fromPem(pem).left.map(_ => s"unparseable certificate"))
+    pems.traverse(pem => x5.Certificate.parse(pem).left.map(_ => s"unparseable certificate"))
 
   private def outcome(
     chain: List[x5.Certificate],
@@ -51,8 +51,8 @@ class X509CorpusSuite extends munit.CatsEffectSuite:
       case Left(_)  => IO.pure(Left(x5.PathInvalid.UntrustedAnchor))
       case Right(t) =>
         (id, kind) match
-          case (Some(peer), "SERVER") => x5.CertPath.verify(chain, t, at, peer).either
-          case _                      => x5.CertPath.verifyClient(chain, t, at).either
+          case (Some(peer), "SERVER") => x5.CertPath.verify(chain, t, at, peer).either.absolve
+          case _                      => x5.CertPath.verifyClient(chain, t, at).either.absolve
 
   // The corpus's own `conflicts_with` field marks this pair as mutually exclusive: one asserts RFC
   // 5280's must-be-critical rule for NameConstraints, the other the CA/Browser Forum exception that
@@ -78,7 +78,7 @@ class X509CorpusSuite extends munit.CatsEffectSuite:
       val chain = c.field("peer_certificate").str :: c.field("untrusted_intermediates").arr.toList.map(_.str)
       val anchors = c.field("trusted_certs").arr.toList.map(_.str)
       val id =
-        if peer.field("kind").str == "DNS" || peer.field("kind").str == "IP" then x5.ServerId.of(peer.field("value").str).toOption
+        if peer.field("kind").str == "DNS" || peer.field("kind").str == "IP" then x5.ServerId.parse(peer.field("value").str).toOption
         else None
       (certificates(chain), certificates(anchors)) match
         // A rejected case whose own material will not parse is still a rejection, and every

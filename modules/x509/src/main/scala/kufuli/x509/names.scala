@@ -23,6 +23,7 @@ package kufuli.x509
 import scala.annotation.tailrec
 
 import boilerplate.Slice
+import boilerplate.ValueCodec
 
 import kufuli.Malformed
 
@@ -41,12 +42,15 @@ object IpAddress:
   /** Parses a presentation-form address - a dotted quad, or RFC 4291 IPv6 text with `::`
     * compression and an optional trailing dotted quad, enclosing brackets accepted.
     */
-  def of(text: String): Either[Malformed, IpAddress] =
+  def parse(text: String): Either[Malformed, IpAddress] =
     val bare =
       if text.length >= 2 && text.charAt(0) == '[' && text.charAt(text.length - 1) == ']' then text.substring(1, text.length - 1)
       else text
     val parsed = if bare.indexOf(':') >= 0 then ipv6(bare) else ipv4(bare).map(v => IpBits(0L, v, v6 = false))
     parsed.toRight(Malformed)
+
+  /** The wire-text contract: decode IS `parse`, encode the canonical presentation text. */
+  given valueCodec: ValueCodec.Aux[IpAddress, Malformed] = ValueCodec(parse, render)
 
   /** Wraps the 4 or 16 address octets an iPAddress SAN or a TLS peer address supplies. */
   def of(bytes: Slice): Either[Malformed, IpAddress] =
@@ -62,7 +66,30 @@ object IpAddress:
       if a.v6 then IArray.tabulate(16)(i => (if i < 8 then a.hi >>> ((7 - i) * 8) else a.lo >>> ((15 - i) * 8)).toByte)
       else IArray.tabulate(4)(i => (a.lo >>> ((3 - i) * 8)).toByte)
 
+    /** The canonical presentation text: a dotted quad, or RFC 5952 IPv6 (lowercase groups, the
+      * leftmost longest zero run compressed).
+      */
+    def value: String = render(a)
+
     private[x509] def bits: IpBits = a
+  end extension
+
+  private def render(a: IpAddress): String =
+    if !a.v6 then (0 to 3).map(i => ((a.lo >>> ((3 - i) * 8)) & 0xff).toString).mkString(".")
+    else
+      val gs = IArray.tabulate(8)(i => ((if i < 4 then a.hi >>> ((3 - i) * 16) else a.lo >>> ((7 - i) * 16)) & 0xffff).toInt)
+      @tailrec def zeroEnd(j: Int): Int = if j < 8 && gs(j) == 0 then zeroEnd(j + 1) else j
+      @tailrec def bestRun(i: Int, best: Int, bestLen: Int): (Int, Int) =
+        if i >= 8 then (best, bestLen)
+        else if gs(i) == 0 then
+          val j = zeroEnd(i)
+          if j - i > bestLen then bestRun(j, i, j - i) else bestRun(j, best, bestLen)
+        else bestRun(i + 1, best, bestLen)
+      val (best, bestLen) = bestRun(0, -1, 0)
+      def hex(g: Int): String = Integer.toHexString(g)
+      // RFC 5952 section 4.2.1: `::` stands in only for a run of two or more zero groups.
+      if bestLen >= 2 then gs.take(best).map(hex).mkString(":") + "::" + gs.drop(best + bestLen).map(hex).mkString(":")
+      else gs.map(hex).mkString(":")
 
   private def bigEndian(s: Slice, off: Int, n: Int): Long =
     (0 until n).foldLeft(0L)((acc, i) => (acc << 8) | (s(off + i) & 0xffL))
@@ -135,13 +162,22 @@ object ServerId:
   /** Classifies a peer identity: a bracketed or colon-bearing literal is IPv6, four dot-separated
     * decimal octets are IPv4, anything else must parse as a DNS name.
     */
-  def of(text: String): Either[Malformed, ServerId] =
-    if text.startsWith("[") || text.indexOf(':') >= 0 || dottedQuadShape(text) then IpAddress.of(text).map(ServerId.Ip(_))
-    else Hostname.of(text).map(ServerId.Dns(_))
+  def parse(text: String): Either[Malformed, ServerId] =
+    if text.startsWith("[") || text.indexOf(':') >= 0 || dottedQuadShape(text) then IpAddress.parse(text).map(ServerId.Ip(_))
+    else Hostname.parse(text).map(ServerId.Dns(_))
+
+  /** The wire-text contract: decode IS `parse` (the ONE audited RFC 9525 classifier), encode the
+    * identity's canonical text.
+    */
+  given valueCodec: ValueCodec.Aux[ServerId, Malformed] = ValueCodec(
+    parse,
+    { case ServerId.Dns(h) => Hostname.value(h); case ServerId.Ip(a) => IpAddress.value(a) }
+  )
 
   private def dottedQuadShape(text: String): Boolean =
     val parts = text.split('.')
     parts.length == 4 && text.count(_ == '.') == 3 && parts.forall(p => p.nonEmpty && p.forall(c => c >= '0' && c <= '9'))
+end ServerId
 
 // The GeneralName forms RFC 5280 gives no matching rule for, plus uniformResourceIdentifier. A
 // constraint naming one of these rejects any certificate presenting that form and is vacuous

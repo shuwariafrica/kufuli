@@ -65,6 +65,19 @@ private[kufuli] def secretRead[B](r: SecretRepr)(f: boilerplate.Slice => B): B =
   case h: SecretHandle       =>
     val _ = h.handle // liveness first, so a destroyed handle reports destruction rather than absence
     throw new IllegalStateException("handle-backed key has no byte view") // scalafix:ok DisableSyntax.throw
+// As `secretRead`, holding the guard across the RETURNED EFFECT rather than only across the call:
+// a continuation that merely builds an effect would otherwise hand the view on to a runtime the
+// guard has already released. The handle arm has no byte view here either.
+private[kufuli] def secretReadEff[E <: Throwable, B](r: SecretRepr)(
+  f: boilerplate.Slice => boilerplate.effect.Eff[E, B]
+): boilerplate.effect.Eff[E, B] = r match
+  case s: boilerplate.Secret => boilerplate.effect.useEff(s)(f)
+  case h: SecretHandle       =>
+    boilerplate.effect.Eff.suspend {
+      val _ = h.handle // liveness first, so a destroyed handle reports destruction rather than absence
+      throw new IllegalStateException("handle-backed key has no byte view") // scalafix:ok DisableSyntax.throw
+    }
+
 private[kufuli] def secretDestroy(r: SecretRepr): Unit = r match
   case s: boilerplate.Secret => boilerplate.Secret.destroy(s)()
   case h: SecretHandle       => h.kill()

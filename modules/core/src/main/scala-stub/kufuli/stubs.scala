@@ -179,13 +179,13 @@ private[kufuli] object stubs:
       KeyPair(PublicKey.unsafe(keyGenerated(body.clone)), PrivateKey.unsafeRepr(secretGenerated(body)))
     }
     private[kufuli] def fromRaw(bytes: Slice) = Eff.delay {
-      if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
-      else if bytes(0) == -1 then Left(InvalidKey.NotOnCurve)
+      if bytes(0) == -1 then Left(Refused) // the stub off-curve marker
       else Right(PublicKey.unsafe[Ed25519](keyRepr(bytes.toArray)))
     }
-    private[kufuli] def fromSpki(der: Slice) = Eff.from(DER.payload(der, DER.edSpkiPrefix, 32)).flatMap(fromRaw)
+    private[kufuli] def fromSpki(der: Slice) =
+      Eff.from(DER.payload(der, DER.edSpkiPrefix, 32).left.map(_ => Refused)).flatMap(fromRaw)
     private[kufuli] def fromPkcs8(der: Slice) =
-      Eff.delay(DER.payload(der, DER.edPkcs8Prefix, 32).map(s => PrivateKey.unsafe[Ed25519](s.toArray)))
+      Eff.delay(DER.payload(der, DER.edPkcs8Prefix, 32).left.map(_ => Refused).map(s => PrivateKey.unsafe[Ed25519](s.toArray)))
     private[kufuli] def raw(key: PublicKey[Ed25519]) = Eff.succeed(IArray.from(keyBytes(key.repr)))
     private[kufuli] def spki(key: PublicKey[Ed25519]) = Eff.succeed(IArray.from(DER.edSpkiPrefix ++ keyBytes(key.repr)))
     private[kufuli] def pkcs8(key: PrivateKey[Ed25519]) =
@@ -201,13 +201,12 @@ private[kufuli] object stubs:
       KeyPair(PublicKey.unsafe(keyGenerated(b.clone)), PrivateKey.unsafeRepr(secretGenerated(b)))
     }
     private[kufuli] def fromRaw(bytes: Slice) = Eff.delay {
-      if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
-      else if bytes.toArray.forall(_ == 0) then Left(InvalidKey.WeakPoint)
-      else Right(PublicKey.unsafe[X25519](keyRepr(bytes.toArray)))
+      Right(PublicKey.unsafe[X25519](keyRepr(bytes.toArray))): Either[Refused, PublicKey[X25519]]
     }
-    private[kufuli] def fromSpki(der: Slice) = Eff.from(DER.payload(der, DER.xSpkiPrefix, 32)).flatMap(fromRaw)
+    private[kufuli] def fromSpki(der: Slice) =
+      Eff.from(DER.payload(der, DER.xSpkiPrefix, 32).left.map(_ => Refused)).flatMap(fromRaw)
     private[kufuli] def fromPkcs8(der: Slice) =
-      Eff.delay(DER.payload(der, DER.xPkcs8Prefix, 32).map(s => PrivateKey.unsafe[X25519](s.toArray)))
+      Eff.delay(DER.payload(der, DER.xPkcs8Prefix, 32).left.map(_ => Refused).map(s => PrivateKey.unsafe[X25519](s.toArray)))
     private[kufuli] def raw(key: PublicKey[X25519]) = Eff.succeed(IArray.from(keyBytes(key.repr)))
     private[kufuli] def spki(key: PublicKey[X25519]) = Eff.succeed(IArray.from(DER.xSpkiPrefix ++ keyBytes(key.repr)))
     private[kufuli] def pkcs8(key: PrivateKey[X25519]) =
@@ -229,19 +228,18 @@ private[kufuli] object stubs:
       KeyPair(PublicKey.unsafe(keyGenerated(body.clone)), PrivateKey.unsafeRepr(secretGenerated(body)))
     }
     private[kufuli] def fromSec1(point: Slice) = Eff.delay {
-      if point.length != pointLength then Left(InvalidKey.WrongLength(pointLength, point.length))
-      else if point(0) != 4.toByte then Left(InvalidKey.Malformed)
-      else if point(1) == -1 then Left(InvalidKey.NotOnCurve)
+      if point(1) == -1 then Left(Refused) // the stub off-curve marker
       else Right(PublicKey.unsafe[C](keyRepr(point.toArray)))
     }
-    private[kufuli] def fromSpki(der: Slice) = Eff.from(DER.payload(der, spkiPrefix, pointLength)).flatMap(fromSec1)
+    private[kufuli] def fromSpki(der: Slice) =
+      Eff.from(DER.payload(der, spkiPrefix, pointLength).left.map(_ => Refused)).flatMap(fromSec1)
     private[kufuli] def fromPkcs8(der: Slice) = Eff.delay {
       val expected = DER.sequence(
         DER.integer(Array.emptyByteArray),
         DER.sequence(DER.objectId(DER.oidEcPublic), DER.objectId(curveOid)),
         DER.octetString(new Array[Byte](pointLength))
       )
-      if der.length != expected.length then Left(InvalidKey.Malformed)
+      if der.length != expected.length then Left(Refused)
       else Right(PrivateKey.unsafe[C](der.drop(der.length - pointLength).toArray))
     }
     private[kufuli] def sec1(key: PublicKey[C]) = Eff.succeed(IArray.from(keyBytes(key.repr)))
@@ -265,15 +263,24 @@ private[kufuli] object stubs:
   end StubEcKeys
 
   final private[kufuli] class StubRsaKeys extends RsaKeys:
-    // stub key layout: repr = modulus ++ exponent(3 bytes, 0x010001)
+    // stub key layout: exponent length (2 octets, big-endian) ++ exponent ++ modulus. The length is
+    // carried rather than assumed, because the JWK `e` is minimal-width: 65537 is three octets but
+    // 3 is one and 2^64+1 is nine, and a fixed split would hand every such key back with octets of
+    // its modulus read as its exponent.
     private val e = Array[Byte](1, 0, 1)
+    private def pack(modulus: Array[Byte], exponent: Array[Byte]): Array[Byte] =
+      Array[Byte]((exponent.length >>> 8).toByte, exponent.length.toByte) ++ exponent ++ modulus
+    private def exponentLength(b: Array[Byte]): Int = ((b(0) & 0xff) << 8) | (b(1) & 0xff)
+    private def modulusOf(b: Array[Byte]): Array[Byte] = b.drop(2 + exponentLength(b))
+    private def exponentOf(b: Array[Byte]): Array[Byte] = b.slice(2, 2 + exponentLength(b))
+    private def wellFormed(b: Array[Byte]): Boolean = b.length > 2 && b.length > 2 + exponentLength(b)
     private[kufuli] def generate(size: RSA.Size) = Eff.suspend {
-      val body = fresh("rsa")(size.bits / 8) ++ e
+      val body = pack(fresh("rsa")(size.bits / 8), e)
       KeyPair(PublicKey.unsafe(keyGenerated(body.clone)), PrivateKey.unsafeRepr(secretGenerated(body)))
     }
     private[kufuli] def fromComponents(modulus: Slice, exponent: Slice) = Eff.delay {
-      if modulus.isEmpty || exponent.isEmpty then Left(InvalidKey.Malformed)
-      else RSA.flooredComponents(modulus).map(_ => PublicKey.unsafe[RSA](keyRepr(modulus.toArray ++ exponent.toArray)))
+      if modulus.isEmpty || exponent.isEmpty || exponent.length > 0xffff then Left(Refused)
+      else Right(PublicKey.unsafe[RSA](keyRepr(pack(modulus.toArray, exponent.toArray)))): Either[Refused, PublicKey[RSA]]
     }
     // A DER INTEGER carries a leading zero only to clear a set sign bit, so an exponent such as
     // 65537 has none and its first content octet is magnitude.
@@ -283,37 +290,36 @@ private[kufuli] object stubs:
     private[kufuli] def fromSpki(der: Slice) = Eff
       .delay {
         // real parse via the bounded reader: SEQ { SEQ { oid, NULL }, BIT STRING { SEQ { INT n, INT e } } }
-        for
+        (for
           outer <- DER.read(der, 0, 0x30)
           algId <- DER.within(der, outer.contentOff, 0x30, outer.next)
           bits <- DER.within(der, algId.next, 0x03, outer.next)
           inner <- DER.within(der, bits.contentOff + 1, 0x30, bits.next)
           n <- DER.within(der, inner.contentOff, 0x02, inner.next)
           ex <- DER.within(der, n.next, 0x02, inner.next)
-        yield (magnitude(der, n), magnitude(der, ex))
+        yield (magnitude(der, n), magnitude(der, ex))).left.map(_ => Refused)
       }
       .flatMap((n, ex) => fromComponents(Slice.of(n), Slice.of(ex)))
     private[kufuli] def fromPkcs8(der: Slice) = Eff.delay {
-      for
+      (for
         outer <- DER.read(der, 0, 0x30)
         v <- DER.read(der, outer.contentOff, 0x02)
         algId <- DER.read(der, v.next, 0x30)
         octets <- DER.read(der, algId.next, 0x04)
         body = der.slice(octets.contentOff, octets.next)
-        _ <- if body.length > e.length then Right(()) else Left(InvalidKey.Malformed)
-        _ <- RSA.floored(body.take(body.length - e.length))
-      yield PrivateKey.unsafe[RSA](body.toArray)
+        _ <- if wellFormed(body.toArray) then Right(()) else Left(Refused)
+      yield PrivateKey.unsafe[RSA](body.toArray)).left.map(_ => Refused)
     }
     private[kufuli] def components(key: PublicKey[RSA]) =
       val b = keyBytes(key.repr)
-      Eff.succeed(RSA.Components(IArray.from(b.take(b.length - 3)), IArray.from(b.drop(b.length - 3))))
+      Eff.succeed(RSA.Components(IArray.from(modulusOf(b)), IArray.from(exponentOf(b))))
     private[kufuli] def spki(key: PublicKey[RSA]) =
       val b = keyBytes(key.repr)
       Eff.succeed(
         IArray.from(
           DER.sequence(
             DER.sequence(DER.objectId(DER.oidRsa), DER.nullValue),
-            DER.bitString(DER.sequence(DER.integer(b.take(b.length - 3)), DER.integer(b.drop(b.length - 3))))
+            DER.bitString(DER.sequence(DER.integer(modulusOf(b)), DER.integer(exponentOf(b))))
           )
         )
       )

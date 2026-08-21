@@ -25,22 +25,34 @@ import boilerplate.Slice
 import kufuli.nodecrypto.ba
 import kufuli.nodecrypto.crypto
 import kufuli.nodecrypto.u8
+import kufuli.nodecrypto.zero
 
-// A raw AES block via one-block CBC with a zero IV - node's ECB needs a null IV, which lint forbids.
-private[unsafe] def aesBlockEncrypt(key: Array[Byte], src: Slice, dst: Slice): Unit =
-  val cipher = crypto.createCipheriv(s"aes-${key.length * 8}-cbc", u8(key), u8(new Array[Byte](16)))
-  val _ = cipher.setAutoPadding(false)
-  val out = ba(cipher.update(u8(src.take(16).toArray))) ++ ba(cipher.`final`())
-  val _ = Slice.of(out).copyInto(dst)
+private[unsafe] def aesBlockEngine(key: Array[Byte]): AesBlockEngine =
+  new AesBlockEngine:
+    // node builds its cipher state per `createCipheriv`, so there is no context to hold across
+    // packets; the key buffer is what the handle owns, and it is zeroed at release.
+    private val kb = u8(key)
+    private val zeroIv = u8(new Array[Byte](16))
+    private val name = s"aes-${key.length * 8}-cbc" // node's ECB needs a null IV, which lint forbids
+    def encrypt(src: Slice, dst: Slice): Unit =
+      val cipher = crypto.createCipheriv(name, kb, zeroIv)
+      val _ = cipher.setAutoPadding(false)
+      val out = ba(cipher.update(u8(src.take(16).toArray))) ++ ba(cipher.`final`())
+      val _ = Slice.of(out).copyInto(dst)
+    def release(): Unit = zero(kb)
 
-// node's `chacha20` IV is a 32-bit little-endian counter followed by the 96-bit nonce (RFC 8439).
-private[unsafe] def chacha20Keystream(key: Array[Byte], dst: Slice, nonce: Slice, counter: Int): Unit =
-  val iv = new Array[Byte](16)
-  iv(0) = counter.toByte
-  iv(1) = (counter >>> 8).toByte
-  iv(2) = (counter >>> 16).toByte
-  iv(3) = (counter >>> 24).toByte
-  val _ = nonce.copyInto(Slice.of(iv).drop(4))
-  val cipher = crypto.createCipheriv("chacha20", u8(key), u8(iv))
-  val out = ba(cipher.update(u8(new Array[Byte](dst.length)))) ++ ba(cipher.`final`())
-  val _ = Slice.of(out).copyInto(dst)
+private[unsafe] def chacha20Engine(key: Array[Byte]): ChaCha20Engine =
+  new ChaCha20Engine:
+    private val kb = u8(key)
+    def keystream(dst: Slice, nonce: Slice, counter: Int): Unit =
+      // node's `chacha20` IV is a 32-bit little-endian counter followed by the 96-bit nonce (RFC 8439).
+      val iv = new Array[Byte](16)
+      iv(0) = counter.toByte
+      iv(1) = (counter >>> 8).toByte
+      iv(2) = (counter >>> 16).toByte
+      iv(3) = (counter >>> 24).toByte
+      val _ = nonce.copyInto(Slice.of(iv).drop(4))
+      val cipher = crypto.createCipheriv("chacha20", kb, u8(iv))
+      val out = ba(cipher.update(u8(new Array[Byte](dst.length)))) ++ ba(cipher.`final`())
+      val _ = Slice.of(out).copyInto(dst)
+    def release(): Unit = zero(kb)

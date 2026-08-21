@@ -28,6 +28,7 @@ import scala.scalajs.js
 import scala.scalajs.js.typedarray.Uint8Array
 
 import boilerplate.Slice
+import boilerplate.codec.Base64Url
 import boilerplate.effect.Eff
 import boilerplate.effect.UEff
 import boilerplate.nullable.option
@@ -88,7 +89,8 @@ private[kufuli] object node:
     )
 
   // Re-raising sends the error through `guard` to a sanitised `Unexpected` defect, which is where a
-  // wrongly-called primitive belongs.
+  // wrongly-called primitive belongs. EVERY typed failure this backend reports comes through here,
+  // imports and data alike, so no arm can turn a kufuli bug into a forgery a consumer logs.
   private def failing[E, A](error: E)(f: => A): Either[E, A] =
     try Right(f)
     catch
@@ -96,8 +98,9 @@ private[kufuli] object node:
         if errorCode(e).exists(defectCodes.contains) then throw e // scalafix:ok DisableSyntax.throw
         else Left(error)
 
-  private def validating[A](notOnCurve: Boolean)(f: => A): Either[InvalidKey, A] =
-    failing(if notOnCurve then InvalidKey.NotOnCurve else InvalidKey.Malformed)(f)
+  // Import refusal is BINARY here: the companion door names the public arm from the form it was
+  // handed, so this backend cannot classify differently from its siblings.
+  private def refusing[A](f: => A): Either[Refused, A] = failing(Refused: Refused)(f)
 
   private def derPub(der: Uint8Array): js.Any = js.Dynamic.literal(key = der, format = "der", `type` = "spki")
   private def derPriv(der: Uint8Array): js.Any = js.Dynamic.literal(key = der, format = "der", `type` = "pkcs8")
@@ -120,16 +123,15 @@ private[kufuli] object node:
     k.asymmetricKeyType.toOption.contains(kind) &&
       curve.forall(c => k.asymmetricKeyDetails.toOption.flatMap(_.namedCurve.toOption).contains(c))
 
-  private def storePub(der: Array[Byte], kind: String, curve: Option[String], notOnCurve: Boolean): Either[InvalidKey, Array[Byte]] =
-    if !DER.spansWhole(Slice.of(der), 0x30) then Left(InvalidKey.Malformed)
-    else
-      validating(notOnCurve)(parsePub(der)).flatMap(k => if bound(k, kind, curve) then Right(exportSpki(k)) else Left(InvalidKey.Malformed))
+  private def storePub(der: Array[Byte], kind: String, curve: Option[String]): Either[Refused, Array[Byte]] =
+    if !DER.spansWhole(Slice.of(der), 0x30) then Left(Refused)
+    else refusing(parsePub(der)).flatMap(k => if bound(k, kind, curve) then Right(exportSpki(k)) else Left(Refused))
 
-  private def storePriv(der: Array[Byte], kind: String, curve: Option[String]): Either[InvalidKey, Array[Byte]] =
-    if !DER.spansWhole(Slice.of(der), 0x30) then Left(InvalidKey.Malformed)
+  private def storePriv(der: Array[Byte], kind: String, curve: Option[String]): Either[Refused, Array[Byte]] =
+    if !DER.spansWhole(Slice.of(der), 0x30) then Left(Refused)
     else
-      validating(notOnCurve = false)(crypto.createPrivateKey(derPriv(u8(der))))
-        .flatMap(k => if bound(k, kind, curve) then Right(exportPkcs8(k)) else Left(InvalidKey.Malformed))
+      refusing(crypto.createPrivateKey(derPriv(u8(der))))
+        .flatMap(k => if bound(k, kind, curve) then Right(exportPkcs8(k)) else Left(Refused))
 
   private def publicPoint(key: KeyRepr, length: Int): IArray[Byte] =
     IArray.from(demand(DER.spkiPublicBits(Slice.of(keyBytes(key)), length)).toArray)
@@ -140,9 +142,10 @@ private[kufuli] object node:
     case _: Sha512.type => "sha512"
 
   // The key arrives as a buffer so a composite key can be halved by window and so erasing it stays
-  // with whoever made the copy.
+  // with whoever made the copy. Drained, because on the KDF paths the digest IS the derived key:
+  // node's own buffer is erased once the array copy holds it rather than left to the collector.
   private def hmacRaw(name: String, key: Uint8Array, data: Uint8Array): Array[Byte] =
-    ba(crypto.createHmac(name, key).update(data).digest())
+    drained(crypto.createHmac(name, key).update(data).digest())
 
   private def setAad(c: NodeCipher, aad: Slice): Unit =
     if aad.length > 0 then c.setAAD(u8(aad.toArray))
@@ -184,8 +187,7 @@ private[kufuli] object node:
             val d = mkCipher(cipherName, kb, u8(nonce.repr), chacha, decrypt = true)
             setAad(d, aad)
             d.setAuthTag(u8(tag))
-            try Right(Slice.of(ba(d.update(u8(ct))) ++ ba(d.`final`())))
-            catch case _: js.JavaScriptException => Left(AuthFailed)
+            failing(AuthFailed: AuthFailed)(Slice.of(ba(d.update(u8(ct))) ++ ba(d.`final`())))
         }
       }
     }
@@ -230,8 +232,7 @@ private[kufuli] object node:
             if !Slice.of(macTag(window(kb, 0, half), iv, aad, ct)).constantTimeEquals(Slice.of(tag)) then Left(AuthFailed)
             else
               val d = crypto.createDecipheriv(s"aes-${half * 8}-cbc", window(kb, half, half), u8(iv))
-              try Right(Slice.of(ba(d.update(u8(ct))) ++ ba(d.`final`())))
-              catch case _: js.JavaScriptException => Left(AuthFailed)
+              failing(AuthFailed: AuthFailed)(Slice.of(ba(d.update(u8(ct))) ++ ba(d.`final`())))
         }
       }
     }
@@ -258,6 +259,9 @@ private[kufuli] object node:
       val d = mkCipher(cipherName, keyBuf, u8(nonce.toArray), chacha, decrypt = true)
       setAad(d, aad)
       val _ = d.setAuthTag(u8(tag))
+      // Not `failing` here, unlike the effectful arms: this method is the synchronous record engine,
+      // outside `guard`, so a re-raise would reach a loop thread unsanitised. Every argument it takes
+      // is pre-validated by the budgeted wrapper, so node's misuse codes are unreachable from it.
       try
         val out = ba(d.update(u8(ct))) ++ ba(d.`final`())
         val _ = Slice.of(out).copyInto(dst)
@@ -271,9 +275,8 @@ private[kufuli] object node:
       Resource
         .make(guard(IO(key.material { k =>
           val a = k.toArray
-          val buf = u8(a)
-          val _ = Slice.of(a).wipe()
-          buf
+          try u8(a)
+          finally Slice.of(a).wipe()
         })))(buf => IO(zero(buf)))
         .map(buf => new AeadEngine(buf, spec, cipherName, chacha))
 
@@ -382,7 +385,9 @@ private[kufuli] object node:
       kek.material { k =>
         withSecret(k) { kb =>
           val c = crypto.createCipheriv(cipherName(kb.length), kb, u8(iv))
-          Slice.of(ba(c.update(u8(target.toArray))) ++ ba(c.`final`()))
+          // The target is plaintext key material exactly as the KEK is, so it crosses into node
+          // through the same erasing window rather than as two abandoned copies.
+          withSecret(target)(tb => Slice.of(ba(c.update(tb)) ++ ba(c.`final`())))
         }
       }
     }
@@ -390,8 +395,16 @@ private[kufuli] object node:
       kek.material { k =>
         withSecret(k) { kb =>
           val d = crypto.createDecipheriv(cipherName(kb.length), kb, u8(iv))
-          try Right(Slice.of(ba(d.update(u8(wrapped.toArray))) ++ ba(d.`final`())))
-          catch case _: js.JavaScriptException => Left(UnwrapFailed)
+          // Each fragment holds part of the recovered key; only the joined array is handed on, so
+          // the fragments are erased here - on the failing path of the second call as well.
+          def joined(): Array[Byte] =
+            val head = drained(d.update(u8(wrapped.toArray)))
+            try
+              val tail = drained(d.`final`())
+              try head ++ tail
+              finally Slice.of(tail).wipe()
+            finally Slice.of(head).wipe()
+          failing(UnwrapFailed: UnwrapFailed)(Slice.of(joined()))
         }
       }
     }
@@ -410,21 +423,24 @@ private[kufuli] object node:
           val n = (length + hlen - 1) / hlen
           val out = new Array[Byte](n * hlen)
           val infoBytes = info.toArray
-          // The counter chain carries the derived key forward, so each round erases its input and its
-          // predecessor: wiping `out` alone leaves those same octets live in the chain's garbage.
+          // The counter chain carries the derived key forward, so each round erases its input and
+          // its predecessor - in `finally`, so a failing primitive cannot abandon them - and the
+          // accumulator is erased on every exit path.
           @tailrec def go(i: Int, prev: Array[Byte]): Unit =
             if i > n then Slice.of(prev).wipe()
             else
               val input = prev ++ infoBytes ++ Array[Byte](i.toByte)
-              val block = withBuffer(input)(hmacRaw(name, key, _))
+              val block =
+                try withBuffer(input)(hmacRaw(name, key, _))
+                finally
+                  Slice.of(input).wipe()
+                  Slice.of(prev).wipe()
               Array.copy(block, 0, out, (i - 1) * hlen, hlen)
-              Slice.of(input).wipe()
-              Slice.of(prev).wipe()
               go(i + 1, block)
-          go(1, Array.emptyByteArray)
-          val taken = Slice.of(out.take(length))
-          Slice.of(out).wipe()
-          taken
+          try
+            go(1, Array.emptyByteArray)
+            Slice.of(out.take(length))
+          finally Slice.of(out).wipe()
         }
       }
     }
@@ -437,18 +453,24 @@ private[kufuli] object node:
         val pwBytes = password.toArray
         val pw = u8(pwBytes)
         Slice.of(pwBytes).wipe()
-        crypto.pbkdf2(
-          pw,
-          u8(salt.toArray),
-          iterations,
-          length,
-          digestName(hash),
-          (err, out) =>
+        try
+          crypto.pbkdf2(
+            pw,
+            u8(salt.toArray),
+            iterations,
+            length,
+            digestName(hash),
+            (err, out) =>
+              zero(pw)
+              err.option match
+                case None    => cb(Right(Slice.of(drained(out))))
+                case Some(e) => cb(Left(js.JavaScriptException(e)))
+          )
+        catch
+          case t: Throwable =>
             zero(pw)
-            err.option match
-              case None    => cb(Right(Slice.of(drained(out))))
-              case Some(e) => cb(Left(js.JavaScriptException(e)))
-        )
+            throw t // scalafix:ok DisableSyntax.throw
+        end try
       })
 
   private def hashOf[D <: HashAlgorithm](name: String): Hash[D] = new Hash[D]:
@@ -471,8 +493,9 @@ private[kufuli] object node:
     private[kufuli] def decrypt(key: PrivateKey[RSA], ciphertext: Slice, scheme: RsaOaep): Eff[AuthFailed, Slice] = opE {
       key.material { der =>
         withSecret(der) { buf =>
-          try Right(Slice.of(ba(crypto.privateDecrypt(oaepOptions(crypto.createPrivateKey(derPriv(buf)), scheme.hash), u8(ciphertext.toArray)))))
-          catch case _: js.JavaScriptException => Left(AuthFailed)
+          failing(AuthFailed: AuthFailed)(
+            Slice.of(ba(crypto.privateDecrypt(oaepOptions(crypto.createPrivateKey(derPriv(buf)), scheme.hash), u8(ciphertext.toArray))))
+          )
         }
       }
     }
@@ -484,13 +507,11 @@ private[kufuli] object node:
       genKeyPair("ed25519", emptyOptions).map((pub, priv) =>
         KeyPair(PublicKey.unsafe(keyRepr(exportSpki(pub))), PrivateKey.unsafe(exportPkcs8(priv)))
       )
-    private[kufuli] def fromRaw(bytes: Slice): Eff[InvalidKey, PublicKey[Ed25519]] = opE {
-      if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
-      else storePub(DER.edSpkiPrefix ++ bytes.toArray, "ed25519", None, notOnCurve = true).map(b => PublicKey.unsafe[Ed25519](keyRepr(b)))
-    }
-    private[kufuli] def fromSpki(der: Slice): Eff[InvalidKey, PublicKey[Ed25519]] =
-      opE(storePub(der.toArray, "ed25519", None, notOnCurve = false).map(b => PublicKey.unsafe[Ed25519](keyRepr(b))))
-    private[kufuli] def fromPkcs8(der: Slice): Eff[InvalidKey, PrivateKey[Ed25519]] =
+    private[kufuli] def fromRaw(bytes: Slice): Eff[Refused, PublicKey[Ed25519]] =
+      opE(storePub(DER.edSpkiPrefix ++ bytes.toArray, "ed25519", None).map(b => PublicKey.unsafe[Ed25519](keyRepr(b))))
+    private[kufuli] def fromSpki(der: Slice): Eff[Refused, PublicKey[Ed25519]] =
+      opE(storePub(der.toArray, "ed25519", None).map(b => PublicKey.unsafe[Ed25519](keyRepr(b))))
+    private[kufuli] def fromPkcs8(der: Slice): Eff[Refused, PrivateKey[Ed25519]] =
       opE(storePriv(der.toArray, "ed25519", None).map(PrivateKey.unsafe[Ed25519]))
     private[kufuli] def raw(key: PublicKey[Ed25519]): Eff[KeyNotExportable, IArray[Byte]] =
       op(publicPoint(key.repr, 32))
@@ -503,14 +524,11 @@ private[kufuli] object node:
       genKeyPair("x25519", emptyOptions).map((pub, priv) =>
         KeyPair(PublicKey.unsafe(keyRepr(exportSpki(pub))), PrivateKey.unsafe(exportPkcs8(priv)))
       )
-    private[kufuli] def fromRaw(bytes: Slice): Eff[InvalidKey, PublicKey[X25519]] = opE {
-      if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
-      else if bytes.toArray.forall(_ == 0) then Left(InvalidKey.WeakPoint)
-      else storePub(DER.xSpkiPrefix ++ bytes.toArray, "x25519", None, notOnCurve = true).map(b => PublicKey.unsafe[X25519](keyRepr(b)))
-    }
-    private[kufuli] def fromSpki(der: Slice): Eff[InvalidKey, PublicKey[X25519]] =
-      opE(storePub(der.toArray, "x25519", None, notOnCurve = false).map(b => PublicKey.unsafe[X25519](keyRepr(b))))
-    private[kufuli] def fromPkcs8(der: Slice): Eff[InvalidKey, PrivateKey[X25519]] =
+    private[kufuli] def fromRaw(bytes: Slice): Eff[Refused, PublicKey[X25519]] =
+      opE(storePub(DER.xSpkiPrefix ++ bytes.toArray, "x25519", None).map(b => PublicKey.unsafe[X25519](keyRepr(b))))
+    private[kufuli] def fromSpki(der: Slice): Eff[Refused, PublicKey[X25519]] =
+      opE(storePub(der.toArray, "x25519", None).map(b => PublicKey.unsafe[X25519](keyRepr(b))))
+    private[kufuli] def fromPkcs8(der: Slice): Eff[Refused, PrivateKey[X25519]] =
       opE(storePriv(der.toArray, "x25519", None).map(PrivateKey.unsafe[X25519]))
     private[kufuli] def raw(key: PublicKey[X25519]): Eff[KeyNotExportable, IArray[Byte]] =
       op(publicPoint(key.repr, 32))
@@ -524,14 +542,11 @@ private[kufuli] object node:
       genKeyPair("ec", js.Dynamic.literal(namedCurve = curveName)).map((pub, priv) =>
         KeyPair(PublicKey.unsafe(keyRepr(exportSpki(pub))), PrivateKey.unsafe(exportPkcs8(priv)))
       )
-    private[kufuli] def fromSec1(point: Slice): Eff[InvalidKey, PublicKey[C]] = opE {
-      if point.length != pointLength then Left(InvalidKey.WrongLength(pointLength, point.length))
-      else if point(0) != 4.toByte then Left(InvalidKey.Malformed)
-      else storePub(prefix ++ point.toArray, "ec", Some(curveName), notOnCurve = true).map(b => PublicKey.unsafe[C](keyRepr(b)))
-    }
-    private[kufuli] def fromSpki(der: Slice): Eff[InvalidKey, PublicKey[C]] =
-      opE(storePub(der.toArray, "ec", Some(curveName), notOnCurve = false).map(b => PublicKey.unsafe[C](keyRepr(b))))
-    private[kufuli] def fromPkcs8(der: Slice): Eff[InvalidKey, PrivateKey[C]] =
+    private[kufuli] def fromSec1(point: Slice): Eff[Refused, PublicKey[C]] =
+      opE(storePub(prefix ++ point.toArray, "ec", Some(curveName)).map(b => PublicKey.unsafe[C](keyRepr(b))))
+    private[kufuli] def fromSpki(der: Slice): Eff[Refused, PublicKey[C]] =
+      opE(storePub(der.toArray, "ec", Some(curveName)).map(b => PublicKey.unsafe[C](keyRepr(b))))
+    private[kufuli] def fromPkcs8(der: Slice): Eff[Refused, PrivateKey[C]] =
       opE(storePriv(der.toArray, "ec", Some(curveName)).map(PrivateKey.unsafe[C]))
     private[kufuli] def sec1(key: PublicKey[C]): Eff[KeyNotExportable, IArray[Byte]] = op(publicPoint(key.repr, pointLength))
     private[kufuli] def spki(key: PublicKey[C]): Eff[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
@@ -543,23 +558,17 @@ private[kufuli] object node:
       genKeyPair("rsa", js.Dynamic.literal(modulusLength = size.bits)).map((pub, priv) =>
         KeyPair(PublicKey.unsafe(keyRepr(exportSpki(pub))), PrivateKey.unsafe(exportPkcs8(priv)))
       )
-    private[kufuli] def fromComponents(modulus: Slice, exponent: Slice): Eff[InvalidKey, PublicKey[RSA]] = opE {
-      RSA.flooredComponents(modulus).flatMap { _ =>
-        validating(notOnCurve = false) {
-          val jwk = js.Dynamic.literal(kty = "RSA", n = Base64Url.encode(modulus.toArray), e = Base64Url.encode(exponent.toArray))
-          val ko = crypto.createPublicKey(js.Dynamic.literal(key = jwk, format = "jwk"))
-          PublicKey.unsafe[RSA](keyRepr(exportSpki(ko)))
-        }
+    private[kufuli] def fromComponents(modulus: Slice, exponent: Slice): Eff[Refused, PublicKey[RSA]] = opE {
+      refusing {
+        val jwk = js.Dynamic.literal(kty = "RSA", n = Base64Url.encode(modulus.toArray), e = Base64Url.encode(exponent.toArray))
+        val ko = crypto.createPublicKey(js.Dynamic.literal(key = jwk, format = "jwk"))
+        PublicKey.unsafe[RSA](keyRepr(exportSpki(ko)))
       }
     }
-    private[kufuli] def fromSpki(der: Slice): Eff[InvalidKey, PublicKey[RSA]] =
-      opE(
-        storePub(der.toArray, "rsa", None, notOnCurve = false).flatMap(b =>
-          RSA.flooredSpki(Slice.of(b)).map(_ => PublicKey.unsafe[RSA](keyRepr(b)))
-        )
-      )
-    private[kufuli] def fromPkcs8(der: Slice): Eff[InvalidKey, PrivateKey[RSA]] =
-      opE(storePriv(der.toArray, "rsa", None).flatMap(b => RSA.flooredPkcs8(Slice.of(b)).map(_ => PrivateKey.unsafe[RSA](b))))
+    private[kufuli] def fromSpki(der: Slice): Eff[Refused, PublicKey[RSA]] =
+      opE(storePub(der.toArray, "rsa", None).map(b => PublicKey.unsafe[RSA](keyRepr(b))))
+    private[kufuli] def fromPkcs8(der: Slice): Eff[Refused, PrivateKey[RSA]] =
+      opE(storePriv(der.toArray, "rsa", None).map(PrivateKey.unsafe[RSA]))
     private[kufuli] def components(key: PublicKey[RSA]): Eff[KeyNotExportable, RSA.Components] = op {
       val der = Slice.of(keyBytes(key.repr))
       demand(
@@ -578,35 +587,33 @@ private[kufuli] object node:
     private[kufuli] def pkcs8(key: PrivateKey[RSA]): Eff[KeyNotExportable, IArray[Byte]] =
       Eff.defer(op(key.material(exported)))
 
-  private def kemKeysOf[K <: KemAlgorithm](kind: String, spec: KemSpec[K]): KemKeys[K] = new KemKeys[K]:
+  private def kemKeysOf[K <: KemAlgorithm](kind: String): KemKeys[K] = new KemKeys[K]:
     private[kufuli] def generate: UEff[KeyPair[PublicKey[K], PrivateKey[K]]] =
       genKeyPair(kind, emptyOptions).map { (pub, priv) =>
         val rawPub = ba(pub.`export`(js.Dynamic.literal(format = "raw-public")))
         val seed = drained(priv.`export`(js.Dynamic.literal(format = "raw-seed")))
         KeyPair(PublicKey.unsafe(keyRepr(rawPub)), PrivateKey.unsafe(seed))
       }
-    private[kufuli] def fromRaw(bytes: Slice): Eff[InvalidKey, PublicKey[K]] = opE {
-      if bytes.length != spec.publicKeyLength then Left(InvalidKey.WrongLength(spec.publicKeyLength, bytes.length))
-      else
-        // FIPS 203 section 7.2's encapsulation-key check; without it a peer key of the right length
-        // fails at `encapsulate` as a defect instead of at import as a value, and the JVM already
-        // rejects it at import.
-        validating(notOnCurve = false) {
-          val _ = crypto.createPublicKey(rawPublic(u8(bytes.toArray), kind))
-          PublicKey.unsafe[K](keyRepr(bytes.toArray))
-        }
+    private[kufuli] def fromRaw(bytes: Slice): Eff[Refused, PublicKey[K]] = opE {
+      // FIPS 203 section 7.2's encapsulation-key check; without it a peer key of the right length
+      // fails at `encapsulate` as a defect instead of at import as a value, and the JVM already
+      // rejects it at import.
+      refusing {
+        val _ = crypto.createPublicKey(rawPublic(u8(bytes.toArray), kind))
+        PublicKey.unsafe[K](keyRepr(bytes.toArray))
+      }
     }
     private[kufuli] def raw(key: PublicKey[K]): Eff[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))
     private[kufuli] def fromSeed(seed: Slice): Eff[InvalidKey, KeyPair[PublicKey[K], PrivateKey[K]]] = opE {
       if seed.length != 64 then Left(InvalidKey.WrongLength(64, seed.length))
       else
-        validating(notOnCurve = false) {
+        refusing {
           withSecret(seed) { buf =>
             val priv = crypto.createPrivateKey(rawSeed(buf, kind))
             val pub = ba(crypto.createPublicKey(priv).`export`(js.Dynamic.literal(format = "raw-public")))
             KeyPair(PublicKey.unsafe[K](keyRepr(pub)), PrivateKey.unsafe[K](seed.toArray))
           }
-        }
+        }.left.map(_ => InvalidKey.Malformed)
     }
 
   // Capability bundles the node platform table wires each companion into.
@@ -681,6 +688,6 @@ private[kufuli] object node:
   private[kufuli] trait RsaKeysBytes:
     given RsaKeys = rsaKeys
   private[kufuli] trait KemKeysAll:
-    given KemKeys[MlKem768] = kemKeysOf("ml-kem-768", MlKem768)
-    given KemKeys[MlKem1024] = kemKeysOf("ml-kem-1024", MlKem1024)
+    given KemKeys[MlKem768] = kemKeysOf[MlKem768]("ml-kem-768")
+    given KemKeys[MlKem1024] = kemKeysOf[MlKem1024]("ml-kem-1024")
 end node

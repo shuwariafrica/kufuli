@@ -27,7 +27,7 @@ import cats.effect.IO
 
 object support:
   def expectRight[E <: Throwable, A](label: String)(e: Eff[E, A])(using TypeTest[Throwable, E]): IO[A] =
-    e.either.flatMap {
+    e.either.absolve.flatMap {
       case Right(a)  => IO.pure(a)
       case Left(err) => IO.raiseError(new AssertionError(s"$label: unexpected error $err"))
     }

@@ -24,6 +24,8 @@ import scala.compiletime.testing.typeChecks
 import scala.concurrent.duration.*
 
 import boilerplate.Slice
+import boilerplate.codec
+import boilerplate.codec.Base64Url
 import boilerplate.effect.*
 import cats.effect.IO
 
@@ -52,14 +54,14 @@ class JoseStrictnessSuite extends munit.CatsEffectSuite:
     for
       ed <- Ed25519.generate.absolve
       raw <- expectRight("ed raw")(ed.publicKey.raw)
-      edCose <- CoseKey.parse(okp(Array.from(raw.iterator))).either
+      edCose <- CoseKey.parse(okp(Array.from(raw.bytes.iterator))).either.absolve
       _ <- check(edCose.exists { case ImportedPublicKey.Ed(_) => true; case _ => false }, s"OKP/Ed25519 imports, got $edCose")
       p <- P256.generate.absolve
-      sec1 <- expectRight("p256 sec1")(p.publicKey.sec1).map(a => Array.from(a.iterator))
+      sec1 <- expectRight("p256 sec1")(p.publicKey.sec1).map(a => Array.from(a.bytes.iterator))
       (x, y) = sec1.tail.splitAt(32)
-      ecCose <- CoseKey.parse(ec2(x, y)).either
+      ecCose <- CoseKey.parse(ec2(x, y)).either.absolve
       _ <- check(ecCose.exists { case ImportedPublicKey.EcP256(_) => true; case _ => false }, s"EC2/P-256 imports, got $ecCose")
-      unsupported <- CoseKey.parse(map(uint(1) ++ uint(3))).either
+      unsupported <- CoseKey.parse(map(uint(1) ++ uint(3))).either.absolve
       _ <- check(unsupported == Left(InvalidKey.Unsupported), s"an RSA COSE key is unsupported, got $unsupported")
     yield ()
     end for
@@ -68,24 +70,24 @@ class JoseStrictnessSuite extends munit.CatsEffectSuite:
   test("CoseKey: one credential key has exactly one COSE encoding") {
     for
       p <- P256.generate.absolve
-      sec1 <- expectRight("p256 sec1")(p.publicKey.sec1).map(a => Array.from(a.iterator))
+      sec1 <- expectRight("p256 sec1")(p.publicKey.sec1).map(a => Array.from(a.bytes.iterator))
       (x, y) = sec1.tail.splitAt(32)
       // A 64-bit label truncated to 32 bits would read 0xFFFFFFFF00000001 as 1, the `kty` label.
       wide = Array(0xa1.toByte, 0x1b.toByte) ++ Array[Byte](-1, -1, -1, -1, 0, 0, 0, 1) ++ uint(1)
-      truncated <- CoseKey.parse(wide).either
+      truncated <- CoseKey.parse(wide).either.absolve
       _ <- check(truncated == Left(InvalidKey.Malformed), s"a 64-bit label is not narrowed, got $truncated")
-      short <- CoseKey.parse(ec2(x.take(31), y)).either
+      short <- CoseKey.parse(ec2(x.take(31), y)).either.absolve
       _ <- check(short.isLeft, s"a coordinate below the curve size is rejected, got $short")
-      long <- CoseKey.parse(ec2(x, y ++ Array[Byte](0))).either
+      long <- CoseKey.parse(ec2(x, y ++ Array[Byte](0))).either.absolve
       _ <- check(long.isLeft, s"a coordinate above the curve size is rejected, got $long")
-      trailing <- CoseKey.parse(ec2(x, y) ++ Array[Byte](0)).either
+      trailing <- CoseKey.parse(ec2(x, y) ++ Array[Byte](0)).either.absolve
       _ <- check(trailing == Left(InvalidKey.Malformed), s"bytes after the map are rejected, got $trailing")
       duplicate = Array(0xa4.toByte) ++ (uint(1) ++ uint(2)) ++ (uint(1) ++ uint(1)) ++
                     (nint(-1) ++ uint(1)) ++ (nint(-2) ++ bstr(x))
-      dup <- CoseKey.parse(duplicate).either
+      dup <- CoseKey.parse(duplicate).either.absolve
       _ <- check(dup == Left(InvalidKey.Malformed), s"a repeated label is rejected, got $dup")
       oversize = Array(0xa1.toByte) ++ nint(-2) ++ Array(0x5a.toByte) ++ Array[Byte](0, 0, 0, 4) ++ Array[Byte](1, 2, 3, 4)
-      over <- CoseKey.parse(oversize).either
+      over <- CoseKey.parse(oversize).either.absolve
       _ <- check(over.isLeft, s"a byte string whose declared length overflows is rejected, got $over")
     yield ()
     end for
@@ -93,7 +95,7 @@ class JoseStrictnessSuite extends munit.CatsEffectSuite:
 
   // A real 1024-bit key, so the private door is exercised through the backend that parses it rather
   // than through a synthetic encoding no provider would accept.
-  private val weakRsaPkcs8 = Base64
+  private val weakRsaPkcs8 = codec.Base64
     .decode(
       "MIICdwIBADANBgkqhkiG9w0BAQEFAASCAmEwggJdAgEAAoGBAOTqDuk551c9Y7QfT0PLQHbdzZGk" +
         "01V/CrmjIag4pnm33EOPBH1qTtcIGdNt7F7u4wbtqG/mCtd6r6eaF2Q2TK/Wk2cdlQVIOza9ESsS" +
@@ -114,23 +116,23 @@ class JoseStrictnessSuite extends munit.CatsEffectSuite:
   test("RSA keys below the 2048-bit floor are declined at import, not merely at generation") {
     val e = Array[Byte](1, 0, 1)
     for
-      weak <- PublicKey.fromComponents(Slice.of(Array.fill[Byte](128)(0xff.toByte)), Slice.of(e)).either
+      weak <- PublicKey.of(RSA.Components(IArray.fill[Byte](128)(0xff.toByte), IArray.from(e))).either.absolve
       _ <- check(weak == Left(InvalidKey.Unsupported), s"a 1024-bit modulus is unsupported, got $weak")
       jwk = s"""{"kty":"RSA","n":"${Base64Url.encode(Array.fill[Byte](128)(0xff.toByte))}","e":"${Base64Url.encode(e)}"}"""
-      parsed <- JWK.parse(jwk).either
+      parsed <- JWK.parse(jwk).either.absolve
       _ <- check(parsed == Left(InvalidKey.Unsupported), s"a sub-floor JWK is unsupported, got $parsed")
-      ok <- PublicKey.fromComponents(Slice.of(Array.fill[Byte](256)(0xff.toByte)), Slice.of(e)).either
+      ok <- PublicKey.of(RSA.Components(IArray.fill[Byte](256)(0xff.toByte), IArray.from(e))).either.absolve
       _ <- check(ok.isRight, s"a 2048-bit modulus imports, got $ok")
     yield ()
   }
 
   test("the floor governs the private door too, so it cannot be walked around by loading a key") {
     for
-      weak <- PrivateKey.fromPkcs8(RSA)(Slice.of(weakRsaPkcs8)).either
+      weak <- PrivateKey.parse(RSA)(PKCS8(Slice.of(weakRsaPkcs8))).either.absolve
       _ <- check(weak == Left(InvalidKey.Unsupported), s"a 1024-bit private key is unsupported, got $weak")
       kp <- RSA.generate(RSA.bits(2048)).absolve
-      exported <- expectRight("pkcs8")(kp.privateKey.pkcs8).map(a => Array.from(a.iterator))
-      back <- PrivateKey.fromPkcs8(RSA)(Slice.of(exported)).either
+      exported <- expectRight("pkcs8")(kp.privateKey.pkcs8).map(a => Array.from(a.bytes.iterator))
+      back <- PrivateKey.parse(RSA)(PKCS8(Slice.of(exported))).either.absolve
       _ <- check(back.isRight, s"a 2048-bit private key round-trips through export and import, got $back")
     yield ()
   }
@@ -142,10 +144,10 @@ class JoseStrictnessSuite extends munit.CatsEffectSuite:
     // node's JWK importer takes the octets verbatim where the JVM and Native normalise them away.
     val padded = Array[Byte](0) ++ modulus
     for
-      inflated <- PublicKey.fromComponents(Slice.of(padded), Slice.of(e)).either
+      inflated <- PublicKey.of(RSA.Components(IArray.from(padded), IArray.from(e))).either.absolve
       _ <- check(inflated == Left(InvalidKey.Malformed), s"a leading zero octet is refused, got $inflated")
       jwk = s"""{"kty":"RSA","n":"${Base64Url.encode(padded)}","e":"${Base64Url.encode(e)}"}"""
-      viaJwk <- JWK.parse(jwk).either
+      viaJwk <- JWK.parse(jwk).either.absolve
       _ <- check(viaJwk == Left(InvalidKey.Malformed), s"and refused through a JWK, got $viaJwk")
       // The floor itself reads the magnitude, so padding neither lifts a weak modulus over it nor
       // drops a sound one below it.
@@ -196,7 +198,7 @@ class JoseStrictnessSuite extends munit.CatsEffectSuite:
     for
       key <- HmacSha256.generate.absolve
       tok <- JWT.sign(claims, HS256, now)(key).absolve
-      v <- JWT.verify(tok.compact, HS256, key, JWT.Policy.unaudienced(HS256), now).either
+      v <- JWT.verify(tok.compact, HS256, key, JWT.Policy.unaudienced(HS256), now).either.absolve
       got <- IO.fromEither(v.left.map(e => new AssertionError(s"verify: $e")))
       _ <- check(
              values.zipWithIndex.forall((value, i) => got.claims.get(s"c$i").contains(value)),
@@ -240,16 +242,16 @@ class JoseStrictnessSuite extends munit.CatsEffectSuite:
                  s"the emitted alg is the current registry value, got ${new String(header, "UTF-8")}"
            )
       _ <- check(JWT.peek(tok.compact).exists(_.algorithm == "Ed25519"), s"peek reports what was emitted, got ${JWT.peek(tok.compact)}")
-      current <- JWT.verify(tok.compact, EdDSA, kp.publicKey, policy, now).either
+      current <- JWT.verify(tok.compact, EdDSA, kp.publicKey, policy, now).either.absolve
       _ <- check(current.isRight, s"a token carrying Ed25519 verifies, got $current")
       legacy <- reheaded(tok.compact, """{"alg":"EdDSA"}""", kp.privateKey)
-      accepted <- JWT.verify(legacy, EdDSA, kp.publicKey, policy, now).either
+      accepted <- JWT.verify(legacy, EdDSA, kp.publicKey, policy, now).either.absolve
       _ <- check(accepted.isRight, s"a token carrying the legacy EdDSA verifies into the same arm, got $accepted")
-      set <- expectRight("jwk")(JWK.of("k", kp.publicKey)).map(JwkSet.of(_))
-      viaSet <- JWT.verify(legacy, set, policy, now).either
+      set <- expectRight("jwk")(JWK.of("k", kp.publicKey)).map(JwkSet(_))
+      viaSet <- JWT.verify(legacy, set, policy, now).either.absolve
       _ <- check(viaSet.isRight, s"and through a key set, got $viaSet")
       foreign <- reheaded(tok.compact, """{"alg":"ES256"}""", kp.privateKey)
-      other <- JWT.verify(foreign, EdDSA, kp.publicKey, policy, now).either
+      other <- JWT.verify(foreign, EdDSA, kp.publicKey, policy, now).either.absolve
       _ <- check(other == Left(JWT.UntrustedAlgorithm), s"another algorithm still does not match this arm, got $other")
       jwkTok <- JWT.sign(claims.id("j"), EdDSA, "dpop+jwt", kp.publicKey, now)(kp.privateKey).absolve
       jwkHeader <- IO.fromEither(Base64Url.decode(jwkTok.compact.split('.')(0)).left.map(e => new AssertionError(s"header: $e")))
@@ -282,9 +284,9 @@ class JoseStrictnessSuite extends munit.CatsEffectSuite:
     for
       key <- HmacSha256.generate.absolve
       tok <- JWT.sign(claims, HS256, now)(key).absolve
-      v <- JWT.verify(tok.compact, HS256, key, JWT.Policy.unaudienced(HS256), now).either
+      v <- JWT.verify(tok.compact, HS256, key, JWT.Policy.unaudienced(HS256), now).either.absolve
       _ <- check(v.exists(_.notBefore.contains(now - 60)), s"nbf reaches Verified, got $v")
-      early <- JWT.verify(tok.compact, HS256, key, JWT.Policy.unaudienced(HS256), now - 120).either
+      early <- JWT.verify(tok.compact, HS256, key, JWT.Policy.unaudienced(HS256), now - 120).either.absolve
       _ <- check(early == Left(JWT.NotYetValid), s"a token before its nbf is rejected, got $early")
     yield ()
   }
@@ -293,7 +295,7 @@ class JoseStrictnessSuite extends munit.CatsEffectSuite:
     for
       p384 <- P384.generate.absolve
       j384 <- expectRight("p384 jwk")(JWK.of("k384", p384.publicKey))
-      r384 <- JWK.parse(j384.json).either
+      r384 <- JWK.parse(j384.json).either.absolve
       _ <- check(r384.exists(_.key match
                    case ImportedPublicKey.EcP384(_) => true;
                    case _                           => false),
@@ -301,15 +303,53 @@ class JoseStrictnessSuite extends munit.CatsEffectSuite:
            )
       p521 <- P521.generate.absolve
       j521 <- expectRight("p521 jwk")(JWK.of("k521", p521.publicKey))
-      r521 <- JWK.parse(j521.json).either
+      r521 <- JWK.parse(j521.json).either.absolve
       _ <- check(r521.exists(_.key match
                    case ImportedPublicKey.EcP521(_) => true;
                    case _                           => false),
                  s"P-521 round-trips, got $r521"
            )
       short = j521.json.replace("\"y\":\"", "\"y\":\"A")
-      bad <- JWK.parse(short).either
+      bad <- JWK.parse(short).either.absolve
       _ <- check(bad.isLeft, s"an over-long coordinate is rejected, got $bad")
+    yield ()
+    end for
+  }
+
+  test("JwkSet.parse skips a member kufuli does not serve, and FAILS on a weak member it does") {
+    for
+      kp <- Ed25519.generate.absolve
+      jwk <- expectRight("of")(JWK.of("good", kp.publicKey))
+      mixed = s"""{"keys":[${jwk.json},{"k":"AAAA","kid":"secret","kty":"oct"}]}"""
+      set <- expectRight("parse")(JwkSet.parse(mixed))
+      _ <- check(set.keys.map(_.kid) == List(Some("good")), s"an unserved kty is skipped, the rest survive, got ${set.keys}")
+      weakN = boilerplate.codec.Base64Url.encode(Array.fill[Byte](128)(0xff.toByte))
+      weak = s"""{"keys":[{"e":"AQAB","kty":"RSA","n":"$weakN"}]}"""
+      r <- JwkSet.parse(weak).either.absolve
+      _ <- check(r == Left(InvalidKey.Unsupported), s"a weak key of a served family FAILS the set, got $r")
+    yield ()
+  }
+
+  test("JwkSet.parse fails a member whose own declaration is unreadable rather than skipping it") {
+    for
+      kp <- Ed25519.generate.absolve
+      jwk <- expectRight("of")(JWK.of("good", kp.publicKey))
+      // `crv` is REQUIRED of EC and OKP keys (RFC 7518 s6.2.1.1, RFC 8037 s2). Skipping a member
+      // that omits it would answer an operator's typo with a permanent UnknownKey at verify, and a
+      // consumer that refetches on UnknownKey would then refetch for ever.
+      noCrv = s"""{"keys":[${jwk.json},{"kid":"typo","kty":"EC","x":"AAAA","y":"AAAA"}]}"""
+      a <- JwkSet.parse(noCrv).either.absolve
+      _ <- check(a == Left(kufuli.Malformed), s"an EC member with no crv fails the set, got $a")
+      okpNoCrv = s"""{"keys":[{"kid":"typo","kty":"OKP","x":"AAAA"}]}"""
+      b <- JwkSet.parse(okpNoCrv).either.absolve
+      _ <- check(b == Left(kufuli.Malformed), s"an OKP member with no crv fails the set, got $b")
+      noKty = s"""{"keys":[${jwk.json},{"kid":"typo","x":"AAAA"}]}"""
+      c <- JwkSet.parse(noKty).either.absolve
+      _ <- check(c == Left(kufuli.Malformed), s"a member with no kty at all fails the set, got $c")
+      // A curve kufuli does not serve is a genuine skip: the provider is entitled to publish it.
+      exotic = s"""{"keys":[${jwk.json},{"crv":"X25519","kid":"ecdh","kty":"OKP","x":"AAAA"}]}"""
+      d <- expectRight("exotic")(JwkSet.parse(exotic))
+      _ <- check(d.keys.map(_.kid) == List(Some("good")), s"an unserved crv of a served kty is skipped, got ${d.keys}")
     yield ()
     end for
   }

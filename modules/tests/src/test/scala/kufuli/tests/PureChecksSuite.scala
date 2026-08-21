@@ -21,11 +21,16 @@
 package kufuli.tests
 
 import boilerplate.Slice
+import boilerplate.codec.Base32
+import boilerplate.codec.Base64Url
 
 import kufuli.*
 
-// Backend-independent value-layer checks over the shared code, so identical on every artifact
-// including the browser.
+// The value layer: everything kufuli computes in shared source before a provider is reached, so it
+// is the same real logic on every artifact. The upstream codec rows are here deliberately - they pin
+// a DEPENDENCY CONTRACT rather than upstream's implementation for its own sake, because a Base64Url
+// that started accepting padding or the standard alphabet would make a JWS malleable without a line
+// of kufuli changing.
 class PureChecksSuite extends munit.FunSuite:
 
   test("nonce derivation (RFC 8446 s5.3): self-inverse; sequence lands big-endian in the low bytes") {
@@ -59,10 +64,20 @@ class PureChecksSuite extends munit.FunSuite:
 
   test("PEM (RFC 7468): encode->decode round-trip, fullchain decodeAll, negatives") {
     val der = Array.tabulate[Byte](70)(i => (i * 7).toByte)
-    val text = PEM.encode(PEM.Block("PUBLIC KEY", IArray.from(der)))
-    assert(PEM.decode(text).exists(b => b.label == "PUBLIC KEY" && b.der.length == 70), "PEM round-trip")
-    val two = text + "\n" + PEM.encode(PEM.Block("CERTIFICATE", IArray[Byte](1, 2, 3)))
-    assert(PEM.decodeAll(two).exists(bs => bs.length == 2 && bs(1).label == "CERTIFICATE"), "decodeAll")
+    val text = PEM.encode(PEM.Block.PublicKey(SPKI(IArray.from(der))))
+    assert(PEM.decode(text).exists { case PEM.Block.PublicKey(k) => k.bytes.length == 70; case _ => false },
+           "PEM round-trip yields the PublicKey arm"
+    )
+    val two = text + "\n" + PEM.encode(PEM.Block.Certificate(IArray[Byte](1, 2, 3)))
+    assert(PEM
+             .decodeAll(two)
+             .exists(bs =>
+               bs.length == 2 && bs(1).match
+                 case PEM.Block.Certificate(_) => true;
+                 case _                        => false
+             ),
+           "decodeAll classifies each block"
+    )
     assert(PEM.decode("-----BEGIN X-----\nAAAA").isLeft, "missing END rejected")
     assert(PEM.decode("-----BEGIN X-----\n!!!!\n-----END X-----").isLeft, "corrupt body rejected")
   }
@@ -81,47 +96,65 @@ class PureChecksSuite extends munit.FunSuite:
     assert(SecretKey.of(HmacSha256)(new Array[Byte](16)).isLeft, "HMAC key below hash length rejected")
     assert(SecretKey.of(HmacSha256)(new Array[Byte](48)).isRight, "HMAC accepts longer keys")
     assert(Digest.of(new Array[Byte](15)).isLeft, "digest length validated")
-    assert(SealedBox.of(AesGcm256)(new Array[Byte](5)).isLeft, "truncated box rejected")
-    assert(SealedBox.of(AesGcm256)(Array.fill[Byte](64)(9)).isLeft, "unknown box version rejected")
-    assert(Signature.fromRaw(Ed25519)(new Array[Byte](63)).isLeft, "ed25519 signature is 64 bytes")
-    assert(Signature.fromRaw(P256)(new Array[Byte](64)).isRight, "P-256 raw r||s is 64 bytes")
-    assertEquals(Signature.fromRaw(HmacSha256)(new Array[Byte](31)), Left(Malformed))
+    assert(SealedBox.parse(AesGcm256)(new Array[Byte](5)).isLeft, "truncated box rejected")
+    assert(SealedBox.parse(AesGcm256)(Array.fill[Byte](64)(9)).isLeft, "unknown box version rejected")
+    assert(Signature.of(Ed25519)(new Array[Byte](63)).isLeft, "ed25519 signature is 64 bytes")
+    assert(Signature.of(P256)(new Array[Byte](64)).isRight, "P-256 raw r||s is 64 bytes")
+    assertEquals(Signature.of(HmacSha256)(new Array[Byte](31)), Left(Malformed))
     // RSA signature octets are validated against the modulus by the backend at verify, so the door
     // admits any non-empty length and rejects only the one length no modulus can produce.
-    assert(Signature.fromRaw(RSA)(Array.emptyByteArray).isLeft, "an empty RSA signature is rejected")
-    assert(Signature.fromRaw(RSA)(new Array[Byte](1)).isRight, "and any other length is the backend's to judge")
+    assert(Signature.of(RSA)(Array.emptyByteArray).isLeft, "an empty RSA signature is rejected")
+    assert(Signature.of(RSA)(new Array[Byte](1)).isRight, "and any other length is the backend's to judge")
     assertEquals(KemCiphertext.of(MlKem768)(new Array[Byte](10)), Left(Malformed))
   }
 
   test("programmer-error domains are defects (require), not error values") {
     val _ = intercept[IllegalArgumentException](RSA.bits(1024))
+    // The ceiling is a programmer-error domain on the GENERATION side for the same reason the floor
+    // is: an engine that refuses the size (the JDK past 16384 bits, aws-lc likewise) makes it a
+    // parameter no caller can meaningfully ask for.
+    val _ = intercept[IllegalArgumentException](RSA.bits(16392))
+    assertEquals(RSA.bits(16384).bits, 16384, "and the ceiling itself is generatable")
     val _ = intercept[IllegalArgumentException](AeadLimits(0, 1, 1))
+  }
+
+  test("a PKCS#8 document owns its octets: it can be erased, and a copy taken from it is the caller's") {
+    // The type carries a plaintext private key, `d`, `p` and `q` included. Owning the buffer is
+    // what makes erasure expressible at all, and what keeps the import doors from allocating a
+    // fresh plaintext copy on every call.
+    val source = IArray.tabulate[Byte](32)(i => (i + 1).toByte)
+    val doc = PKCS8(source)
+    val taken = doc.bytes
+    doc.wipe()
+    assert(Array.from(doc.bytes.iterator).forall(_ == 0.toByte), "the document erases in place")
+    assert(Array.from(taken.iterator).sameElements(Array.from(source.iterator)), "a copy taken beforehand is untouched")
+    assert(Array.from(source.iterator).sameElements(Array.tabulate[Byte](32)(i => (i + 1).toByte)), "and so is the caller's input")
   }
 
   test("ECDSA DER<->raw codec: round-trip, minimal integers, strict rejection") {
     // r||s where both halves have the high bit set (forces a 0x00 sign byte in DER)
     val raw = Array.tabulate[Byte](64)(i => if i == 0 || i == 32 then 0x80.toByte else (i + 1).toByte)
-    val sig = Signature.fromRaw(P256)(raw).toOption.get
-    val der = Array.from(sig.der.iterator)
+    val sig = Signature.of(P256)(raw).toOption.get
+    val der = Array.from(sig.der.bytes.iterator)
     assertEquals(der(0), 0x30.toByte, "SEQUENCE tag")
-    val back = Signature.fromDer(P256)(der).toOption.get
+    val back = Signature.parse(P256)(Signature.Der(IArray.from(der))).toOption.get
     assert(Array.from(back.bytes.iterator).sameElements(raw), "der -> raw round-trips")
-    assert(Signature.fromDer(P256)(Array[Byte](0x30, 0x00)).isLeft, "empty integers rejected")
-    assert(Signature.fromDer(P256)(Array.emptyByteArray).isLeft, "empty der rejected")
+    assert(Signature.parse(P256)(Signature.Der(IArray.from(Array[Byte](0x30, 0x00)))).isLeft, "empty integers rejected")
+    assert(Signature.parse(P256)(Signature.Der(IArray.from(Array.emptyByteArray))).isLeft, "empty der rejected")
   }
 
   test("one signature has one DER spelling: trailing bytes, long-form lengths and padded integers rejected") {
     val raw = Array.tabulate[Byte](64)(i => (i + 1).toByte)
-    val der = Array.from(Signature.fromRaw(P256)(raw).toOption.get.der.iterator)
-    assert(Signature.fromDer(P256)(der).isRight, "the canonical encoding is accepted")
-    assert(Signature.fromDer(P256)(der :+ 0.toByte).isLeft, "a byte past the SEQUENCE is rejected")
+    val der = Array.from(Signature.of(P256)(raw).toOption.get.der.bytes.iterator)
+    assert(Signature.parse(P256)(Signature.Der(IArray.from(der))).isRight, "the canonical encoding is accepted")
+    assert(Signature.parse(P256)(Signature.Der(IArray.from(der :+ 0.toByte))).isLeft, "a byte past the SEQUENCE is rejected")
     val longForm = Array[Byte](0x30, 0x81.toByte, der(1)) ++ der.drop(2)
-    assert(Signature.fromDer(P256)(longForm).isLeft, "a length not in its shortest form is rejected")
+    assert(Signature.parse(P256)(Signature.Der(IArray.from(longForm))).isLeft, "a length not in its shortest form is rejected")
     // SEQUENCE { INTEGER 00 00 01, INTEGER 01 }: r carries a zero byte its sign bit does not need.
     val paddedInteger = Array[Byte](0x30, 0x08, 0x02, 0x03, 0x00, 0x00, 0x01, 0x02, 0x01, 0x01)
-    assert(Signature.fromDer(P256)(paddedInteger).isLeft, "a non-minimal INTEGER is rejected")
+    assert(Signature.parse(P256)(Signature.Der(IArray.from(paddedInteger))).isLeft, "a non-minimal INTEGER is rejected")
     val negative = Array[Byte](0x30, 0x06, 0x02, 0x01, 0x80.toByte, 0x02, 0x01, 0x01)
-    assert(Signature.fromDer(P256)(negative).isLeft, "a negative INTEGER is rejected")
+    assert(Signature.parse(P256)(Signature.Der(IArray.from(negative))).isLeft, "a negative INTEGER is rejected")
   }
 
   test("the shared DER peek requires the outer TLV to span the whole blob") {

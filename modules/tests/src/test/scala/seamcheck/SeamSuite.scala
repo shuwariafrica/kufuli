@@ -81,8 +81,8 @@ class SeamSuite extends munit.FunSuite:
     assert(!typeChecks("summon[EcKeys[P256]].fromSec1(???)"), "EcKeys.fromSec1 is sealed")
     assert(!typeChecks("summon[RsaKeys].fromComponents(???, ???)"), "RsaKeys.fromComponents is sealed")
     assert(typeChecks("Ed25519.generate"), "generation goes through the algorithm object")
-    assert(typeChecks("PublicKey.fromRaw(X25519)(???)"), "the blocklisted import is the public path")
-    assert(typeChecks("PublicKey.fromSpki(X25519)(???)"), "the typed SPKI import is the public path")
+    assert(typeChecks("PublicKey.parse(X25519)(??? : Raw)"), "the blocklisted import is the public path")
+    assert(typeChecks("PublicKey.parse(X25519)(??? : SPKI)"), "the typed SPKI import is the public path")
 
     assert(typeChecks("(??? : Signature.Signer[Ed25519]).sign(???)"), "a prepared signer stays callable")
     assert(typeChecks("(??? : Hasher).digest"), "a hasher handle stays callable")

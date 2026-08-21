@@ -26,6 +26,7 @@ import scala.annotation.tailrec
 
 import boilerplate.Slice
 import boilerplate.TypedError
+import boilerplate.ValueCodec
 import boilerplate.effect.Eff
 import boilerplate.effect.UEff
 
@@ -35,7 +36,9 @@ sealed abstract class X509Error(message: String, cause: Option[Throwable]) exten
   def this(message: String) = this(message, None)
 
 // Payload-free cases are a class plus a co-named object, and type positions name the CLASS: a union
-// of singleton types does not survive the TypeTest reification `either`/`catchAll` rely on.
+// of singleton types does not survive the TypeTest reification `either`/`catchAll` rely on
+// (re-tested at each toolchain adoption, last at Scala 3.9.0-RC5: still broken; drop the
+// class+object shape for plain case objects when the erasure defect is fixed).
 sealed abstract class PathInvalid(message: String) extends X509Error(message)
 object PathInvalid:
   sealed abstract class MalformedChain private[x509] () extends PathInvalid("unparseable certificate in chain")
@@ -709,7 +712,7 @@ private[x509] object X509:
   // out, `agree` having no channel to carry a refusal at all. Every arm returned here is the import's
   // own verdict, so this accessor and the core door cannot name one encoding differently.
   def verifyingKey(spki: Array[Byte]): Eff[InvalidKey, ImportedPublicKey] =
-    PublicKey.fromSpki(Slice.of(spki))
+    PublicKey.parse(SPKI(Slice.of(spki)))
 
   // BadSignature is reserved for a verification that ran and failed, which is the only outcome an
   // auditor can read as a forgery signal; a key that will not import means none ran. The match is
@@ -728,25 +731,32 @@ object Certificate:
   /** Two certificates are the same certificate when their DER is the same bytes. */
   given CanEqual[Certificate, Certificate] = CanEqual.derived
 
-  /** Parses one complete DER certificate; trailing bytes are rejected. */
-  def fromDer(der: Array[Byte]): Either[Malformed, Certificate] =
+  /** A certificate is one DER document (RFC 5280) or its PEM text (RFC 7468): two serialisations of
+    * one value, discriminated by parameter type, so they share the `parse` name. The DER form
+    * rejects trailing bytes; the PEM form reads the first CERTIFICATE block, ignoring text outside
+    * the encapsulation boundaries - the dump `openssl x509 -text` writes ahead of the block (RFC
+    * 7468 section 5.2).
+    */
+  def parse(der: Array[Byte]): Either[Malformed, Certificate] =
     X509.parse(IArray.from(der)).left.map(_ => Malformed)
 
-  /** Parses the first CERTIFICATE block, ignoring text outside the encapsulation boundaries - the
-    * dump `openssl x509 -text` writes ahead of the block (RFC 7468 section 5.2).
-    */
-  def fromPem(pem: String): Either[Malformed, Certificate] =
+  def parse(pem: String): Either[Malformed, Certificate] =
     kufuli.PEM
       .decode(encapsulated(pem))
-      .flatMap(b => if b.label == "CERTIFICATE" then fromDer(Array.from(b.der.iterator)) else Left(Malformed))
+      .flatMap {
+        case kufuli.PEM.Block.Certificate(der) => parse(Array.from(der.iterator))
+        case _                                 => Left(Malformed)
+      }
 
-  /** Parses every CERTIFICATE block of a bundle in file order - a `fullchain.pem` is leaf first. */
-  def chainFromPem(pem: String): Either[Malformed, List[Certificate]] =
+  /** Parses every CERTIFICATE block of a bundle in file order - a `fullchain.pem` is leaf first.
+    * Named for its RESULT shape, which no parameter type carries.
+    */
+  def chain(pem: String): Either[Malformed, List[Certificate]] =
     kufuli.PEM.decodeAll(encapsulated(pem)).flatMap { blocks =>
-      val ders = blocks.filter(_.label == "CERTIFICATE")
+      val ders = blocks.collect { case kufuli.PEM.Block.Certificate(der) => der }
       if ders.isEmpty then Left(Malformed)
       else
-        val parsed = ders.map(b => fromDer(Array.from(b.der.iterator)))
+        val parsed = ders.map(b => parse(Array.from(b.iterator)))
         if parsed.forall(_.isRight) then Right(parsed.collect { case Right(c) => c }) else Left(Malformed)
     }
 
@@ -813,11 +823,16 @@ object Hostname:
     * stands; converting a U-label to its A-label is the caller's, since IDNA needs a Unicode
     * profile kufuli does not carry.
     */
-  def of(name: String): Either[Malformed, Hostname] =
+  def parse(name: String): Either[Malformed, Hostname] =
     val rooted = if name.endsWith(".") then name.substring(0, name.length - 1) else name
     if rooted.isEmpty || !Names.validDnsBase(rooted) then Left(Malformed)
     else if rooted.substring(rooted.lastIndexOf('.') + 1).forall(c => c >= '0' && c <= '9') then Left(Malformed)
     else Right(Names.foldAscii(rooted))
+
+  /** The wire-text contract: decode IS `parse` (which case-folds, so the normalising decode stays
+    * idempotent through re-encoding), encode the folded name.
+    */
+  given valueCodec: ValueCodec.Aux[Hostname, Malformed] = ValueCodec(parse, h => h)
 
   extension (h: Hostname) def value: String = h
 end Hostname
@@ -830,7 +845,7 @@ object TrustAnchors:
   /** The pinned-anchor flow, where the set is known at the call site. */
   def apply(anchor: Certificate, more: Certificate*): TrustAnchors = new TrustAnchors(anchor :: more.toList)
 
-  /** The configuration flow: `Certificate.chainFromPem(pem).flatMap(TrustAnchors.of)` reports a
+  /** The configuration flow: `Certificate.chain(pem).flatMap(TrustAnchors.of)` reports a
     * zero-certificate bundle once, in one vocabulary.
     */
   def of(anchors: List[Certificate]): Either[Malformed, TrustAnchors] =
@@ -1107,14 +1122,14 @@ private object engine:
   private[x509] def verifyBy(scheme: SigScheme, key: ImportedPublicKey, tbs: Slice, sig: Array[Byte]): Eff[SignatureRejected, Unit] =
     (scheme, key) match
       case (SigScheme.Ed, ImportedPublicKey.Ed(k)) =>
-        Eff.from(Signature.fromRaw(Ed25519)(sig)).mapError(_ => SignatureRejected).flatMap(s => k.verify(tbs, s))
+        Eff.from(Signature.of(Ed25519)(sig)).mapError(_ => SignatureRejected).flatMap(s => k.verify(tbs, s))
       case (SigScheme.Ec(h), ImportedPublicKey.EcP256(k))    => ecVerify(P256, k, tbs, sig, h)
       case (SigScheme.Ec(h), ImportedPublicKey.EcP384(k))    => ecVerify(P384, k, tbs, sig, h)
       case (SigScheme.Ec(h), ImportedPublicKey.EcP521(k))    => ecVerify(P521, k, tbs, sig, h)
       case (SigScheme.RsaPkcs1(h), ImportedPublicKey.Rsa(k)) =>
-        Eff.from(Signature.fromRaw(RSA)(sig)).mapError(_ => SignatureRejected).flatMap(s => k.verify(tbs, s, kufuli.RsaPkcs1(h)))
+        Eff.from(Signature.of(RSA)(sig)).mapError(_ => SignatureRejected).flatMap(s => k.verify(tbs, s, kufuli.RsaPkcs1(h)))
       case (SigScheme.RsaPss(h), ImportedPublicKey.Rsa(k)) =>
-        Eff.from(Signature.fromRaw(RSA)(sig)).mapError(_ => SignatureRejected).flatMap(s => k.verify(tbs, s, kufuli.RsaPss(h)))
+        Eff.from(Signature.of(RSA)(sig)).mapError(_ => SignatureRejected).flatMap(s => k.verify(tbs, s, kufuli.RsaPss(h)))
       case _ => Eff.fail(SignatureRejected)
 
   private def ecVerify[C <: EcCurve](
@@ -1124,7 +1139,7 @@ private object engine:
     sig: Array[Byte],
     hash: Sha2
   )(using Verifying[C]): Eff[SignatureRejected, Unit] =
-    Eff.from(Signature.fromDer(curve)(sig)).mapError(_ => SignatureRejected).flatMap(s => key.verify(tbs, s, hash))
+    Eff.from(Signature.parse(curve)(Signature.Der(IArray.from(sig)))).mapError(_ => SignatureRejected).flatMap(s => key.verify(tbs, s, hash))
 end engine
 
 /** Verifies a stapled OCSP response the caller supplies (from the TLS handshake). No network I/O is

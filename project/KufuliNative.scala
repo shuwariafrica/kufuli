@@ -14,7 +14,7 @@ import snx.sbt.SNXImports.*
   *
   * Both libraries are pinned by full commit SHA; sbt-snx resolves any other ref at build time.
   */
-object KufuliNative {
+object KufuliNative:
 
   /** The aws-lc commit kufuli is verified against - release v5.2.0. */
   val awsLcCommit: String = "683ebde4bf3bcc016a9a710ad6b49c0c91b59161"
@@ -95,7 +95,7 @@ object KufuliNative {
   // -march=native - reproducible and safe to cross-compile. sbt-snx requires a backend to write its
   // outputs under the context staging directory, so the source is copied there and built out of the
   // cached clone.
-  private def buildArgon2(context: BuildContext): Artefacts = {
+  private def buildArgon2(context: BuildContext): Artefacts =
     val buildDir = context.staging / "build"
     IO.copyDirectory(context.source, buildDir)
     // On MSVC, fold the target and CRT selectors into `CC` (make expands `$(CC)` at every compile;
@@ -104,15 +104,13 @@ object KufuliNative {
     // not take its target from the vcvars environment, so a bare invocation defaults to x86_64 and
     // emits objects the aarch64 link cannot resolve (undefined `argon2id_hash_raw`); pin the target to
     // the build arch. The static CRT matches aws-lc and the Scala Native link.
-    val cc = context.runtime match {
+    val cc = context.runtime match
       case Windows(arch, Msvc) =>
-        val triple = arch match {
+        val triple = arch match
           case Arch.X86_64  => "x86_64-pc-windows-msvc"
           case Arch.Aarch64 => "aarch64-pc-windows-msvc"
-        }
         s"${context.clang.getAbsolutePath} --target=$triple -fms-runtime-lib=static"
       case _ => context.clang.getAbsolutePath
-    }
     val command = Seq(
       "make",
       "-C",
@@ -124,23 +122,22 @@ object KufuliNative {
     )
     context.log.info(command.mkString("snx argon2: ", " ", ""))
     val logger = ProcessLogger(line => context.log.info(line), line => context.log.error(line))
-    if (Process(command).!(logger) != 0)
-      sys.error(s"snx: libargon2 build failed: ${command.mkString(" ")}")
+    if Process(command).!(logger) != 0 then sys.error(s"snx: libargon2 build failed: ${command.mkString(" ")}")
     val includes = Seq(buildDir / "include")
-    context.runtime match {
+    context.runtime match
       case Windows(_, Msvc) =>
         // lld-link does not resolve `argon2id_hash_raw` from make's GNU `ar` archive (aws-lc links
         // because CMake emits an MSVC `.lib`; argon2 ships no CMakeLists). Fold the compiled objects in
         // directly - a directly-linked object is always included, so no archive symbol index is read.
         val objects = ((buildDir / "src") ** "*.o").get().filter(_.isFile).sortBy(_.getAbsolutePath)
-        if (objects.isEmpty) sys.error(s"snx: libargon2 build produced no objects under ${(buildDir / "src").getAbsolutePath}")
+        if objects.isEmpty then sys.error(s"snx: libargon2 build produced no objects under ${(buildDir / "src").getAbsolutePath}")
         Artefacts(objects, includes)
       case _ =>
         val archive = buildDir / "libargon2.a"
-        if (!archive.isFile) sys.error(s"snx: libargon2 build produced no archive at ${archive.getAbsolutePath}")
+        if !archive.isFile then sys.error(s"snx: libargon2 build produced no archive at ${archive.getAbsolutePath}")
         Artefacts(Seq(archive), includes)
-    }
-  }
+    end match
+  end buildArgon2
 
   /** libargon2, built from source at the pinned commit and folded into the link.
     *
@@ -159,4 +156,4 @@ object KufuliNative {
         // hashed), so it MUST change whenever `buildArgon2` changes, or a stale archive is reused.
         .command("libargon2-static-ref-nothreads-2-winobjs")(buildArgon2)
     )
-}
+end KufuliNative

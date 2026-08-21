@@ -69,12 +69,13 @@ private[kufuli] object jca:
   private def blockingOp[A](thunk: => A): UEff[A] = guard(IO.blocking(thunk))
   private def opE[E <: Throwable, A](thunk: => Either[E, A]): Eff[E, A] = Eff.lift(guard(IO(thunk)))
 
-  // Import validation: a malformed encoding is a typed value, not a defect.
-  private def validating[A](notOnCurve: Boolean)(f: => A): Either[InvalidKey, A] =
+  // Import refusal is BINARY here: the companion door names the public arm from the form it was
+  // handed, so this backend cannot classify differently from its siblings.
+  private def refusing[A](f: => A): Either[Refused, A] =
     try Right(f)
     catch
-      case _: InvalidKeySpecException           => Left(if notOnCurve then InvalidKey.NotOnCurve else InvalidKey.Malformed)
-      case _: java.security.InvalidKeyException => Left(if notOnCurve then InvalidKey.NotOnCurve else InvalidKey.Malformed)
+      case _: InvalidKeySpecException           => Left(Refused)
+      case _: java.security.InvalidKeyException => Left(Refused)
 
   // JCA key and spec constructors clone the array they are handed, so the copy taken out of a
   // carrier is ours to erase; what the provider retains beyond that is the documented JVM boundary.
@@ -91,13 +92,9 @@ private[kufuli] object jca:
   // canonical and an export reads a header kufuli itself produced. JCA infers the family from that
   // encoding and reports no curve of its own, so the stored AlgorithmIdentifier is also what binds
   // the import to the family and curve the caller named.
-  private def storePub[A <: Algorithm](
-    alg: String,
-    expect: DER.Alg,
-    spki: Array[Byte],
-    notOnCurve: Boolean): Either[InvalidKey, PublicKey[A]] =
-    validating(notOnCurve)(parsePub(alg, spki).getEncoded)
-      .flatMap(stored => DER.requireSpki(Slice.of(stored), expect).map(_ => PublicKey.unsafe[A](keyRepr(stored))))
+  private def storePub[A <: Algorithm](alg: String, expect: DER.Alg, spki: Array[Byte]): Either[Refused, PublicKey[A]] =
+    refusing(parsePub(alg, spki).getEncoded)
+      .flatMap(stored => DER.requireSpki(Slice.of(stored), expect).left.map(_ => Refused).map(_ => PublicKey.unsafe[A](keyRepr(stored))))
 
   // JCA's EC KeyFactory accepts any coordinate pair, so an off-curve point imports here and only
   // misbehaves later, where aws-lc and node both refuse it at parse. kufuli's three curves have
@@ -118,18 +115,18 @@ private[kufuli] object jca:
         case _ => false
     case _ => false
 
-  private def storeEcPub[C <: EcCurve](expect: DER.Alg, spki: Array[Byte], notOnCurve: Boolean): Either[InvalidKey, PublicKey[C]] =
-    validating(notOnCurve)(parsePub("EC", spki))
-      .flatMap(parsed => if onCurve(parsed) then Right(parsed.getEncoded) else Left(InvalidKey.NotOnCurve))
-      .flatMap(stored => DER.requireSpki(Slice.of(stored), expect).map(_ => PublicKey.unsafe[C](keyRepr(stored))))
+  private def storeEcPub[C <: EcCurve](expect: DER.Alg, spki: Array[Byte]): Either[Refused, PublicKey[C]] =
+    refusing(parsePub("EC", spki))
+      .flatMap(parsed => if onCurve(parsed) then Right(parsed.getEncoded) else Left(Refused))
+      .flatMap(stored => DER.requireSpki(Slice.of(stored), expect).left.map(_ => Refused).map(_ => PublicKey.unsafe[C](keyRepr(stored))))
 
   // The canonical encoding before it becomes a carrier: adoption wipes the source, so a check over
   // the stored bytes has to run here.
-  private def canonicalPriv(alg: String, expect: DER.Alg, pkcs8: Array[Byte]): Either[InvalidKey, Array[Byte]] =
-    validating(notOnCurve = false)(parsePriv(alg, pkcs8).getEncoded)
-      .flatMap(stored => DER.requirePkcs8(Slice.of(stored), expect).map(_ => stored))
+  private def canonicalPriv(alg: String, expect: DER.Alg, pkcs8: Array[Byte]): Either[Refused, Array[Byte]] =
+    refusing(parsePriv(alg, pkcs8).getEncoded)
+      .flatMap(stored => DER.requirePkcs8(Slice.of(stored), expect).left.map(_ => Refused).map(_ => stored))
 
-  private def storePriv[A <: Algorithm](alg: String, expect: DER.Alg, pkcs8: Array[Byte]): Either[InvalidKey, PrivateKey[A]] =
+  private def storePriv[A <: Algorithm](alg: String, expect: DER.Alg, pkcs8: Array[Byte]): Either[Refused, PrivateKey[A]] =
     canonicalPriv(alg, expect, pkcs8).map(PrivateKey.unsafe[A])
 
   // Public-point export walks the stored SPKI to its BIT STRING; the algorithm-independent length
@@ -238,24 +235,33 @@ private[kufuli] object jca:
   final private class GcmEngine[A <: AeadAlgorithm](kb: Array[Byte], spec: AeadSpec[A], cipherName: String, keyAlg: String, gcm: Boolean)
       extends Cipher.Engine[A]:
     private val jk = new SecretKeySpec(kb, keyAlg)
+
+    // Runs per record on the loop thread: `getInstance` was 2821 ns of the 3750 ns a 1300-byte
+    // AES-256-GCM record cost on JDK 25, so the instance is held and re-initialised per nonce
+    // (1263 ns with the buffer forms below). JCA accepts every nonce but a repeat of the one
+    // immediately preceding, which turns the single misuse this whole tier exists to prevent into
+    // a loud failure instead of a silent one.
+    private val engine = JCipher.getInstance(cipherName)
     private def params(nonce: Slice) =
-      if gcm then new GCMParameterSpec(spec.tagLength * 8, nonce.toArray) else new IvParameterSpec(nonce.toArray)
+      if gcm then new GCMParameterSpec(spec.tagLength * 8, nonce.unsafeArray, nonce.unsafeOffset, nonce.length)
+      else new IvParameterSpec(nonce.unsafeArray, nonce.unsafeOffset, nonce.length)
+    private def prepare(mode: Int, aad: Slice, nonce: Slice): Unit =
+      engine.init(mode, jk, params(nonce))
+      if aad.length > 0 then engine.updateAAD(aad.unsafeArray, aad.unsafeOffset, aad.length)
     private[kufuli] def encrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Int =
-      val c = JCipher.getInstance(cipherName)
-      c.init(JCipher.ENCRYPT_MODE, jk, params(nonce))
-      if aad.length > 0 then c.updateAAD(aad.toArray)
-      val out = c.doFinal(src.toArray)
-      val _ = Slice.of(out).copyInto(dst)
-      out.length
+      prepare(JCipher.ENCRYPT_MODE, aad, nonce)
+      engine.doFinal(src.unsafeArray, src.unsafeOffset, src.length, dst.unsafeArray, dst.unsafeOffset)
     private[kufuli] def decrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Either[AuthFailed, Int] =
-      val c = JCipher.getInstance(cipherName)
-      c.init(JCipher.DECRYPT_MODE, jk, params(nonce))
-      if aad.length > 0 then c.updateAAD(aad.toArray)
-      try
-        val out = c.doFinal(src.toArray)
-        val _ = Slice.of(out).copyInto(dst)
-        Right(out.length)
-      catch case _: javax.crypto.AEADBadTagException => Left(AuthFailed)
+      prepare(JCipher.DECRYPT_MODE, aad, nonce)
+      try Right(engine.doFinal(src.unsafeArray, src.unsafeOffset, src.length, dst.unsafeArray, dst.unsafeOffset))
+      catch
+        case _: javax.crypto.AEADBadTagException =>
+          // `Left` carries no length, so the buffer has to be clean for it to mean nothing was
+          // produced. SunJCE erases the output itself (executed), but the JCA contract does not say
+          // so and a JVM's security provider is a deployment choice - this makes it kufuli's own.
+          // aws-lc states the same erase in its own contract (aead.h:336), so Native needs none.
+          dst.take(math.min(dst.length, math.max(0, src.length - spec.tagLength))).wipe()
+          Left(AuthFailed)
     private[jca] def release(): Unit = Slice.of(kb).wipe()
   end GcmEngine
 
@@ -265,7 +271,16 @@ private[kufuli] object jca:
     new Ciphering[A]:
       private[kufuli] def engine(key: SecretKey[A]): Resource[IO, Cipher.Engine[A]] =
         Resource
-          .make(IO(new GcmEngine(key.material(_.toArray), spec, cipherName, keyAlg, gcm)))(e => IO(e.release()))
+          .make(IO {
+            val kb = key.material(_.toArray)
+            // Engine construction sits between the copy and the release becoming armed, so its
+            // failure erases the copy here.
+            try new GcmEngine(kb, spec, cipherName, keyAlg, gcm)
+            catch
+              case t: Throwable =>
+                Slice.of(kb).wipe()
+                throw t // scalafix:ok DisableSyntax.throw
+          })(e => IO(e.release()))
           .map(identity)
   private def cipheringGcm[A <: AeadAlgorithm](spec: AeadSpec[A]): Ciphering[A] =
     cipheringOf(spec, "AES/GCM/NoPadding", "AES", gcm = true)
@@ -422,21 +437,24 @@ private[kufuli] object jca:
           val n = (length + hlen - 1) / hlen
           val out = new Array[Byte](n * hlen)
           val infoBytes = info.toArray
-          // The counter chain carries the derived key forward, so each round erases its input and its
-          // predecessor: wiping `out` alone leaves those same octets live in the chain's garbage.
+          // The counter chain carries the derived key forward, so each round erases its input and
+          // its predecessor - in `finally`, so a failing primitive cannot abandon them - and the
+          // accumulator is erased on every exit path.
           @tailrec def go(i: Int, prev: Array[Byte]): Unit =
             if i > n then Slice.of(prev).wipe()
             else
               val input = prev ++ infoBytes ++ Array[Byte](i.toByte)
-              val block = hmac(name, key, input)
+              val block =
+                try hmac(name, key, input)
+                finally
+                  Slice.of(input).wipe()
+                  Slice.of(prev).wipe()
               Array.copy(block, 0, out, (i - 1) * hlen, hlen)
-              Slice.of(input).wipe()
-              Slice.of(prev).wipe()
               go(i + 1, block)
-          go(1, Array.emptyByteArray)
-          val taken = Slice.of(out.take(length))
-          Slice.of(out).wipe()
-          taken
+          try
+            go(1, Array.emptyByteArray)
+            Slice.of(out.take(length))
+          finally Slice.of(out).wipe()
         }
       }
     }
@@ -448,30 +466,34 @@ private[kufuli] object jca:
         val out = new Array[Byte](blocks * hlen)
         val saltBytes = salt.toArray
         // Each U is derived key material in its own right, so it is erased once the next one is
-        // folded in; wiping `out` alone leaves the whole chain live.
+        // folded in - in `finally`, so a failing primitive cannot abandon it - and the block
+        // accumulator and output are erased on every exit path.
         @tailrec def accumulate(t: Array[Byte], u: Array[Byte], it: Int): Array[Byte] =
           if it >= iterations then
             Slice.of(u).wipe()
             t
           else
-            val next = hmac(name, pw, u)
+            val next =
+              try hmac(name, pw, u)
+              finally Slice.of(u).wipe()
             @tailrec def xor(j: Int): Unit = if j < hlen then
               t(j) = (t(j) ^ next(j)).toByte; xor(j + 1)
             xor(0)
-            Slice.of(u).wipe()
             accumulate(t, next, it + 1)
         @tailrec def block(b: Int): Unit =
           if b <= blocks then
             val intB = Array[Byte]((b >>> 24).toByte, (b >>> 16).toByte, (b >>> 8).toByte, b.toByte)
             val u1 = hmac(name, pw, saltBytes ++ intB)
-            val t = accumulate(u1.clone, u1, 1)
-            Array.copy(t, 0, out, (b - 1) * hlen, hlen)
-            Slice.of(t).wipe()
+            val t = u1.clone
+            try
+              val _ = accumulate(t, u1, 1)
+              Array.copy(t, 0, out, (b - 1) * hlen, hlen)
+            finally Slice.of(t).wipe()
             block(b + 1)
-        block(1)
-        val taken = Slice.of(out.take(length))
-        Slice.of(out).wipe()
-        taken
+        try
+          block(1)
+          Slice.of(out.take(length))
+        finally Slice.of(out).wipe()
       }
     }
 
@@ -513,13 +535,11 @@ private[kufuli] object jca:
       val kp = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
       KeyPair(PublicKey.unsafe(keyRepr(kp.getPublic.getEncoded)), PrivateKey.unsafe(kp.getPrivate.getEncoded))
     }
-    private[kufuli] def fromRaw(bytes: Slice): Eff[InvalidKey, PublicKey[Ed25519]] = opE {
-      if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
-      else storePub[Ed25519]("Ed25519", DER.Alg.Ed, DER.edSpkiPrefix ++ bytes.toArray, notOnCurve = true)
-    }
-    private[kufuli] def fromSpki(der: Slice): Eff[InvalidKey, PublicKey[Ed25519]] =
-      opE(storePub[Ed25519]("Ed25519", DER.Alg.Ed, der.toArray, notOnCurve = false))
-    private[kufuli] def fromPkcs8(der: Slice): Eff[InvalidKey, PrivateKey[Ed25519]] =
+    private[kufuli] def fromRaw(bytes: Slice): Eff[Refused, PublicKey[Ed25519]] =
+      opE(storePub[Ed25519]("Ed25519", DER.Alg.Ed, DER.edSpkiPrefix ++ bytes.toArray))
+    private[kufuli] def fromSpki(der: Slice): Eff[Refused, PublicKey[Ed25519]] =
+      opE(storePub[Ed25519]("Ed25519", DER.Alg.Ed, der.toArray))
+    private[kufuli] def fromPkcs8(der: Slice): Eff[Refused, PrivateKey[Ed25519]] =
       opE(storePriv[Ed25519]("Ed25519", DER.Alg.Ed, der.toArray))
     private[kufuli] def raw(key: PublicKey[Ed25519]): Eff[KeyNotExportable, IArray[Byte]] =
       op(publicPoint(key.repr, 32))
@@ -532,14 +552,11 @@ private[kufuli] object jca:
       val kp = KeyPairGenerator.getInstance("X25519").generateKeyPair()
       KeyPair(PublicKey.unsafe(keyRepr(kp.getPublic.getEncoded)), PrivateKey.unsafe(kp.getPrivate.getEncoded))
     }
-    private[kufuli] def fromRaw(bytes: Slice): Eff[InvalidKey, PublicKey[X25519]] = opE {
-      if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
-      else if bytes.toArray.forall(_ == 0) then Left(InvalidKey.WeakPoint)
-      else storePub[X25519]("X25519", DER.Alg.X, DER.xSpkiPrefix ++ bytes.toArray, notOnCurve = true)
-    }
-    private[kufuli] def fromSpki(der: Slice): Eff[InvalidKey, PublicKey[X25519]] =
-      opE(storePub[X25519]("X25519", DER.Alg.X, der.toArray, notOnCurve = false))
-    private[kufuli] def fromPkcs8(der: Slice): Eff[InvalidKey, PrivateKey[X25519]] =
+    private[kufuli] def fromRaw(bytes: Slice): Eff[Refused, PublicKey[X25519]] =
+      opE(storePub[X25519]("X25519", DER.Alg.X, DER.xSpkiPrefix ++ bytes.toArray))
+    private[kufuli] def fromSpki(der: Slice): Eff[Refused, PublicKey[X25519]] =
+      opE(storePub[X25519]("X25519", DER.Alg.X, der.toArray))
+    private[kufuli] def fromPkcs8(der: Slice): Eff[Refused, PrivateKey[X25519]] =
       opE(storePriv[X25519]("X25519", DER.Alg.X, der.toArray))
     private[kufuli] def raw(key: PublicKey[X25519]): Eff[KeyNotExportable, IArray[Byte]] =
       op(publicPoint(key.repr, 32))
@@ -555,14 +572,11 @@ private[kufuli] object jca:
       val kp = kpg.generateKeyPair()
       KeyPair(PublicKey.unsafe(keyRepr(kp.getPublic.getEncoded)), PrivateKey.unsafe(kp.getPrivate.getEncoded))
     }
-    private[kufuli] def fromSec1(point: Slice): Eff[InvalidKey, PublicKey[C]] = opE {
-      if point.length != pointLength then Left(InvalidKey.WrongLength(pointLength, point.length))
-      else if point(0) != 4.toByte then Left(InvalidKey.Malformed)
-      else storeEcPub[C](curve, prefix ++ point.toArray, notOnCurve = true)
-    }
-    private[kufuli] def fromSpki(der: Slice): Eff[InvalidKey, PublicKey[C]] =
-      opE(storeEcPub[C](curve, der.toArray, notOnCurve = false))
-    private[kufuli] def fromPkcs8(der: Slice): Eff[InvalidKey, PrivateKey[C]] =
+    private[kufuli] def fromSec1(point: Slice): Eff[Refused, PublicKey[C]] =
+      opE(storeEcPub[C](curve, prefix ++ point.toArray))
+    private[kufuli] def fromSpki(der: Slice): Eff[Refused, PublicKey[C]] =
+      opE(storeEcPub[C](curve, der.toArray))
+    private[kufuli] def fromPkcs8(der: Slice): Eff[Refused, PrivateKey[C]] =
       opE(storePriv[C]("EC", curve, der.toArray))
     private[kufuli] def sec1(key: PublicKey[C]): Eff[KeyNotExportable, IArray[Byte]] =
       op(publicPoint(key.repr, pointLength))
@@ -577,27 +591,18 @@ private[kufuli] object jca:
       val kp = kpg.generateKeyPair()
       KeyPair(PublicKey.unsafe(keyRepr(kp.getPublic.getEncoded)), PrivateKey.unsafe(kp.getPrivate.getEncoded))
     }
-    private[kufuli] def fromComponents(modulus: Slice, exponent: Slice): Eff[InvalidKey, PublicKey[RSA]] = opE {
-      RSA.flooredComponents(modulus).flatMap { _ =>
-        validating(notOnCurve = false) {
-          val n = new BigInteger(1, modulus.toArray)
-          val e = new BigInteger(1, exponent.toArray)
-          val jk = kf("RSA").generatePublic(new RSAPublicKeySpec(n, e))
-          PublicKey.unsafe[RSA](keyRepr(jk.getEncoded))
-        }
+    private[kufuli] def fromComponents(modulus: Slice, exponent: Slice): Eff[Refused, PublicKey[RSA]] = opE {
+      refusing {
+        val n = new BigInteger(1, modulus.toArray)
+        val e = new BigInteger(1, exponent.toArray)
+        val jk = kf("RSA").generatePublic(new RSAPublicKeySpec(n, e))
+        PublicKey.unsafe[RSA](keyRepr(jk.getEncoded))
       }
     }
-    private[kufuli] def fromSpki(der: Slice): Eff[InvalidKey, PublicKey[RSA]] =
-      opE(
-        storePub[RSA]("RSA", DER.Alg.Rsa, der.toArray, notOnCurve = false).flatMap(k =>
-          RSA.flooredSpki(Slice.of(keyBytes(k.repr))).map(_ => k)
-        )
-      )
-    private[kufuli] def fromPkcs8(der: Slice): Eff[InvalidKey, PrivateKey[RSA]] =
-      opE(
-        canonicalPriv("RSA", DER.Alg.Rsa, der.toArray)
-          .flatMap(stored => RSA.flooredPkcs8(Slice.of(stored)).map(_ => PrivateKey.unsafe[RSA](stored)))
-      )
+    private[kufuli] def fromSpki(der: Slice): Eff[Refused, PublicKey[RSA]] =
+      opE(storePub[RSA]("RSA", DER.Alg.Rsa, der.toArray))
+    private[kufuli] def fromPkcs8(der: Slice): Eff[Refused, PrivateKey[RSA]] =
+      opE(storePriv[RSA]("RSA", DER.Alg.Rsa, der.toArray))
     private[kufuli] def components(key: PublicKey[RSA]): Eff[KeyNotExportable, RSA.Components] = op {
       // The non-RSA arm is unreachable with a conformant provider, and a JWK built from an export
       // that succeeded without components would carry empty `n` and `e`.
@@ -625,23 +630,21 @@ private[kufuli] object jca:
       val kp = KeyPairGenerator.getInstance(param).generateKeyPair()
       KeyPair(PublicKey.unsafe(keyRepr(kp.getPublic.getEncoded)), PrivateKey.unsafe(kp.getPrivate.getEncoded))
     }
-    private[kufuli] def fromRaw(bytes: Slice): Eff[InvalidKey, PublicKey[K]] = opE {
-      if bytes.length != spec.publicKeyLength then Left(InvalidKey.WrongLength(spec.publicKeyLength, bytes.length))
-      else
-        val spki = mlkemSpki(spec, bytes.toArray)
-        // The KeyFactory accepts any well-formed encoding; FIPS 203 section 7.2's coefficient check
-        // runs when an encapsulator is constructed, so one is constructed here and discarded - the
-        // peer key is adversarial input and belongs in the typed channel at import.
-        validating(notOnCurve = false) {
-          val _ = JKem.getInstance("ML-KEM").newEncapsulator(parsePub("ML-KEM", spki))
-          PublicKey.unsafe[K](keyRepr(spki))
-        }
+    private[kufuli] def fromRaw(bytes: Slice): Eff[Refused, PublicKey[K]] = opE {
+      val spki = mlkemSpki(spec, bytes.toArray)
+      // The KeyFactory accepts any well-formed encoding; FIPS 203 section 7.2's coefficient check
+      // runs when an encapsulator is constructed, so one is constructed here and discarded - the
+      // peer key is adversarial input and belongs in the typed channel at import.
+      refusing {
+        val _ = JKem.getInstance("ML-KEM").newEncapsulator(parsePub("ML-KEM", spki))
+        PublicKey.unsafe[K](keyRepr(spki))
+      }
     }
     private[kufuli] def raw(key: PublicKey[K]): Eff[KeyNotExportable, IArray[Byte]] = op(IArray.from(mlkemRaw(keyBytes(key.repr))))
     private[kufuli] def fromSeed(seed: Slice): Eff[InvalidKey, KeyPair[PublicKey[K], PrivateKey[K]]] = opE {
       if seed.length != 64 then Left(InvalidKey.WrongLength(64, seed.length))
       else
-        validating(notOnCurve = false) {
+        refusing {
           // The source outlives the draw only as garbage, and it is the seed pair itself.
           wiping(seed) { bytes =>
             val g = KeyPairGenerator.getInstance(param)
@@ -649,7 +652,7 @@ private[kufuli] object jca:
             val kp = g.generateKeyPair()
             KeyPair(PublicKey.unsafe[K](keyRepr(kp.getPublic.getEncoded)), PrivateKey.unsafe[K](kp.getPrivate.getEncoded))
           }
-        }
+        }.left.map(_ => InvalidKey.Malformed)
     }
 
   // Capability bundles the JVM platform table wires each companion into.

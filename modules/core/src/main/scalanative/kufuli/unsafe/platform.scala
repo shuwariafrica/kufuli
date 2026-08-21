@@ -26,14 +26,22 @@ import boilerplate.Slice
 
 import kufuli.awslcffi
 
-private[unsafe] def aesBlockEncrypt(key: Array[Byte], src: Slice, dst: Slice): Unit =
-  require(
-    awslcffi.kufuli_aes_block_encrypt(dst.unsafePtr, src.unsafePtr, Slice.of(key).unsafePtr, key.length.toCSize) == 1,
-    "aes block"
-  )
+private[unsafe] def aesBlockEngine(key: Array[Byte]): AesBlockEngine =
+  new AesBlockEngine:
+    private val kb = key.clone
+    def encrypt(src: Slice, dst: Slice): Unit =
+      require(
+        awslcffi.kufuli_aes_block_encrypt(dst.unsafePtr, src.unsafePtr, Slice.of(kb).unsafePtr, kb.length.toCSize) == 1,
+        "aes block"
+      )
+    def release(): Unit = Slice.of(kb).wipe()
 
-private[unsafe] def chacha20Keystream(key: Array[Byte], dst: Slice, nonce: Slice, counter: Int): Unit =
-  require(
-    awslcffi.kufuli_chacha20_keystream(dst.unsafePtr, dst.length.toCSize, Slice.of(key).unsafePtr, nonce.unsafePtr, counter.toUInt) == 1,
-    "chacha20 keystream"
-  )
+private[unsafe] def chacha20Engine(key: Array[Byte]): ChaCha20Engine =
+  new ChaCha20Engine:
+    private val kb = key.clone
+    def keystream(dst: Slice, nonce: Slice, counter: Int): Unit =
+      require(
+        awslcffi.kufuli_chacha20_keystream(dst.unsafePtr, dst.length.toCSize, Slice.of(kb).unsafePtr, nonce.unsafePtr, counter.toUInt) == 1,
+        "chacha20 keystream"
+      )
+    def release(): Unit = Slice.of(kb).wipe()

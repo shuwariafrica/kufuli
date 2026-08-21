@@ -245,8 +245,8 @@ private[kufuli] object awslc:
 
   // aws-lc yields a null handle when it rejects an input, and Scala Native surfaces that as a null
   // REFERENCE, not as a pointer whose address is zero: the test must therefore be a reference test,
-  // because reading the address off the handle dereferences it. Every typed `InvalidKey` this
-  // backend returns for a rejected encoding depends on this.
+  // because reading the address off the handle dereferences it. Every `Refused` this
+  // backend reports for a rejected encoding depends on this.
   private def present(p: Ptr[Byte]): Boolean =
     val handle: Ptr[Byte] | Null = p
     handle.option.isDefined
@@ -275,6 +275,24 @@ private[kufuli] object awslc:
       val lenP = stackalloc[CSize]()
       require1(call(Slice.of(buf).unsafePtr, lenP))
       buf.take((!lenP).toInt)
+    finally Slice.of(buf).wipe()
+
+  // As `collect`, for the two marshalling calls that report the length they need (-1) instead of
+  // failing when the buffer is short: the encoded length varies with the key, so a fixed buffer
+  // would cap the key sizes this backend accepts while the others take them. The retry is bounded
+  // because the modulus ceiling is enforced above every backend before a handle reaches here.
+  private def marshalled(initial: Int)(call: (Ptr[Byte], Ptr[CSize], Int) => CInt): Array[Byte] =
+    attempt(initial)(call) match
+      case Right(bytes) => bytes
+      case Left(needed) => demand(attempt(needed)(call))
+
+  private def attempt(max: Int)(call: (Ptr[Byte], Ptr[CSize], Int) => CInt): Either[Int, Array[Byte]] =
+    val buf = new Array[Byte](max)
+    try
+      val lenP = stackalloc[CSize]()
+      val rc = call(Slice.of(buf).unsafePtr, lenP, max)
+      require1(if rc == 0 then 0 else 1)
+      if rc == 1 then Right(buf.take((!lenP).toInt)) else Left((!lenP).toInt)
     finally Slice.of(buf).wipe()
 
   // As `collect`, but a 0 return is the typed failure `e` rather than a defect.
@@ -306,21 +324,23 @@ private[kufuli] object awslc:
   // Validate a parsed handle and store its canonical encoding as the key's bytes. aws-lc infers the
   // family from the encoding and one EC handle serves every curve, so the canonical encoding's own
   // AlgorithmIdentifier is what binds the import to the family and curve the caller named.
-  private def storePub(handle: Ptr[Byte], maxLen: Int, expect: DER.Alg): Either[InvalidKey, Array[Byte]] =
+  // Import refusal is BINARY here: the companion door names the public arm from the form it was
+  // handed, so this backend cannot classify differently from its siblings.
+  private def storePub(handle: Ptr[Byte], maxLen: Int, expect: DER.Alg): Either[Refused, Array[Byte]] =
     if present(handle) then
       try
-        val stored = collect(maxLen)((o, l) => kufuli_pkey_spki(handle, o, l, maxLen.toCSize))
-        DER.requireSpki(Slice.of(stored), expect).map(_ => stored)
+        val stored = marshalled(maxLen)((o, l, m) => kufuli_pkey_spki(handle, o, l, m.toCSize))
+        DER.requireSpki(Slice.of(stored), expect).left.map(_ => Refused).map(_ => stored)
       finally kufuli_pkey_free(handle)
-    else Left(InvalidKey.Malformed)
+    else Left(Refused)
 
-  private def storePriv(handle: Ptr[Byte], maxLen: Int, expect: DER.Alg): Either[InvalidKey, Array[Byte]] =
+  private def storePriv(handle: Ptr[Byte], maxLen: Int, expect: DER.Alg): Either[Refused, Array[Byte]] =
     if present(handle) then
       try
-        val stored = collect(maxLen)((o, l) => kufuli_pkey_pkcs8(handle, o, l, maxLen.toCSize))
-        DER.requirePkcs8(Slice.of(stored), expect).map(_ => stored)
+        val stored = marshalled(maxLen)((o, l, m) => kufuli_pkey_pkcs8(handle, o, l, m.toCSize))
+        DER.requirePkcs8(Slice.of(stored), expect).left.map(_ => Refused).map(_ => stored)
       finally kufuli_pkey_free(handle)
-    else Left(InvalidKey.Malformed)
+    else Left(Refused)
 
   private[kufuli] val random: Random = new Random:
     private[kufuli] def bytes(n: Int): UEff[Slice] = op {
@@ -412,7 +432,10 @@ private[kufuli] object awslc:
                           aad.length.toCSize
         ) == 1
       then Right((!lenP).toInt)
-      else Left(AuthFailed)
+      else
+        // No erase here: aws-lc's own contract is that `out` is filled with zero bytes on any
+        // failure (aead.h:336), which is the same guarantee the wrapper states.
+        Left(AuthFailed)
       end if
     end decrypt
   end AeadEngine
@@ -753,8 +776,10 @@ private[kufuli] object awslc:
       }
     }
 
-  // Public keys are stored as SPKI, private keys as PKCS#8 (ML-KEM excepted, which travels raw). A
-  // generous marshal buffer covers every family; the shim reports the true length.
+  // Public keys are stored as SPKI, private keys as PKCS#8 (ML-KEM excepted, which travels raw).
+  // These are the COMMON-CASE staging sizes, not caps: the marshal reports the length it needs and
+  // `marshalled` re-runs at that size, so an RSA-8192 PrivateKeyInfo (4678 octets) stores here
+  // exactly as it does on the other backends.
   private inline val SpkiMax = 2048
   private inline val Pkcs8Max = 4096
 
@@ -762,8 +787,8 @@ private[kufuli] object awslc:
     val h = kufuli_pkey_generate(tpe, rsaBits)
     requirePresent(h)
     try
-      val pub = collect(SpkiMax)((o, l) => kufuli_pkey_spki(h, o, l, SpkiMax.toCSize))
-      val priv = collect(Pkcs8Max)((o, l) => kufuli_pkey_pkcs8(h, o, l, Pkcs8Max.toCSize))
+      val pub = marshalled(SpkiMax)((o, l, m) => kufuli_pkey_spki(h, o, l, m.toCSize))
+      val priv = marshalled(Pkcs8Max)((o, l, m) => kufuli_pkey_pkcs8(h, o, l, m.toCSize))
       (pub = pub, priv = priv)
     finally kufuli_pkey_free(h)
 
@@ -772,16 +797,14 @@ private[kufuli] object awslc:
       val kp = genPkey(PkeyEd25519, 0)
       KeyPair(PublicKey.unsafe(keyRepr(kp.pub)), PrivateKey.unsafe(kp.priv))
     }
-    private[kufuli] def fromRaw(bytes: Slice): Eff[InvalidKey, PublicKey[Ed25519]] = opE {
-      if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
-      else
-        storePub(kufuli_pkey_from_raw_public(PkeyEd25519, bytes.unsafePtr, bytes.length.toCSize), SpkiMax, DER.Alg.Ed).map(b =>
-          PublicKey.unsafe(keyRepr(b))
-        )
-    }
-    private[kufuli] def fromSpki(der: Slice): Eff[InvalidKey, PublicKey[Ed25519]] =
+    private[kufuli] def fromRaw(bytes: Slice): Eff[Refused, PublicKey[Ed25519]] =
+      opE(
+        storePub(kufuli_pkey_from_raw_public(PkeyEd25519, bytes.unsafePtr, bytes.length.toCSize), SpkiMax, DER.Alg.Ed)
+          .map(b => PublicKey.unsafe(keyRepr(b)))
+      )
+    private[kufuli] def fromSpki(der: Slice): Eff[Refused, PublicKey[Ed25519]] =
       opE(storePub(parsePub(der), SpkiMax, DER.Alg.Ed).map(b => PublicKey.unsafe(keyRepr(b))))
-    private[kufuli] def fromPkcs8(der: Slice): Eff[InvalidKey, PrivateKey[Ed25519]] =
+    private[kufuli] def fromPkcs8(der: Slice): Eff[Refused, PrivateKey[Ed25519]] =
       opE(storePriv(parsePriv(der), Pkcs8Max, DER.Alg.Ed).map(PrivateKey.unsafe))
     private[kufuli] def raw(key: PublicKey[Ed25519]): Eff[KeyNotExportable, IArray[Byte]] =
       op(
@@ -796,17 +819,14 @@ private[kufuli] object awslc:
       val kp = genPkey(PkeyX25519, 0)
       KeyPair(PublicKey.unsafe(keyRepr(kp.pub)), PrivateKey.unsafe(kp.priv))
     }
-    private[kufuli] def fromRaw(bytes: Slice): Eff[InvalidKey, PublicKey[X25519]] = opE {
-      if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
-      else if bytes.toArray.forall(_ == 0) then Left(InvalidKey.WeakPoint)
-      else
-        storePub(kufuli_pkey_from_raw_public(PkeyX25519, bytes.unsafePtr, bytes.length.toCSize), SpkiMax, DER.Alg.X).map(b =>
-          PublicKey.unsafe(keyRepr(b))
-        )
-    }
-    private[kufuli] def fromSpki(der: Slice): Eff[InvalidKey, PublicKey[X25519]] =
+    private[kufuli] def fromRaw(bytes: Slice): Eff[Refused, PublicKey[X25519]] =
+      opE(
+        storePub(kufuli_pkey_from_raw_public(PkeyX25519, bytes.unsafePtr, bytes.length.toCSize), SpkiMax, DER.Alg.X)
+          .map(b => PublicKey.unsafe(keyRepr(b)))
+      )
+    private[kufuli] def fromSpki(der: Slice): Eff[Refused, PublicKey[X25519]] =
       opE(storePub(parsePub(der), SpkiMax, DER.Alg.X).map(b => PublicKey.unsafe(keyRepr(b))))
-    private[kufuli] def fromPkcs8(der: Slice): Eff[InvalidKey, PrivateKey[X25519]] =
+    private[kufuli] def fromPkcs8(der: Slice): Eff[Refused, PrivateKey[X25519]] =
       opE(storePriv(parsePriv(der), Pkcs8Max, DER.Alg.X).map(PrivateKey.unsafe))
     private[kufuli] def raw(key: PublicKey[X25519]): Eff[KeyNotExportable, IArray[Byte]] =
       op(
@@ -822,16 +842,13 @@ private[kufuli] object awslc:
       val kp = genPkey(tpe, 0)
       KeyPair(PublicKey.unsafe(keyRepr(kp.pub)), PrivateKey.unsafe(kp.priv))
     }
-    private[kufuli] def fromSec1(point: Slice): Eff[InvalidKey, PublicKey[C]] = opE {
-      if point.length != pointLength then Left(InvalidKey.WrongLength(pointLength, point.length))
-      else if point(0) != 4.toByte then Left(InvalidKey.Malformed)
-      else
-        val h = kufuli_pkey_from_ec_point(tpe, point.unsafePtr, point.length.toCSize)
-        if present(h) then storePub(h, SpkiMax, curve).map(b => PublicKey.unsafe(keyRepr(b))) else Left(InvalidKey.NotOnCurve)
+    private[kufuli] def fromSec1(point: Slice): Eff[Refused, PublicKey[C]] = opE {
+      val h = kufuli_pkey_from_ec_point(tpe, point.unsafePtr, point.length.toCSize)
+      if present(h) then storePub(h, SpkiMax, curve).map(b => PublicKey.unsafe(keyRepr(b))) else Left(Refused)
     }
-    private[kufuli] def fromSpki(der: Slice): Eff[InvalidKey, PublicKey[C]] =
+    private[kufuli] def fromSpki(der: Slice): Eff[Refused, PublicKey[C]] =
       opE(storePub(parsePub(der), SpkiMax, curve).map(b => PublicKey.unsafe(keyRepr(b))))
-    private[kufuli] def fromPkcs8(der: Slice): Eff[InvalidKey, PrivateKey[C]] =
+    private[kufuli] def fromPkcs8(der: Slice): Eff[Refused, PrivateKey[C]] =
       opE(storePriv(parsePriv(der), Pkcs8Max, curve).map(PrivateKey.unsafe))
     private[kufuli] def sec1(key: PublicKey[C]): Eff[KeyNotExportable, IArray[Byte]] =
       op(
@@ -848,18 +865,16 @@ private[kufuli] object awslc:
       val kp = genPkey(PkeyRsa, size.bits)
       KeyPair(PublicKey.unsafe(keyRepr(kp.pub)), PrivateKey.unsafe(kp.priv))
     }
-    private[kufuli] def fromComponents(modulus: Slice, exponent: Slice): Eff[InvalidKey, PublicKey[RSA]] = opE {
-      RSA.flooredComponents(modulus).flatMap { _ =>
-        storePub(kufuli_pkey_from_rsa_components(modulus.unsafePtr, modulus.length.toCSize, exponent.unsafePtr, exponent.length.toCSize),
-                 SpkiMax,
-                 DER.Alg.Rsa
-        ).map(b => PublicKey.unsafe(keyRepr(b)))
-      }
+    private[kufuli] def fromComponents(modulus: Slice, exponent: Slice): Eff[Refused, PublicKey[RSA]] = opE {
+      storePub(kufuli_pkey_from_rsa_components(modulus.unsafePtr, modulus.length.toCSize, exponent.unsafePtr, exponent.length.toCSize),
+               SpkiMax,
+               DER.Alg.Rsa
+      ).map(b => PublicKey.unsafe(keyRepr(b)))
     }
-    private[kufuli] def fromSpki(der: Slice): Eff[InvalidKey, PublicKey[RSA]] =
-      opE(storePub(parsePub(der), SpkiMax, DER.Alg.Rsa).flatMap(b => RSA.flooredSpki(Slice.of(b)).map(_ => PublicKey.unsafe(keyRepr(b)))))
-    private[kufuli] def fromPkcs8(der: Slice): Eff[InvalidKey, PrivateKey[RSA]] =
-      opE(storePriv(parsePriv(der), Pkcs8Max, DER.Alg.Rsa).flatMap(b => RSA.flooredPkcs8(Slice.of(b)).map(_ => PrivateKey.unsafe(b))))
+    private[kufuli] def fromSpki(der: Slice): Eff[Refused, PublicKey[RSA]] =
+      opE(storePub(parsePub(der), SpkiMax, DER.Alg.Rsa).map(b => PublicKey.unsafe(keyRepr(b))))
+    private[kufuli] def fromPkcs8(der: Slice): Eff[Refused, PrivateKey[RSA]] =
+      opE(storePriv(parsePriv(der), Pkcs8Max, DER.Alg.Rsa).map(PrivateKey.unsafe))
     private[kufuli] def components(key: PublicKey[RSA]): Eff[KeyNotExportable, RSA.Components] = op {
       val spki = keyBytes(key.repr)
       val capacity = spki.length
@@ -887,11 +902,10 @@ private[kufuli] object awslc:
       )
       KeyPair(PublicKey.unsafe(keyRepr(pubBuf.take((!pubLen).toInt))), PrivateKey.unsafe(priv))
     }
-    private[kufuli] def fromRaw(bytes: Slice): Eff[InvalidKey, PublicKey[K]] = opE {
-      if bytes.length != spec.publicKeyLength then Left(InvalidKey.WrongLength(spec.publicKeyLength, bytes.length))
+    private[kufuli] def fromRaw(bytes: Slice): Eff[Refused, PublicKey[K]] = opE {
       // FIPS 203 section 7.2's encapsulation-key check: a peer key is adversarial input, so it
       // belongs in the typed channel at import rather than in a failure inside encapsulation.
-      else if kufuli_kem_public_valid(kem, bytes.unsafePtr, bytes.length.toCSize) != 1 then Left(InvalidKey.Malformed)
+      if kufuli_kem_public_valid(kem, bytes.unsafePtr, bytes.length.toCSize) != 1 then Left(Refused)
       else Right(PublicKey.unsafe(keyRepr(bytes.toArray)))
     }
     private[kufuli] def raw(key: PublicKey[K]): Eff[KeyNotExportable, IArray[Byte]] = op(IArray.from(keyBytes(key.repr)))

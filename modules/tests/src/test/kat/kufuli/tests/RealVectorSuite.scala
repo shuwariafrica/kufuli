@@ -82,12 +82,12 @@ class RealVectorSuite extends munit.CatsEffectSuite:
       "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
     )
     for
-      key <- expectRight("import ed pub")(PublicKey.fromRaw(Ed25519)(Slice.of(pub)))
-      good = Signature.fromRaw(Ed25519)(sig).toOption.get
-      ok <- key.verify(Slice.empty, good).either
+      key <- expectRight("import ed pub")(PublicKey.parse(Ed25519)(Raw(Slice.of(pub))))
+      good = Signature.of(Ed25519)(sig).toOption.get
+      ok <- key.verify(Slice.empty, good).either.absolve
       _ <- check(ok == Right(()), "ed25519 rfc8032 verify")
-      bad = Signature.fromRaw(Ed25519)(sig.updated(0, (sig(0) ^ 1).toByte)).toOption.get
-      rej <- key.verify(Slice.empty, bad).either
+      bad = Signature.of(Ed25519)(sig.updated(0, (sig(0) ^ 1).toByte)).toOption.get
+      rej <- key.verify(Slice.empty, bad).either.absolve
       _ <- check(rej.isLeft, "tampered ed25519 rejected")
     yield ()
   }
@@ -111,7 +111,7 @@ class RealVectorSuite extends munit.CatsEffectSuite:
         key <- IO.fromEither(SecretKey.of(HmacSha1)(k).left.map(e => new AssertionError(s"key import: $e")))
         tag <- key.sign(Slice.of(data)).absolve
         _ <- check(hex(Array.from(tag.bytes.iterator)) == want, s"hmac-sha1 tag for a ${k.length}-byte key")
-        ok <- key.verify(Slice.of(data), tag).either
+        ok <- key.verify(Slice.of(data), tag).either.absolve
         _ <- check(ok == Right(()), "the shared constant-time compare accepts the published tag")
       yield ()
       // Case 2's four-byte "Jefe" key is below RFC 2104's floor, which kufuli enforces at import.

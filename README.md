@@ -11,8 +11,8 @@ them, nonce-misuse-resistant AEADs (XChaCha20-Poly1305, AES-256-GCM-SIV) and fir
 remove the classic footguns.
 
 > Status: under active development. The public API below is complete and verified on all four
-> platforms; the JVM, Node, and Native backends are implemented, the browser (Web Crypto) backend is
-> in progress.
+> platforms. The JVM, Node, and Native backends are implemented; the browser (Web Crypto) backend is
+> still a stub, and its artifact is not built for publication.
 
 ## Install
 
@@ -22,21 +22,17 @@ kufuli publishes a platform-aware artifact for each target. In a cross-platform 
 libraryDependencies += "africa.shuwari" %%% "kufuli" % "<version>"
 ```
 
-For a JVM-only build, use `%%`. Browser targets use the WebCrypto artifact instead of the core one:
+For a JVM-only build, use `%%`. The JOSE, password, and X.509 layers are separate artifacts
+(`kufuli-jose`, `kufuli-password`, `kufuli-x509`) that depend on the core.
 
-```scala
-libraryDependencies += "africa.shuwari" %%% "kufuli-browser" % "<version>"
-```
-
-The JOSE, password, and X.509 layers are separate artifacts (`kufuli-jose`, `kufuli-password`,
-`kufuli-x509`) that depend on the core.
+Browser targets will take a separate WebCrypto artifact, `kufuli-browser`, once that backend lands;
+it is not published today.
 
 ## Modules
 
 | Artifact          | Purpose                                                            |
 | ----------------- | ----------------------------------------------------------------- |
 | `kufuli`          | Primitives, recipes, key rotation, and the `kufuli.unsafe` floor. |
-| `kufuli-browser`  | The WebCrypto build of the core, for browser bundles.             |
 | `kufuli-jose`     | JWT/JWS, JWK sets, and COSE key import.                            |
 | `kufuli-password` | Argon2id password hashing with the PHC format.                    |
 | `kufuli-x509`     | Certificate path validation and stapled-OCSP verification.        |
@@ -64,7 +60,7 @@ for
   key   <- AesGcm256.generate                     // SecretKey.of(AesGcm256)(raw) parses a stored key
   box   <- key.seal(Slice.of(accountNumber), aad)
   plain <- key.open(box, aad)                     // Eff[AuthFailed, Slice]
-yield box.bytes                                   // the stored form; SealedBox.of parses it back
+yield box.bytes                                   // the stored form; SealedBox.parse reads it back
 ```
 
 A `Keyring` seals under its primary key and still opens anything it holds, so rotation is a value.
@@ -72,7 +68,7 @@ Ring construction and rotation are pure, and reject a duplicate id:
 
 ```scala
 for
-  ring <- Eff.from(Keyring.of(KeyId.of(1) -> key2024).flatMap(_.rotated(KeyId.of(2) -> key2025)))
+  ring <- Eff.from(Keyring.of(KeyId(1) -> key2024).flatMap(_.rotated(KeyId(2) -> key2025)))
   box  <- ring.seal(Slice.of(secret))             // under the new primary; retired keys still open
 yield box
 ```
@@ -162,7 +158,7 @@ hashing, and `kufuli.unsafe` are not part of it.
 
 ## Requirements
 
-- Scala 3.8+.
+- Scala 3.9.
 - JVM: JDK 25+ (the in-JDK JCA ML-KEM provider).
 - Node.js: 24.7+ (the floor for the native Argon2id binding); ML-KEM is verified against 24.18.
 - Scala Native: 0.5+ with a C toolchain; the native backend links aws-lc, provisioned by sbt-snx.

@@ -40,6 +40,13 @@ private[kufuli] def secretCopy(bytes: Array[Byte]): SecretRepr =
     val _ = boilerplate.Slice.of(bytes).copyInto(dst)
   }
 private[kufuli] def secretRead[B](r: SecretRepr)(f: boilerplate.Slice => B): B = boilerplate.Secret.use(r)(f)
+
+// As `secretRead`, holding the guard across the RETURNED EFFECT rather than only across the call:
+// a continuation that merely builds an effect would otherwise hand the view on to a runtime the
+// guard has already released.
+private[kufuli] def secretReadEff[E <: Throwable, B](r: SecretRepr)(
+  f: boilerplate.Slice => boilerplate.effect.Eff[E, B]
+): boilerplate.effect.Eff[E, B] = boilerplate.effect.useEff(r)(f)
 private[kufuli] def secretDestroy(r: SecretRepr): Unit = boilerplate.Secret.destroy(r)()
 
 // Generated keys are byte-backed and exportable here, so the backend door coincides with the view.

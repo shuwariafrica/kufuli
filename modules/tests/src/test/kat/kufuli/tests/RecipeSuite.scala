@@ -20,93 +20,81 @@
  */
 package kufuli.tests
 
-import scala.compiletime.testing.typeChecks
-
 import boilerplate.Slice
 import boilerplate.effect.*
 
 import kufuli.*
 import kufuli.tests.support.*
 
-// Runs on every artifact, browser included, so it exercises only the ops common to all four
-// backends.
-class CoreFlowsSuite extends munit.CatsEffectSuite:
+// The recipe layer - the box format, the keyrings, the prepared handles, the derive-and-seal chain,
+// the export-versus-custody contract - each assertion of which runs a backend operation to reach
+// what it is about. That is why the suite lives in the known-answer tier and not beside the
+// value-layer checks: these rows are meaningless against a placeholder, so they execute on the lanes
+// with a real provider and nowhere else.
+class RecipeSuite extends munit.CatsEffectSuite:
 
-  test("AES-GCM-256 seal/open with authenticated header; re-heading refuses") {
+  private val prepared = Slice.of("prepared".getBytes)
+
+  test("a sealed box binds its own header, so re-heading a valid box refuses to open") {
     for
       key <- AesGcm256.generate.absolve
       box <- key.seal(Slice.of("secret".getBytes), Slice.of("ctx".getBytes)).absolve
       pt <- expectRight("open")(key.open(box, Slice.of("ctx".getBytes)))
       _ <- check(new String(pt.toArray) == "secret", "round-trip")
-      bad <- key.open(box, Slice.of("other".getBytes)).either
-      _ <- check(bad.isLeft, "wrong aad -> AuthFailed")
-      stored = box.bytes
-      reparsed = SealedBox.of(AesGcm256)(Array.from(stored.iterator))
-      _ <- check(reparsed.isRight, "persistence round-trip")
+      bad <- key.open(box, Slice.of("other".getBytes)).either.absolve
+      _ <- check(bad.isLeft, "a different aad -> AuthFailed")
+      stored = Array.from(box.bytes.iterator)
+      _ <- check(SealedBox.parse(AesGcm256)(stored).isRight, "the stored form parses back")
+      // Version 1 is unkeyed and version 2 carries a KeyId; the whole header is the AEAD's
+      // associated data, so promoting a v1 box to v2 fails authentication rather than being read as
+      // a ring member.
+      reheaded = stored.clone
+      _ = reheaded(0) = 2.toByte
+      // The re-headed box must PARSE, or the row would pass on a length rejection and say nothing
+      // about the header being authenticated.
+      forged <- expectRight("the re-headed box parses")(Eff.from(SealedBox.parse(AesGcm256)(reheaded)))
+      opened <- key.open(forged, Slice.of("ctx".getBytes)).either.absolve
+      _ <- check(opened == Left(AuthFailed), s"and then fails authentication rather than opening, got $opened")
     yield ()
+    end for
   }
 
-  test("Keyring AEAD rotation: id-routed v2, duplicate-id rejection, unknown-id-as-forgery") {
+  test("Keyring AEAD rotation: the id routes a v2 box, and an unknown id is a forgery") {
     for
       k1 <- AesGcm256.generate.absolve
       k2 <- AesGcm256.generate.absolve
-      ring1 = Keyring.of(KeyId.of(1) -> k1).toOption.get
-      ring2 = ring1.rotated(KeyId.of(2) -> k2).toOption.get
-      _ <- check(ring1.rotated(KeyId.of(1) -> k2).isLeft, "duplicate id rejected")
+      ring1 = Keyring.of(KeyId(1) -> k1).toOption.get
+      ring2 = ring1.rotated(KeyId(2) -> k2).toOption.get
       box <- ring2.seal(Slice.of("payload".getBytes)).absolve
       opened <- expectRight("ring open")(ring2.open(box))
-      _ <- check(new String(opened.toArray) == "payload", "ring seal/open")
+      _ <- check(new String(opened.toArray) == "payload", "the ring seals under its primary and opens it")
+      // The retired key is still held, so a box sealed before the rotation still opens.
+      old <- ring1.seal(Slice.of("earlier".getBytes)).absolve
+      earlier <- expectRight("retired key")(ring2.open(old))
+      _ <- check(new String(earlier.toArray) == "earlier", "and still opens what a retired key sealed")
+      stranger <- AesGcm256.generate.absolve
+      other = Keyring.of(KeyId(9) -> stranger).toOption.get
+      unknown <- other.open(box).either.absolve
+      _ <- check(unknown == Left(AuthFailed), s"a ring that holds no such id reports a forgery, got $unknown")
     yield ()
+    end for
   }
 
-  test("MAC keyring rotation (session/CSRF): CT trial across held keys") {
+  test("MAC keyring rotation: a tag issued under a retired key still verifies, through the one CT compare") {
     for
       k1 <- HmacSha256.generate.absolve
       k2 <- HmacSha256.generate.absolve
-      ring = Keyring.of(KeyId.of(1) -> k1).toOption.get.rotated(KeyId.of(2) -> k2).toOption.get
-      tag <- ring.sign(Slice.of("cookie".getBytes)).absolve
-      ok <- ring.verify(Slice.of("cookie".getBytes), tag).either
-      _ <- check(ok == Right(()), "tag verifies under the ring")
-      bad <- ring.verify(Slice.of("forged".getBytes), tag).either
-      _ <- check(bad.isLeft, "forged data rejected")
+      ring1 = Keyring.of(KeyId(1) -> k1).toOption.get
+      ring2 = ring1.rotated(KeyId(2) -> k2).toOption.get
+      old <- ring1.sign(Slice.of("cookie".getBytes)).absolve
+      accepted <- ring2.verify(Slice.of("cookie".getBytes), old).either.absolve
+      _ <- check(accepted == Right(()), s"the retired key's tag verifies under the rotated ring, got $accepted")
+      forged <- ring2.verify(Slice.of("forged".getBytes), old).either.absolve
+      _ <- check(forged.isLeft, s"and a tag over other data does not, got $forged")
     yield ()
   }
 
-  test("Ed25519 sign/verify with scheme-mismatch rejection") {
-    for
-      kp <- Ed25519.generate.absolve
-      sig <- kp.privateKey.sign(Slice.of("msg".getBytes)).absolve
-      ok <- kp.publicKey.verify(Slice.of("msg".getBytes), sig).either
-      _ <- check(ok == Right(()), "verify")
-      bad <- kp.publicKey.verify(Slice.of("MSG".getBytes), sig).either
-      _ <- check(bad.isLeft, "tampered data rejected")
-    yield ()
-  }
-
-  test("ECDSA P-256 sign/verify (curve-paired hash)") {
-    for
-      kp <- P256.generate.absolve
-      sig <- kp.privateKey.sign(Slice.of("data".getBytes)).absolve
-      ok <- kp.publicKey.verify(Slice.of("data".getBytes), sig).either
-      _ <- check(ok == Right(()), "verify")
-    yield ()
-  }
-
-  test("X25519 agreement is total and symmetric; secret hygiene (use-wipes)") {
-    for
-      a <- X25519.generate.absolve
-      b <- X25519.generate.absolve
-      za <- a.privateKey.agree(b.publicKey).absolve
-      zb <- b.privateKey.agree(a.publicKey).absolve
-      ha <- za.use(s => s.toArray.toSeq).absolve
-      hb <- zb.use(s => s.toArray.toSeq).absolve
-      _ <- check(ha == hb, "agreement matches both directions")
-      _ <- za.destroy.absolve
-      _ <- zb.destroy.absolve
-    yield ()
-  }
-
-  test("HKDF derive a key from a shared secret; the PRK is destroyed") {
+  test("a shared secret derives a key in one step, and the intermediate PRK does not outlive it") {
     for
       a <- X25519.generate.absolve
       b <- X25519.generate.absolve
@@ -114,48 +102,28 @@ class CoreFlowsSuite extends munit.CatsEffectSuite:
       key <- z.deriveKey(Sha256, Slice.empty, Slice.of("app".getBytes), AesGcm256).absolve
       box <- key.seal(Slice.of("derived".getBytes)).absolve
       pt <- expectRight("open derived")(key.open(box))
-      _ <- check(new String(pt.toArray) == "derived", "derived-key round-trip")
+      _ <- check(new String(pt.toArray) == "derived", "the derived key seals and opens")
+      _ <- z.destroy.absolve
     yield ()
   }
 
-  test("AES-KW wrap/unwrap; the UnwrapFailed | InvalidKey union channel is sound") {
+  test("unwrapping to a named algorithm validates the recovered length, over a sound union channel") {
     for
       kek <- AesKw256.generate.absolve
       target <- AesGcm256.generate.absolve
       wrapped <- expectRight("wrap")(kek.wrap(target))
-      unwrapped <- kek.unwrap(wrapped, AesGcm256).either
-      _ <- check(unwrapped.isRight, "unwrap to the named algorithm")
-    yield ()
-  }
-
-  test("hashing: one-shot digest snapshots") {
-    for
-      d <- Sha256.digest(Slice.of("transcript".getBytes)).absolve
-      _ <- check(d.bytes.length == 32, "SHA-256 is 32 bytes")
-    yield ()
-  }
-  test("a generated public key exports on every backend, and its private half never leaves as bytes") {
-    for
-      ed <- Ed25519.generate.absolve
-      raw <- ed.publicKey.raw.either
-      _ <- check(raw.exists(_.length == 32), s"a generated Ed25519 public key exports its raw form, got $raw")
-      spki <- ed.publicKey.spki.either
-      _ <- check(spki.isRight, s"and its SubjectPublicKeyInfo, got $spki")
-      p <- P256.generate.absolve
-      sec1 <- p.publicKey.sec1.either
-      _ <- check(sec1.exists(_.length == 65), s"a generated P-256 public key exports its point, got $sec1")
-      // The private half has no byte accessor at all: export is the typed, backend-decided path.
-      _ <- check(!typeChecks("def k: PrivateKey[Ed25519] = ???; k.raw"), "a private key has no raw export")
-      _ <- check(!typeChecks("def k: SecretKey[AesGcm256] = ???; k.raw"), "a secret key has no raw export")
+      // Both arms of `UnwrapFailed | InvalidKey` are proper classes, so both survive the reifying
+      // observer a union channel is read through - the first arm of a singleton union does not.
+      recovered <- kek.unwrap(wrapped, AesGcm256).either.absolve
+      _ <- check(recovered.isRight, s"the wrapped key unwraps to its own algorithm, got ${recovered.isRight}")
+      mismatch <- kek.unwrap(wrapped, AesGcm128).either.absolve
+      _ <- check(mismatch == Left(InvalidKey.WrongLength(16, 32)), s"and to another length is a typed refusal, got $mismatch")
+      corrupt = wrapped.toArray
+      _ = corrupt(0) = (corrupt(0) ^ 0xff).toByte
+      failed <- kek.unwrap(Slice.of(corrupt), AesGcm256).either.absolve
+      _ <- check(failed == Left(UnwrapFailed), s"a corrupted wrapping is the other arm, got $failed")
     yield ()
     end for
-  }
-
-  test("a secret key copies the caller's buffer rather than adopting it") {
-    val bytes = Array.fill[Byte](32)(7)
-    val key = SecretKey.of(AesGcm256)(bytes)
-    assert(key.isRight, "32 bytes is an AES-256 key")
-    assert(bytes.forall(_ == 7.toByte), "the caller's buffer is untouched, and stays the caller's to wipe")
   }
 
   test("a shared secret borrows under guard and refuses a borrow after destruction") {
@@ -175,6 +143,7 @@ class CoreFlowsSuite extends munit.CatsEffectSuite:
     yield ()
     end for
   }
+
   test("a borrow across an effect releases its guard whether the effect succeeds or fails") {
     for
       first <- X25519.generate.absolve
@@ -182,7 +151,7 @@ class CoreFlowsSuite extends munit.CatsEffectSuite:
       secret <- first.privateKey.agree(second.publicKey).absolve
       // The channel is ascribed: inferred, it collapses to Nothing and the row proves nothing about
       // a typed failure crossing the borrow.
-      failed <- secret.useEff[Malformed, Int](_ => Eff.fail(Malformed)).either
+      failed <- secret.useEff[Malformed, Int](_ => Eff.fail(Malformed)).either.absolve
       _ <- check(failed == Left(Malformed), s"the typed failure propagates out of the borrow, got $failed")
       // Had the guard survived the failure, this borrow would raise rather than read.
       after <- secret.use(_.length).absolve
@@ -192,15 +161,13 @@ class CoreFlowsSuite extends munit.CatsEffectSuite:
     end for
   }
 
-  private val prepared = Slice.of("prepared".getBytes)
-
   test("a prepared MAC handle signs and verifies what the one-shot ops do") {
     for
       mk <- HmacSha256.generate.absolve
       tag <- mk.signer.use(s => s.sign(prepared)).absolve
       ok <- mk.verifier.use(v => v.verify(prepared, tag).either).absolve
       _ <- check(ok == Right(()), s"a prepared MAC verifier accepts a prepared tag, got $ok")
-      oneShot <- mk.verify(prepared, tag).either
+      oneShot <- mk.verify(prepared, tag).either.absolve
       _ <- check(oneShot == Right(()), s"and the one-shot verify accepts it too, got $oneShot")
       forged <- mk.verifier.use(v => v.verify(Slice.of("other".getBytes), tag).either).absolve
       _ <- check(forged.isLeft, s"a prepared verifier still rejects a tag over other data, got $forged")
@@ -213,7 +180,7 @@ class CoreFlowsSuite extends munit.CatsEffectSuite:
       sig <- ed.privateKey.signer.use(s => s.sign(prepared)).absolve
       ok <- ed.publicKey.verifier.use(v => v.verify(prepared, sig).either).absolve
       _ <- check(ok == Right(()), s"a prepared Ed25519 pair round-trips, got $ok")
-      oneShot <- ed.publicKey.verify(prepared, sig).either
+      oneShot <- ed.publicKey.verify(prepared, sig).either.absolve
       _ <- check(oneShot == Right(()), s"and the one-shot verify accepts the prepared signature, got $oneShot")
     yield ()
   }
@@ -233,13 +200,16 @@ class CoreFlowsSuite extends munit.CatsEffectSuite:
     for
       ed <- Ed25519.generate.absolve
       exportable = ed.privateKey.exportable
-      result <- ed.privateKey.pkcs8.either
+      result <- ed.privateKey.pkcs8.either.absolve
       _ <- check(result.isRight == exportable, s"export and the backend's own custody agree, got $result for exportable=$exportable")
       _ <- check(exportable || result == Left(KeyNotExportable), s"a handle-backed key names the refusal, got $result")
-      // An IMPORTED key is the caller's bytes whatever the backend generates into, so it always
-      // exports - which is what keeps a round trip expressible on every artifact.
-      imported <- ed.publicKey.spki.either
-      _ <- check(imported.isRight, s"a public key always exports, got $imported")
+      raw <- ed.publicKey.raw.either.absolve
+      _ <- check(raw.exists(_.bytes.length == 32), s"a generated public key exports its raw form, got $raw")
+      spki <- ed.publicKey.spki.either.absolve
+      _ <- check(spki.isRight, s"and its SubjectPublicKeyInfo, got $spki")
+      p <- P256.generate.absolve
+      sec1 <- p.publicKey.sec1.either.absolve
+      _ <- check(sec1.exists(_.bytes.length == 65), s"a generated P-256 public key exports its point, got $sec1")
     yield ()
     end for
   }
@@ -262,7 +232,7 @@ class CoreFlowsSuite extends munit.CatsEffectSuite:
       tlv(0x03, Array[Byte](0) ++ seq(tlv(0x02, Array[Byte](0) ++ modulus), tlv(0x02, exponent)))
     )
     for
-      key <- expectRight("rsa spki")(PublicKey.fromSpki(RSA)(Slice.of(spki)))
+      key <- expectRight("rsa spki")(PublicKey.parse(RSA)(SPKI(Slice.of(spki))))
       components <- expectRight("components")(key.components)
       _ <- check(Array.from(components.exponent.iterator).sameElements(exponent),
                  s"the exponent survives, got ${components.exponent.length} octets"
@@ -273,27 +243,27 @@ class CoreFlowsSuite extends munit.CatsEffectSuite:
     yield ()
   }
 
-  test("the error arms a caller routes on: unwrappable length, duplicate id, unknown key algorithm") {
-    // A DSA SubjectPublicKeyInfo: well formed, and outside every family kufuli implements.
-    val dsaSpki =
-      Array[Byte](0x30, 0x1b, 0x30, 0x09, 0x06, 0x07, 0x2a, 0x86.toByte, 0x48, 0xce.toByte, 0x38, 0x04, 0x01, 0x03, 0x0e, 0x00) ++ Array
-        .fill[Byte](13)(1)
+  test("an RSA public key keeps its modulus whatever width its exponent was given in") {
+    // The JWK `e` is minimal-width: 65537 is three octets, 3 is one and 2^64+1 is nine. A reader
+    // that splits a stored (modulus, exponent) pair at a FIXED width hands back octets of the
+    // modulus as the exponent, and a short modulus - so the modulus is what this pins, since a
+    // backend is free to canonicalise the exponent it re-derives.
+    val modulus = Array.fill[Byte](256)(0xff.toByte)
+    val wide = Array[Byte](0, 1, 0, 1) // 65537, one octet wider than its minimal encoding
     for
-      kek <- AesKw256.generate.absolve
-      // HMAC keys are variable length, so a 33-byte one is the reachable way to hand plain AES-KW a
-      // length RFC 3394 cannot wrap; a KWP algorithm takes it.
-      odd <- Eff.from(SecretKey.of(HmacSha256)(new Array[Byte](33))).absolve
-      refused <- kek.wrap(odd).either
-      _ <- check(refused == Left(NotWrappable), s"a length that is not a multiple of 8 -> NotWrappable, got $refused")
-      even <- AesGcm256.generate.absolve
-      accepted <- kek.wrap(even).either
-      _ <- check(accepted.isRight, s"and the same key-encryption key wraps a length RFC 3394 admits, got ${accepted.isRight}")
-      k1 <- AesGcm256.generate.absolve
-      k2 <- AesGcm256.generate.absolve
-      _ <- check(Keyring.of(KeyId.of(1) -> k1, KeyId.of(1) -> k2) == Left(DuplicateKeyId), "a ring cannot be built with a repeated id")
-      unknown <- PublicKey.fromSpki(Slice.of(dsaSpki)).either
-      _ <- check(unknown == Left(InvalidKey.Unsupported), s"an SPKI naming no family kufuli implements -> Unsupported, got $unknown")
+      key <- expectRight("of")(PublicKey.of(RSA.Components(IArray.from(modulus), IArray.from(wide))))
+      components <- expectRight("components")(key.components)
+      _ <- check(
+             Array.from(components.modulus.iterator).sameElements(modulus),
+             s"the modulus survives a four-octet exponent, got ${components.modulus.length} octets"
+           )
+      der <- expectRight("spki")(key.spki)
+      reparsed <- expectRight("reparse")(PublicKey.parse(RSA)(der))
+      again <- expectRight("components again")(reparsed.components)
+      _ <- check(Array.from(again.modulus.iterator).sameElements(modulus),
+                 s"and survives the SPKI the same key emits, got ${again.modulus.length} octets"
+           )
     yield ()
     end for
   }
-end CoreFlowsSuite
+end RecipeSuite

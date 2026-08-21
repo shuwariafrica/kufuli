@@ -34,7 +34,7 @@ class X509ConstraintsSuite extends munit.CatsEffectSuite:
       certs <- chain.traverse(parsed)
       root <- parsed(anchor)
       id <- serverId(host)
-      result <- x5.CertPath.verify(certs, x5.TrustAnchors(root), at, id).either
+      result <- x5.CertPath.verify(certs, x5.TrustAnchors(root), at, id).either.absolve
     yield result
 
   private def permitted(bases: Array[Byte]*): Array[Byte] = constraints(bases.toList, Nil)
@@ -225,9 +225,9 @@ class X509ConstraintsSuite extends munit.CatsEffectSuite:
       anchor <- parsed(root.der).map(x5.TrustAnchors(_))
       good <- leafNamed(root, 2, allowed, List(endEntity)).flatMap(parsed)
       bad <- leafNamed(root, 3, denied, List(endEntity)).flatMap(parsed)
-      inside <- x5.CertPath.verifyClient(List(good), anchor, at).either
+      inside <- x5.CertPath.verifyClient(List(good), anchor, at).either.absolve
       _ <- check(inside.isRight, s"an emailAddress inside the permitted domain validates, got $inside")
-      outside <- x5.CertPath.verifyClient(List(bad), anchor, at).either
+      outside <- x5.CertPath.verifyClient(List(bad), anchor, at).either.absolve
       _ <- check(violated(outside), s"an emailAddress outside it -> NameConstraintViolated, got $outside")
     yield ()
   }
@@ -242,11 +242,11 @@ class X509ConstraintsSuite extends munit.CatsEffectSuite:
       anchor <- parsed(root.der).map(x5.TrustAnchors(_))
       evader <- leafNamed(root, 2, evasive, List(endEntity)).flatMap(parsed)
       outside <- leafNamed(root, 3, plain, List(endEntity)).flatMap(parsed)
-      slipped <- x5.CertPath.verifyClient(List(evader), anchor, at).either
+      slipped <- x5.CertPath.verifyClient(List(evader), anchor, at).either.absolve
       _ <- check(violated(slipped), s"a multi-`@` emailAddress -> NameConstraintViolated, got $slipped")
       // The same exclusion stays vacuous for a well-formed address outside it, so the gate has not
       // become an unconditional rejection of the fallback.
-      clean <- x5.CertPath.verifyClient(List(outside), anchor, at).either
+      clean <- x5.CertPath.verifyClient(List(outside), anchor, at).either.absolve
       _ <- check(clean.isRight, s"a well-formed address outside the excluded subtree validates, got $clean")
     yield ()
     end for
@@ -263,9 +263,9 @@ class X509ConstraintsSuite extends munit.CatsEffectSuite:
       anchor <- parsed(root.der).map(x5.TrustAnchors(_))
       dropped <- leafNamed(root, 2, seq(highByte, rdn(oidCommonName, 0x0c, "leaf")), List(endEntity)).flatMap(parsed)
       decoded <- leafNamed(root, 3, outside, List(endEntity)).flatMap(parsed)
-      ignored <- x5.CertPath.verifyClient(List(dropped), anchor, at).either
+      ignored <- x5.CertPath.verifyClient(List(dropped), anchor, at).either.absolve
       _ <- check(ignored.isRight, s"a non-IA5 attribute is no mailbox, so the fallback has nothing to match, got $ignored")
-      checked <- x5.CertPath.verifyClient(List(decoded), anchor, at).either
+      checked <- x5.CertPath.verifyClient(List(decoded), anchor, at).either.absolve
       _ <- check(violated(checked), s"while an IA5 address outside the subtree is checked and fails, got $checked")
     yield ()
   }
