@@ -22,9 +22,12 @@ initialize := {
 
 formattingSettings
 
-def scala3 = "3.8.4"
-val boilerplate: ModuleID = "africa.shuwari" %% "boilerplate" % "0.11.0"
-val boilerplateEffect: ModuleID = "africa.shuwari" %% "boilerplate-effect" % "0.11.0"
+KufuliBuild.fixtureSettings
+
+def scala3 = "3.9.0-RC6"
+val boilerplate: ModuleID = "africa.shuwari" %% "boilerplate" % "0.14.0"
+val boilerplateEffect: ModuleID = "africa.shuwari" %% "boilerplate-effect" % "0.14.0"
+val boilerplateTestkit: ModuleID = "africa.shuwari" %% "boilerplate-testkit" % "0.14.0"
 val jsoniter: ModuleID = "com.github.plokhotnyuk.jsoniter-scala" %% "jsoniter-scala-core" % "2.40.1"
 val bouncycastle: ModuleID = "org.bouncycastle" % "bcprov-jdk18on" % "1.85.2"
 val munit: ModuleID = "org.scalameta" %% "munit" % "1.3.5"
@@ -122,6 +125,7 @@ val `kufuli-tests` =
     .settings(
       libraryDependencies += munit % Test,
       libraryDependencies += `munit-cats-effect` % Test,
+      libraryDependencies += boilerplateTestkit % Test,
       libraryDependencies += jsoniter % Test,
       testFrameworks += new TestFramework("munit.Framework"),
       // sbt 2.x resolves `test` through testQuick, which skips suites whose prior run succeeded with
@@ -158,7 +162,7 @@ val `kufuli-tests` =
         p.enablePlugins(WycheproofPlugin)
           .settings(
             wycheproofSettings ++ corpusSettings ++ NativePlatformPlugin.testLinkSettings ++ NativePlatformPlugin.provisionAwsLc ++
-              NativePlatformPlugin.provisionArgon2 ++ testDir("kat")
+              NativePlatformPlugin.provisionArgon2 ++ testDir("kat") ++ testDir("misuse")
           )
           .dependsOn(
             kufuli.native(scala3),
@@ -201,7 +205,7 @@ val `kufuli-native` =
 
 def jsSettings: List[Setting[?]] = List(
   scalaJSLinkerConfig ~= { _.withModuleKind(ModuleKind.ESModule) }
-)
+) ++ (if (sys.env.get("KUFULI_RELEASE_GATE").contains("true")) List(Test / scalaJSStage := FullOptStage) else Nil)
 
 def jsNodeSourceDirs: List[Setting[?]] = List(
   Compile / unmanagedSourceDirectories += (Compile / sourceDirectory).value / "scalajs-node",
@@ -220,17 +224,14 @@ def jsBrowserSettings(base: String): List[Setting[?]] = List(
   Test / unmanagedSourceDirectories := (Test / unmanagedSourceDirectories).value.distinct
 )
 
+// One test source set per capability grouping added to rows that implement the grouping. `kat` is the three rows with a
+// real provider; `misuse` is Native alone, which is the only backend carrying XChaCha20-Poly1305 and AES-256-GCM-SIV
 def testDir(name: String): List[Setting[?]] = List(
   Test / unmanagedSourceDirectories += (Test / sourceDirectory).value / name
 )
 
-// The vendored x509-limbo and NIST PKITS slices become string constants, because JS and Native have
-// no test resources to read at run time. Each vendored file is well under a class file's per-entry
-// constant-pool limit, so no chunking is involved.
-val corpusGenerate = taskKey[Seq[File]]("Embeds the vendored X.509 conformance corpora as Scala string constants.")
-
 def corpusSettings: List[Setting[?]] = List(
-  Test / corpusGenerate := Def.uncached {
+  Test / KufuliBuild.corpusGenerate := Def.uncached {
     val out = (Test / sourceManaged).value / "corpora"
     val root = (LocalRootProject / baseDirectory).value / "modules" / "tests" / "corpora"
 
@@ -263,15 +264,17 @@ def corpusSettings: List[Setting[?]] = List(
     if (!file.exists() || IO.read(file, IO.utf8) != rendered) IO.write(file, rendered, IO.utf8)
     Seq(file)
   },
-  Test / sourceGenerators += (Test / corpusGenerate).taskValue
+  Test / sourceGenerators += (Test / KufuliBuild.corpusGenerate).taskValue
 )
 
 def wycheproofSettings: List[Setting[?]] = List(
   wycheproofTargetPackage := "kufuli.tests.wycheproof",
   wycheproofVectorFiles := Seq(
     "aes_gcm_test.json",
+    "aes_gcm_siv_test.json",
     "aes_kwp_test.json",
     "chacha20_poly1305_test.json",
+    "xchacha20_poly1305_test.json",
     "ecdsa_secp256r1_sha256_p1363_test.json",
     "ed25519_test.json",
     "mlkem_768_test.json",
@@ -290,6 +293,7 @@ def baseCompilerOptions = List(
   "-deprecation",
   "-feature",
   "-explain",
+  "-Wall",
   "-Wvalue-discard",
   "-Wnonunit-statement",
   "-Wunused:all",
@@ -305,11 +309,22 @@ def compilerOptions = baseCompilerOptions ++ List(
   "-Werror"
 )
 
+// `-Wall` enables `-Wtostring-interpolated`, which fires on every interpolated non-String value -
+// the shape every assertion message in the suites is built from.
+def testCompilerOptions = compilerOptions.filterNot(_ == "-Wall")
+
 def compilerSettings = List(
   Compile / compile / scalacOptions ++= compilerOptions,
-  Test / compile / scalacOptions ++= compilerOptions,
+  Test / compile / scalacOptions ++= testCompilerOptions,
   Compile / doc / scalacOptions := Nil,
   Test / doc / scalacOptions := Nil
+) ++ scalafixSourceSettings
+
+// scalafix's parser rejects the capture-checking `^` syntax outright, so the sources carrying it are
+// withheld by content; `.scalafmt.conf` withholds the same set by path.
+def scalafixSourceSettings = List(
+  Compile / scalafix / unmanagedSources := (Compile / unmanagedSources).value.filterNot(KufuliBuild.captureChecked),
+  Test / scalafix / unmanagedSources := (Test / unmanagedSources).value.filterNot(KufuliBuild.captureChecked)
 )
 
 def formattingSettings = List(
@@ -354,5 +369,14 @@ def publishSettings: List[Setting[?]] = List(
   )
 )
 
+// the release form of this gate is `KUFULI_RELEASE_GATE=true sbt suites`.
+addCommandAlias(
+  "suites",
+  "kufuli-tests/Test/testOnly *; kufuli-testsJS/Test/testOnly *; kufuli-testsNative/Test/testOnly *; kufuli-testsJS-browser/Test/testOnly *"
+)
+
 addCommandAlias("format", "scalafixAll; scalafmtAll; scalafmtSbt; headerCreateAll")
-addCommandAlias("check", "scalafixAll --check; scalafmtCheckAll; scalafmtSbtCheck; headerCheckAll")
+addCommandAlias(
+  "check",
+  "scalafixAll --check; scalafmtCheckAll; scalafmtSbtCheck; headerCheckAll; checkCaptureCheckedExclusions; checkCaptureEscapes"
+)

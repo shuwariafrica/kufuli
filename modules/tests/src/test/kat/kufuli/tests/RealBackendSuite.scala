@@ -23,7 +23,9 @@ package kufuli.tests
 import scala.concurrent.duration.*
 
 import boilerplate.Slice
+import boilerplate.codec
 import boilerplate.effect.*
+import cats.effect.IO
 
 import kufuli.*
 import kufuli.jose.*
@@ -50,8 +52,40 @@ class RealBackendSuite extends munit.CatsEffectSuite:
       cbcbox <- cbc.seal(Slice.of("jose".getBytes), Slice.of("aad".getBytes)).absolve
       cbcopen <- expectRight("cbc open")(cbc.open(cbcbox, Slice.of("aad".getBytes)))
       _ <- check(new String(cbcopen.toArray) == "jose", "cbc-hs round-trip")
-      tampered <- cbc.open(cbcbox, Slice.of("x".getBytes)).either
+      tampered <- cbc.open(cbcbox, Slice.of("x".getBytes)).either.absolve
       _ <- check(tampered.isLeft, "cbc-hs tamper rejected")
+    yield ()
+  }
+
+  test("an incremental hasher snapshots without consuming its context") {
+    val first = Slice.of("client".getBytes)
+    val second = Slice.of("hello".getBytes)
+    for
+      partial <- Sha256.digest(first).absolve
+      whole <- Sha256.digest(Slice.of("clienthello".getBytes)).absolve
+      seen <- Sha256.hasher.use { h =>
+                IO {
+                  h.update(first)
+                  val one = h.digest
+                  h.update(second)
+                  (one.hex, h.digest.hex, h.digest.hex)
+                }
+              }.absolve
+      _ <- check(seen._1 == partial.hex, s"the snapshot digests what was fed so far, got ${seen._1}")
+      _ <- check(seen._2 == whole.hex, s"and the context carried on from it rather than restarting, got ${seen._2}")
+      _ <- check(seen._3 == seen._2, "so taking it twice yields the same digest - it consumed nothing")
+    yield ()
+    end for
+  }
+
+  test("prepared RSA handles sign and verify what the one-shot ops do") {
+    for
+      rsa <- RSA.generate(RSA.bits(2048)).absolve
+      sig <- rsa.privateKey.signer(RsaPss(Sha256)).use(s => s.sign(Slice.of("m".getBytes))).absolve
+      ok <- rsa.publicKey.verifier(RsaPss(Sha256)).use(v => v.verify(Slice.of("m".getBytes), sig).either).absolve
+      _ <- check(ok == Right(()), s"a prepared RSA verifier accepts a prepared RSA signature, got $ok")
+      direct <- rsa.publicKey.verify(Slice.of("m".getBytes), sig, RsaPss(Sha256)).either.absolve
+      _ <- check(direct == Right(()), s"and the one-shot op accepts the same signature, got $direct")
     yield ()
   }
 
@@ -59,17 +93,17 @@ class RealBackendSuite extends munit.CatsEffectSuite:
     for
       p <- P256.generate.absolve
       sig <- p.privateKey.sign(Slice.of("m".getBytes)).absolve
-      ok <- p.publicKey.verify(Slice.of("m".getBytes), sig).either
+      ok <- p.publicKey.verify(Slice.of("m".getBytes), sig).either.absolve
       _ <- check(ok == Right(()), "ecdsa verify")
-      der = Array.from(sig.der.iterator)
-      back = Signature.fromDer(P256)(der)
+      der = Array.from(sig.der.bytes.iterator)
+      back = Signature.parse(P256)(Signature.Der(IArray.from(der)))
       _ <- check(back.exists(b => Array.from(b.bytes.iterator).sameElements(Array.from(sig.bytes.iterator))), "der round-trip")
-      rsa <- Rsa.generate(Rsa.bits(2048)).absolve
+      rsa <- RSA.generate(RSA.bits(2048)).absolve
       pss <- rsa.privateKey.sign(Slice.of("m".getBytes), RsaPss(Sha256)).absolve
-      pssOk <- rsa.publicKey.verify(Slice.of("m".getBytes), pss, RsaPss(Sha256)).either
+      pssOk <- rsa.publicKey.verify(Slice.of("m".getBytes), pss, RsaPss(Sha256)).either.absolve
       _ <- check(pssOk == Right(()), "rsa-pss verify")
       pk1 <- rsa.privateKey.sign(Slice.of("m".getBytes), RsaPkcs1(Sha256)).absolve
-      pk1Ok <- rsa.publicKey.verify(Slice.of("m".getBytes), pk1, RsaPkcs1(Sha256)).either
+      pk1Ok <- rsa.publicKey.verify(Slice.of("m".getBytes), pk1, RsaPkcs1(Sha256)).either.absolve
       _ <- check(pk1Ok == Right(()), "rsa-pkcs1 verify")
       ct <- rsa.publicKey.encrypt(Slice.of("secret".getBytes), RsaOaep(Sha256)).absolve
       dec <- expectRight("oaep")(rsa.privateKey.decrypt(ct, RsaOaep(Sha256)))
@@ -86,7 +120,7 @@ class RealBackendSuite extends munit.CatsEffectSuite:
       da <- dz.use(s => hex(s.toArray)).absolve
       _ <- check(ea == da, "shared secret matches")
       raw <- expectRight("raw")(kp.publicKey.raw)
-      _ <- check(raw.length == 1184 && enc.ciphertext.bytes.length == 1088, "ML-KEM-768 sizes")
+      _ <- check(raw.bytes.length == 1184 && enc.ciphertext.bytes.length == 1088, "ML-KEM-768 sizes")
     yield ()
   }
 
@@ -95,11 +129,11 @@ class RealBackendSuite extends munit.CatsEffectSuite:
       kw <- AesKw256.generate.absolve
       kwp <- AesKwp256.generate.absolve
       target <- AesGcm256.generate.absolve
-      w1 <- kw.wrap(target).either
-      u1 <- kw.unwrap(w1.toOption.get, AesGcm256).either
+      w1 <- kw.wrap(target).either.absolve
+      u1 <- kw.unwrap(w1.toOption.get, AesGcm256).either.absolve
       _ <- check(u1.isRight, "KW unwrap")
-      w2 <- kwp.wrap(target).either
-      u2 <- kwp.unwrap(w2.toOption.get, AesGcm256).either
+      w2 <- kwp.wrap(target).either.absolve
+      u2 <- kwp.unwrap(w2.toOption.get, AesGcm256).either.absolve
       _ <- check(u2.isRight, "KWP unwrap")
     yield ()
   }
@@ -108,7 +142,7 @@ class RealBackendSuite extends munit.CatsEffectSuite:
     for
       p <- P256.generate.absolve
       jwk <- expectRight("jwk")(JWK.of("k1", p.publicKey))
-      jwks = JWKS.of(jwk)
+      jwks = JwkSet(jwk)
       claims = JWT.Claims.empty
                  .subject("alice")
                  .issuer("iss")
@@ -117,15 +151,15 @@ class RealBackendSuite extends munit.CatsEffectSuite:
                  .id("jti")
                  .claim("htm", JoseValue.Str("POST"))
       tok <- JWT.sign(claims, ES256, "k1", now)(p.privateKey).absolve
-      policy = JWT.Policy("api", Set(ES256, EdDSA)).issuer("iss").skew(60)
-      v <- JWT.verify(tok.compact, jwks, policy, now).either
+      policy = JWT.Policy("api", ES256, EdDSA).issuer("iss").skew(60)
+      v <- JWT.verify(tok.compact, jwks, policy, now).either.absolve
       _ <- check(v.exists(_.subject.contains("alice")), "es256 verify + sub")
       _ <- check(v.exists(_.claims.get("htm").contains(JoseValue.Str("POST"))), "custom claim round-trip")
-      exp <- JWT.verify(tok.compact, jwks, policy, now + 7200).either
+      exp <- JWT.verify(tok.compact, jwks, policy, now + 7200).either.absolve
       _ <- check(exp.isLeft, "expired rejected")
-      aud <- JWT.verify(tok.compact, jwks, JWT.Policy("other", Set(ES256)), now).either
+      aud <- JWT.verify(tok.compact, jwks, JWT.Policy("other", ES256), now).either.absolve
       _ <- check(aud.isLeft, "audience mismatch rejected")
-      alg <- JWT.verify(tok.compact, jwks, JWT.Policy("api", Set(EdDSA)), now).either
+      alg <- JWT.verify(tok.compact, jwks, JWT.Policy("api", EdDSA), now).either.absolve
       _ <- check(alg.isLeft, "algorithm not allowlisted rejected")
       _ <- check(
              JWT.peek(tok.compact).exists(u => u.issuer.contains("iss") && u.kid.contains("k1") && u.algorithm == "ES256"),
@@ -134,13 +168,27 @@ class RealBackendSuite extends munit.CatsEffectSuite:
       ed <- Ed25519.generate.absolve
       edJwk <- expectRight("ed jwk")(JWK.of("e1", ed.publicKey))
       edTok <- JWT.sign(JWT.Claims.empty.audience("api").expiresIn(1.hour), EdDSA, "e1", now)(ed.privateKey).absolve
-      edOk <- JWT.verify(edTok.compact, JWKS.of(edJwk), JWT.Policy("api", Set(EdDSA)), now).either
+      edOk <- JWT.verify(edTok.compact, JwkSet(edJwk), JWT.Policy("api", EdDSA), now).either.absolve
       _ <- check(edOk.isRight, "eddsa verify")
       mk <- HmacSha256.generate.absolve
       hsTok <- JWT.sign(JWT.Claims.empty.audience("api").expiresIn(1.hour), HS256, now)(mk).absolve
-      hsOk <- JWT.verify(hsTok.compact, HS256, mk, JWT.Policy("api", Set(HS256)), now).either
+      hsOk <- JWT.verify(hsTok.compact, HS256, mk, JWT.Policy("api", HS256), now).either.absolve
       _ <- check(hsOk.isRight, "hs256 verify")
     yield ()
+  }
+
+  test("an RSA key's components round-trip: export, re-import, and export again to the same pair") {
+    for
+      kp <- RSA.generate(RSA.bits(2048)).absolve
+      first <- expectRight("components")(kp.publicKey.components)
+      back <- expectRight("re-import")(
+                PublicKey.of(RSA.Components(first.modulus, first.exponent))
+              )
+      second <- expectRight("components again")(back.components)
+      _ <- check(Array.from(first.modulus.iterator).sameElements(Array.from(second.modulus.iterator)), "the modulus survives the round trip")
+      _ <- check(Array.from(first.exponent.iterator).sameElements(Array.from(second.exponent.iterator)), "and so does the exponent")
+    yield ()
+    end for
   }
 
   // Nested custom claims must survive sign -> verify verbatim: DPoP binds `cnf.jkt` and OIDC
@@ -162,7 +210,7 @@ class RealBackendSuite extends munit.CatsEffectSuite:
       ed <- Ed25519.generate.absolve
       jwk <- expectRight("jwk")(JWK.of("k", ed.publicKey))
       tok <- JWT.sign(claims, EdDSA, "k", now)(ed.privateKey).absolve
-      v <- JWT.verify(tok.compact, JWKS.of(jwk), JWT.Policy("api", Set(EdDSA)), now).either
+      v <- JWT.verify(tok.compact, JwkSet(jwk), JWT.Policy("api", EdDSA), now).either.absolve
       got = v.toOption.map(_.claims)
       _ <- check(got.flatMap(_.get("cnf")).contains(cnf), "nested cnf object round-trips")
       _ <- check(got.flatMap(_.get("events")).contains(events), "nested empty-object events round-trips")
@@ -201,27 +249,44 @@ Pv/5JMnVs9fgK3Whg6g=
 -----END CERTIFICATE-----"""
 
   test("x509: real EC chain path validation, SAN/wildcard, EKU-by-purpose, negatives") {
-    val leaf = x5.Certificate.fromPem(leafPem).toOption.get
-    val ca = x5.Certificate.fromPem(caPem).toOption.get
+    val leaf = x5.Certificate.parse(leafPem).toOption.get
+    val ca = x5.Certificate.parse(caPem).toOption.get
     val anchors = x5.TrustAnchors(ca)
     val at = 1_800_000_000L
-    val host = x5.ServerId.of("example.com").toOption.get
-    val wild = x5.ServerId.of("foo.example.com").toOption.get
-    val evil = x5.ServerId.of("evil.com").toOption.get
+    val host = x5.ServerId.parse("example.com").toOption.get
+    val wild = x5.ServerId.parse("foo.example.com").toOption.get
+    val evil = x5.ServerId.parse("evil.com").toOption.get
     for
       _ <- check(leaf.subjectAltDns.sorted == List("*.example.com", "example.com"), "SAN parsed")
-      ok <- x5.CertPath.verify(List(leaf), anchors, at, host).either
+      ok <- x5.CertPath.verify(List(leaf), anchors, at, host).either.absolve
       _ <- check(ok.isRight, "serverauth valid")
-      w <- x5.CertPath.verify(List(leaf), anchors, at, wild).either
+      w <- x5.CertPath.verify(List(leaf), anchors, at, wild).either.absolve
       _ <- check(w.isRight, "wildcard SAN valid")
-      nm <- x5.CertPath.verify(List(leaf), anchors, at, evil).either
+      nm <- x5.CertPath.verify(List(leaf), anchors, at, evil).either.absolve
       _ <- check(nm == Left(x5.PathInvalid.NameMismatch), "wrong host -> NameMismatch")
-      ex <- x5.CertPath.verify(List(leaf), anchors, 1_600_000_000L, host).either
+      ex <- x5.CertPath.verify(List(leaf), anchors, 1_600_000_000L, host).either.absolve
       _ <- check(ex == Left(x5.PathInvalid.Expired), "expired -> Expired")
-      cu <- x5.CertPath.verifyClient(List(leaf), anchors, at).either
+      cu <- x5.CertPath.verifyClient(List(leaf), anchors, at).either.absolve
       _ <- check(cu == Left(x5.PathInvalid.ConstraintViolated), "clientauth on serverauth leaf -> ConstraintViolated")
-      _ <- check(x5.Certificate.chainFromPem(leafPem + "\n" + caPem).map(_.length) == Right(2), "chainFromPem")
+      _ <- check(x5.Certificate.chain(leafPem + "\n" + caPem).map(_.length) == Right(2), "chainFromPem")
     yield ()
     end for
   }
+  test("an RSA-8192 key stores, signs and verifies: no backend caps the encoded length") {
+    // Its PrivateKeyInfo is 4679 octets, larger than the common-case staging buffer the Native
+    // backend marshals into. A fixed buffer made this exact key a raised `Unexpected` there and an
+    // ordinary key on the JVM and Node - the divergence the marshal's length report closes.
+    val pkcs8 = codec.Base64.decode(BigRsa.pkcs8Base64).toOption.get
+    val spki = codec.Base64.decode(BigRsa.spkiBase64).toOption.get
+    val message = Slice.of("record".getBytes)
+    for
+      priv <- expectRight("rsa-8192 pkcs8")(PrivateKey.parse(RSA)(PKCS8(Slice.of(pkcs8))))
+      pub <- expectRight("rsa-8192 spki")(PublicKey.parse(RSA)(SPKI(Slice.of(spki))))
+      sig <- priv.sign(message, RsaPss(Sha256)).absolve
+      _ <- expectRight("verify")(pub.verify(message, sig, RsaPss(Sha256)))
+      exported <- expectRight("re-export")(priv.pkcs8)
+      _ <- check(exported.bytes.length > 4096, s"the stored PrivateKeyInfo keeps its full length, got ${exported.bytes.length}")
+    yield ()
+  }
+
 end RealBackendSuite

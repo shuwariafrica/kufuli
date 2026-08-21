@@ -23,15 +23,15 @@
 package kufuli.password
 
 import boilerplate.Slice
-import boilerplate.effect.EffIO
-import boilerplate.effect.UEffIO
+import boilerplate.effect.Eff
+import boilerplate.effect.UEff
 import org.bouncycastle.crypto.generators.Argon2BytesGenerator
 import org.bouncycastle.crypto.params.Argon2Parameters
 
-private[password] trait Argon2Platform:
+private[kufuli] trait Argon2Platform:
   given Argon2 = new Argon2:
-    def hash(password: Slice, salt: Slice, params: Argon2Params): UEffIO[Array[Byte]] =
-      EffIO.suspendBlocking {
+    private[kufuli] def hash(password: Slice, salt: Slice, params: Argon2Params, length: Int): UEff[Array[Byte]] =
+      Eff.suspendBlocking {
         val p = new Argon2Parameters.Builder(Argon2Parameters.ARGON2_id)
           .withVersion(Argon2Parameters.ARGON2_VERSION_13)
           .withIterations(params.iterations)
@@ -41,8 +41,13 @@ private[password] trait Argon2Platform:
           .build()
         val gen = new Argon2BytesGenerator
         gen.init(p)
-        val out = new Array[Byte](32)
-        val _ = gen.generateBytes(password.toArray, out)
+        val out = new Array[Byte](length)
+        // The generator reads the copy synchronously and retains nothing, so the plaintext
+        // password copy is ours to erase - on the failing path too.
+        val pw = password.toArray
+        try
+          val _ = gen.generateBytes(pw, out)
+        finally Slice.of(pw).wipe()
         out
       }
 end Argon2Platform

@@ -160,6 +160,8 @@ void *kufuli_pkey_from_raw_public(int type, const uint8_t *raw, size_t len);
 void *kufuli_pkey_from_ec_point(int type, const uint8_t *point, size_t len);
 void *kufuli_pkey_from_rsa_components(const uint8_t *n, size_t n_len, const uint8_t *e, size_t e_len);
 
+/* These two return -1, with the encoding's true length in *out_len, when `max_out` is too small,
+ * so a large key is re-marshalled at its own size instead of failing; 1 on success, 0 on failure. */
 int kufuli_pkey_spki(const void *pkey, uint8_t *out, size_t *out_len, size_t max_out);
 int kufuli_pkey_pkcs8(const void *pkey, uint8_t *out, size_t *out_len, size_t max_out);
 int kufuli_pkey_raw_public(const void *pkey, uint8_t *out, size_t *out_len, size_t max_out);

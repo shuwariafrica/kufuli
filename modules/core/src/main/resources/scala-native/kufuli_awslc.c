@@ -197,8 +197,12 @@ int kufuli_aes_wrap(uint8_t *out, size_t *out_len, size_t max_out, const uint8_t
                     size_t in_len, int padded) {
   AES_KEY key;
   int ok = 0;
-  /* AES_set_encrypt_key returns ZERO on success - the header warns it breaks the convention. */
-  if (AES_set_encrypt_key(kek, (unsigned)(kek_len * 8), &key) != 0) return 0;
+  /* AES_set_encrypt_key returns ZERO on success - the header warns it breaks the convention.
+   * A failed expansion may still have written part of the schedule, so it is cleansed too. */
+  if (AES_set_encrypt_key(kek, (unsigned)(kek_len * 8), &key) != 0) {
+    OPENSSL_cleanse(&key, sizeof(key));
+    return 0;
+  }
   if (padded) {
     ok = AES_wrap_key_padded(&key, out, out_len, max_out, in, in_len);
   } else if (in_len <= SIZE_MAX - 8 && in_len + 8 <= max_out) {
@@ -218,7 +222,10 @@ int kufuli_aes_unwrap(uint8_t *out, size_t *out_len, size_t max_out, const uint8
                       size_t in_len, int padded) {
   AES_KEY key;
   int ok = 0;
-  if (AES_set_decrypt_key(kek, (unsigned)(kek_len * 8), &key) != 0) return 0;
+  if (AES_set_decrypt_key(kek, (unsigned)(kek_len * 8), &key) != 0) {
+    OPENSSL_cleanse(&key, sizeof(key));
+    return 0;
+  }
   if (padded) {
     ok = AES_unwrap_key_padded(&key, out, out_len, max_out, in, in_len);
   } else if (in_len >= 8 && in_len - 8 <= max_out) {
@@ -262,7 +269,10 @@ int kufuli_aes_cbc(int encrypt, uint8_t *out, size_t *out_len, size_t max_out, c
 
 int kufuli_aes_block_encrypt(uint8_t *out, const uint8_t *in, const uint8_t *key, size_t key_len) {
   AES_KEY k;
-  if (AES_set_encrypt_key(key, (unsigned)(key_len * 8), &k) != 0) return 0;
+  if (AES_set_encrypt_key(key, (unsigned)(key_len * 8), &k) != 0) {
+    OPENSSL_cleanse(&k, sizeof(k));
+    return 0;
+  }
   AES_encrypt(in, out, &k); /* void, exactly one 16-byte block */
   OPENSSL_cleanse(&k, sizeof(k));
   return 1;
@@ -420,8 +430,13 @@ static int ec_curve_nid(int type) {
   }
 }
 
-/* Copies a CBB-marshalled key into the caller's buffer. CBB_finish hands back an OPENSSL_free'd
- * buffer; on any failure CBB_cleanup releases the partial state. */
+/* Copies a CBB-marshalled key into the caller's buffer. Returns 1 on success, -1 with the true
+ * length in *out_len when the buffer is too small, and 0 on failure. The short-buffer case reports
+ * rather than fails because the encoded length varies with the key: an RSA-8192 PrivateKeyInfo is
+ * 4678 octets where an RSA-4096 one is 2374, so a fixed buffer would cap the key sizes this backend
+ * accepts while the others take them. On any failure CBB_cleanup releases the partial state. The
+ * marshalled buffer is a whole private key for EVP_marshal_private_key, so it is cleansed rather
+ * than merely freed - a plain free returns it to the allocator in the clear. */
 static int marshal_into(int (*fn)(CBB *, const EVP_PKEY *), const EVP_PKEY *pkey, uint8_t *out, size_t *out_len,
                         size_t max_out) {
   CBB cbb;
@@ -429,16 +444,25 @@ static int marshal_into(int (*fn)(CBB *, const EVP_PKEY *), const EVP_PKEY *pkey
   size_t len = 0;
   int ok = 0;
   CBB_zero(&cbb);
-  if (CBB_init(&cbb, 0) && fn(&cbb, pkey) && CBB_finish(&cbb, &data, &len)) {
+  if (!CBB_init(&cbb, 0)) return 0;
+  /* Finish even when the marshal failed: a partial marshal may already hold key material, and
+   * finishing hands it to us for a cleansing free. CBB_cleanup remains only for a failed finish,
+   * whose residue aws-lc offers no cleansing release for. */
+  int wrote = fn(&cbb, pkey);
+  if (!CBB_finish(&cbb, &data, &len)) {
+    CBB_cleanup(&cbb);
+    return 0;
+  }
+  if (wrote) {
+    *out_len = len;
     if (len <= max_out) {
       memcpy(out, data, len);
-      *out_len = len;
       ok = 1;
+    } else {
+      ok = -1;
     }
-    OPENSSL_free(data);
-  } else {
-    CBB_cleanup(&cbb);
   }
+  OPENSSL_clear_free(data, len);
   return ok;
 }
 

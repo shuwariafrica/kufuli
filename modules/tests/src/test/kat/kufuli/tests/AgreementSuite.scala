@@ -274,8 +274,8 @@ class AgreementSuite extends munit.CatsEffectSuite:
     cases(vectors, "ecdh")
       .flatMap(_.traverse { (tc, scalar, point, expected) =>
         for
-          priv <- expectRight(s"tc$tc private key")(PrivateKey.fromPkcs8(curve)(Slice.of(ecPkcs8(curveOid, hb(scalar)))))
-          pub <- expectRight(s"tc$tc peer point")(PublicKey.fromSec1(curve)(Slice.of(hb(point))))
+          priv <- expectRight(s"tc$tc private key")(PrivateKey.parse(curve)(PKCS8(Slice.of(ecPkcs8(curveOid, hb(scalar))))))
+          pub <- expectRight(s"tc$tc peer point")(PublicKey.parse(curve)(SEC1(Slice.of(hb(point)))))
           secret <- priv.agree(pub).absolve
           got <- secret.use(s => hex(s.toArray)).absolve
         yield Option.when(got != expected)(s"tc$tc expected=$expected got=$got")
@@ -301,10 +301,10 @@ class AgreementSuite extends munit.CatsEffectSuite:
     val bobPub = "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"
     val shared = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
     for
-      ak <- expectRight("alice private")(PrivateKey.fromPkcs8(X25519)(Slice.of(x25519Pkcs8(hb(alicePriv)))))
-      bk <- expectRight("bob private")(PrivateKey.fromPkcs8(X25519)(Slice.of(x25519Pkcs8(hb(bobPriv)))))
-      aq <- expectRight("alice public")(PublicKey.fromRaw(X25519)(Slice.of(hb(alicePub))))
-      bq <- expectRight("bob public")(PublicKey.fromRaw(X25519)(Slice.of(hb(bobPub))))
+      ak <- expectRight("alice private")(PrivateKey.parse(X25519)(PKCS8(Slice.of(x25519Pkcs8(hb(alicePriv))))))
+      bk <- expectRight("bob private")(PrivateKey.parse(X25519)(PKCS8(Slice.of(x25519Pkcs8(hb(bobPriv))))))
+      aq <- expectRight("alice public")(PublicKey.parse(X25519)(Raw(Slice.of(hb(alicePub)))))
+      bq <- expectRight("bob public")(PublicKey.parse(X25519)(Raw(Slice.of(hb(bobPub)))))
       za <- ak.agree(bq).absolve.flatMap(_.use(s => hex(s.toArray)).absolve)
       zb <- bk.agree(aq).absolve.flatMap(_.use(s => hex(s.toArray)).absolve)
       _ <- check(za == shared, s"alice expected=$shared got=$za")
@@ -313,7 +313,7 @@ class AgreementSuite extends munit.CatsEffectSuite:
   }
 
   private def cbcHs[A <: AeadAlgorithm](spec: AeadSpec[A], k: String, iv: String, aad: String, p: String, e: String, t: String)(using
-    Aead[A]
+    AEAD[A]
   ): IO[Unit] =
     val key = SecretKey.of(spec)(hb(k)).toOption.get
     val nonce = Nonce.unsafe[A](hb(iv))
@@ -335,7 +335,7 @@ class AgreementSuite extends munit.CatsEffectSuite:
   // RFC 4231's keys are shorter than the digest, or longer than the JOSE cap, so none of them clears
   // `SecretKey.of`'s key-length policy; the vectors anchor the MAC computation, not that policy.
   // Test case 5 publishes only the leading 128 bits, hence the prefix comparison.
-  private def hmacKat[H <: MacAlgorithm](vectors: List[(Int, String, String, String)])(using Mac[H]): IO[Unit] =
+  private def hmacKat[H <: MacAlgorithm](vectors: List[(Int, String, String, String)])(using MAC[H]): IO[Unit] =
     cases(vectors, "hmac")
       .flatMap(_.traverse { (tc, k, data, expected) =>
         SecretKey.unsafe[H](hb(k)).sign(Slice.of(hb(data))).absolve.map { sig =>
@@ -362,11 +362,11 @@ class AgreementSuite extends munit.CatsEffectSuite:
     for
       w192 <- expectRight("4.5 wrap")(kek.wrap(SecretKey.of(AesGcm192)(hb(data192)).toOption.get))
       _ <- check(hex(w192.toArray) == wrapped192, s"4.5 expected=$wrapped192 got=${hex(w192.toArray)}")
-      u192 <- kek.unwrap(Slice.of(hb(wrapped192)), AesGcm192).either
+      u192 <- kek.unwrap(Slice.of(hb(wrapped192)), AesGcm192).either.absolve
       _ <- check(u192.exists(k => k.read(s => hex(s.toArray)) == data192), "4.5 unwrap")
       w256 <- expectRight("4.6 wrap")(kek.wrap(SecretKey.of(AesGcm256)(hb(data256)).toOption.get))
       _ <- check(hex(w256.toArray) == wrapped256, s"4.6 expected=$wrapped256 got=${hex(w256.toArray)}")
-      u256 <- kek.unwrap(Slice.of(hb(wrapped256)), AesGcm256).either
+      u256 <- kek.unwrap(Slice.of(hb(wrapped256)), AesGcm256).either.absolve
       _ <- check(u256.exists(k => k.read(s => hex(s.toArray)) == data256), "4.6 unwrap")
     yield ()
   }
@@ -391,7 +391,7 @@ class AgreementSuite extends munit.CatsEffectSuite:
             if result == "valid" then
               for
                 wrapped <- w.wrap(kek, Slice.of(hb(msg))).absolve.attempt
-                opened <- w.unwrap(kek, Slice.of(hb(ct))).either.attempt
+                opened <- w.unwrap(kek, Slice.of(hb(ct))).either.absolve.attempt
               yield
                 val wrapOk = wrapped.exists(s => hex(s.toArray) == ct)
                 val openOk = opened.exists(_.exists(s => hex(s.toArray) == msg))
@@ -399,6 +399,7 @@ class AgreementSuite extends munit.CatsEffectSuite:
             else
               w.unwrap(kek, Slice.of(hb(ct)))
                 .either
+                .absolve
                 .attempt
                 .map(r => Option.when(r.exists(_.isRight))(s"tc$tc invalid wrapping accepted"))
       })
@@ -413,7 +414,7 @@ class AgreementSuite extends munit.CatsEffectSuite:
     kwpKat(AesKwp256, 256)
   }
 
-  private def sealGcm[A <: AeadAlgorithm](spec: AeadSpec[A], k: String, iv: String, aad: String, msg: String)(using Aead[A]): IO[String] =
+  private def sealGcm[A <: AeadAlgorithm](spec: AeadSpec[A], k: String, iv: String, aad: String, msg: String)(using AEAD[A]): IO[String] =
     val key = SecretKey.of(spec)(hb(k)).toOption.get
     key.seal(Nonce.unsafe[A](hb(iv)), Slice.of(hb(aad)), Slice.of(hb(msg))).absolve.map(s => hex(s.toArray))
 
@@ -445,7 +446,7 @@ class AgreementSuite extends munit.CatsEffectSuite:
 
   test("JWK thumbprint (RFC 7638 3.1): the published thumbprint of the RFC's RSA key") {
     for
-      key <- expectRight("rsa components")(PublicKey.fromComponents(Slice.of(hb(rfc7638Modulus)), Slice.of(hb("010001"))))
+      key <- expectRight("rsa components")(PublicKey.of(RSA.Components(IArray.from(hb(rfc7638Modulus)), IArray.from(hb("010001")))))
       digest <- expectRight("thumbprint")(key.thumbprint)
       _ <- check(digest.hex == rfc7638Thumbprint, s"expected=$rfc7638Thumbprint got=${digest.hex}")
     yield ()
@@ -454,11 +455,11 @@ class AgreementSuite extends munit.CatsEffectSuite:
   // A published encapsulation key from another implementation entirely: it must import, export back
   // byte for byte, and encapsulate. Decapsulating a published ciphertext would pin the other half,
   // but no backend can import an ML-KEM decapsulation key through this surface.
-  private def kemWire[K <: KemAlgorithm](spec: KemSpec[K], ek: String)(using KemKeys[K], Kem[K]): IO[Unit] =
+  private def kemWire[K <: KemAlgorithm](spec: KemSpec[K], ek: String)(using KemKeys[K], KEM[K]): IO[Unit] =
     for
-      pub <- expectRight("encapsulation key")(PublicKey.fromRaw(spec)(Slice.of(hb(ek))))
+      pub <- expectRight("encapsulation key")(PublicKey.parse(spec)(Raw(Slice.of(hb(ek)))))
       exported <- expectRight("export")(pub.raw)
-      _ <- check(hex(Array.from(exported.iterator)) == ek, "encapsulation key round-trips byte for byte")
+      _ <- check(hex(Array.from(exported.bytes.iterator)) == ek, "encapsulation key round-trips byte for byte")
       enc <- pub.encapsulate.absolve
       _ <- check(enc.ciphertext.bytes.length == spec.ciphertextLength, s"ciphertext length ${enc.ciphertext.bytes.length}")
     yield ()

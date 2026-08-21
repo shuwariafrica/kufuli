@@ -18,9 +18,9 @@ import sbt.Keys.*
   * each listed `.json` file, generates a Scala object containing the raw JSON as a string constant.
   * Suites parse this at runtime via jsoniter-scala `readFromString`.
   */
-object WycheproofPlugin extends AutoPlugin {
+object WycheproofPlugin extends AutoPlugin:
 
-  object autoImport {
+  object autoImport:
     val wycheproofVectorFiles = settingKey[Seq[String]](
       "List of JSON filenames to embed from the Wycheproof testvectors_v1/ directory."
     )
@@ -30,7 +30,6 @@ object WycheproofPlugin extends AutoPlugin {
     val wycheproofGenerate = taskKey[Seq[File]](
       "Generates Scala source files embedding Wycheproof JSON vectors."
     )
-  }
 
   import autoImport.*
 
@@ -52,9 +51,9 @@ object WycheproofPlugin extends AutoPlugin {
         val rootDir = (LocalRootProject / baseDirectory).value
         val vectorDir = rootDir / "vendor" / "wycheproof" / "testvectors_v1"
 
-        if (files.isEmpty) Seq.empty[File]
-        else {
-          if (!vectorDir.isDirectory)
+        if files.isEmpty then Seq.empty[File]
+        else
+          if !vectorDir.isDirectory then
             sys.error(
               s"Wycheproof submodule not initialised at $vectorDir. Run: git submodule update --init vendor/wycheproof"
             )
@@ -62,8 +61,7 @@ object WycheproofPlugin extends AutoPlugin {
           IO.createDirectory(outDir)
           files.map { filename =>
             val jsonFile = vectorDir / filename
-            if (!jsonFile.exists())
-              sys.error(s"Wycheproof vector file not found: $jsonFile")
+            if !jsonFile.exists() then sys.error(s"Wycheproof vector file not found: $jsonFile")
 
             val objectName = filenameToObjectName(filename)
             val outFile = outDir / s"$objectName.scala"
@@ -76,13 +74,12 @@ object WycheproofPlugin extends AutoPlugin {
             IO.write(tempFile, scalaSource, IO.utf8)
 
             val changed = !outFile.exists() || !IO.readBytes(outFile).sameElements(IO.readBytes(tempFile))
-            if (changed) {
+            if changed then
               log.info(s"WycheproofPlugin: generating $objectName from $filename")
               IO.copyFile(tempFile, outFile, preserveLastModified = true)
-            }
             outFile
           }
-        }
+        end if
       },
       sourceGenerators += wycheproofGenerate.taskValue
     )
@@ -92,16 +89,15 @@ object WycheproofPlugin extends AutoPlugin {
   // chunks concatenated at runtime; 60000 leaves a conservative margin.
   private val MaxChunkBytes = 60000
 
-  private def renderSource(pkg: String, objectName: String, filename: String, jsonContent: String): String = {
+  private def renderSource(pkg: String, objectName: String, filename: String, jsonContent: String): String =
     val escaped = escapeTripleQuote(jsonContent)
-    if (escaped.getBytes("UTF-8").length <= MaxChunkBytes) {
-      s"""|package $pkg
-          |
-          |/** Generated from `$filename`. Do not edit. */
-          |object $objectName:
-          |  val json: String = ${"\"\"\""}$escaped${"\"\"\""}
-          |""".stripMargin
-    } else {
+    if escaped.getBytes("UTF-8").length <= MaxChunkBytes then s"""|package $pkg
+                                                                  |
+                                                                  |/** Generated from `$filename`. Do not edit. */
+                                                                  |object $objectName:
+                                                                  |  val json: String = ${"\"\"\""}$escaped${"\"\"\""}
+                                                                  |""".stripMargin
+    else
       val chunks = splitByByteLimit(escaped, MaxChunkBytes)
       val sb = new StringBuilder
       sb.append(s"package $pkg\n\n")
@@ -114,39 +110,36 @@ object WycheproofPlugin extends AutoPlugin {
       }
       sb.append(s"    sb.result()\n")
       sb.result()
-    }
-  }
+    end if
+  end renderSource
 
   // hmac_sha256_test.json -> HmacSha256TestJson
-  private def filenameToObjectName(filename: String): String = {
+  private def filenameToObjectName(filename: String): String =
     val base = filename.stripSuffix(".json")
     base
       .split("[_\\-]")
       .map(segment => segment.take(1).toUpperCase + segment.drop(1))
       .mkString + "Json"
-  }
 
   private def escapeTripleQuote(s: String): String =
     s.replace("\"\"\"", "\\\"\\\"\\\"")
 
-  private def splitByByteLimit(s: String, maxBytes: Int): Seq[String] = {
+  private def splitByByteLimit(s: String, maxBytes: Int): Seq[String] =
     val result = Vector.newBuilder[String]
     val current = new StringBuilder
     var currentBytes = 0
     var i = 0
-    while (i < s.length) {
+    while i < s.length do
       val c = s.charAt(i)
-      val charBytes = if (c <= 0x7f) 1 else if (c <= 0x7ff) 2 else 3
-      if (currentBytes + charBytes > maxBytes && current.nonEmpty) {
+      val charBytes = if c <= 0x7f then 1 else if c <= 0x7ff then 2 else 3
+      if currentBytes + charBytes > maxBytes && current.nonEmpty then
         result += current.result()
         current.clear()
         currentBytes = 0
-      }
       current.append(c)
       currentBytes += charBytes
       i += 1
-    }
-    if (current.nonEmpty) result += current.result()
+    if current.nonEmpty then result += current.result()
     result.result()
-  }
-}
+  end splitByByteLimit
+end WycheproofPlugin

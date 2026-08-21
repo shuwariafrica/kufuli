@@ -18,18 +18,15 @@
  * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-// Deterministic, input-sensitive stub backend for node and browser: round-trips are real byte
-// equalities and tamper checks real rejections, over the same op seam as a real backend.
+// Deterministic, input-sensitive stub backend for the browser row, which is the one unit with no
+// real provider yet: round-trips are real byte equalities and tamper checks real rejections, over
+// the same op seam as a real backend.
 package kufuli
 
 import java.util.concurrent.atomic.AtomicLong
 
-import scala.collection.mutable.ArrayBuffer
-
 import boilerplate.Slice
-import boilerplate.effect.EffIO
-import cats.effect.IO
-import cats.effect.Resource
+import boilerplate.effect.Eff
 
 private[kufuli] object stubs:
 
@@ -40,7 +37,7 @@ private[kufuli] object stubs:
     b ^ (b >>> 31)
 
   // Deterministic `len` bytes sensitive to every input byte.
-  private[kufuli] def mix(len: Int)(parts: Slice*): Array[Byte] =
+  private def mix(len: Int)(parts: Slice*): Array[Byte] =
     val seed = parts.foldLeft(0xcbf29ce484222325L) { (h, s) =>
       (0 until s.length).foldLeft(h)((h2, i) => (h2 ^ (s(i) & 0xff)) * 0x100000001b3L)
     }
@@ -50,10 +47,10 @@ private[kufuli] object stubs:
     Array.tabulate(math.min(a.length, b.length))(i => (a(i) ^ b(i)).toByte)
 
   private def schemeTag(s: Scheme[?]): Array[Byte] = s match
-    case _: EdDsa.type => Array(1)
-    case Ecdsa(h)      => Array(2, h.length.toByte)
-    case RsaPss(h)     => Array(3, h.length.toByte)
-    case RsaPkcs1(h)   => Array(4, h.length.toByte)
+    case _: Ed.type  => Array(1)
+    case ECDSA(h)    => Array(2, h.length.toByte)
+    case RsaPss(h)   => Array(3, h.length.toByte)
+    case RsaPkcs1(h) => Array(4, h.length.toByte)
 
   private val seq = new AtomicLong(0)
   private def longBytes(l: Long): Array[Byte] = Array.tabulate(8)(i => (l >>> (56 - 8 * i)).toByte)
@@ -66,7 +63,7 @@ private[kufuli] object stubs:
   // round-trips are real byte equalities and ANY input difference (tampered ciphertext, wrong
   // key/nonce/aad - including the authenticated box header) fails authentication.
   private def sealBytes[A <: AeadAlgorithm](spec: AeadSpec[A])(key: SecretKey[A], nonce: Array[Byte], aad: Slice, pt: Slice): Array[Byte] =
-    val tag = key.read(k => mix(spec.tagLength)(k, Slice.of(nonce), aad, pt))
+    val tag = key.material(k => mix(spec.tagLength)(k, Slice.of(nonce), aad, pt))
     val out = new Array[Byte](pt.length + spec.tagLength)
     val _ = pt.copyInto(Slice.of(out))
     val _ = Slice.of(tag).copyInto(Slice.of(out).drop(pt.length))
@@ -80,73 +77,38 @@ private[kufuli] object stubs:
     if ct.length < spec.tagLength then Left(AuthFailed)
     else
       val payload = ct.take(ct.length - spec.tagLength)
-      val expected = key.read(k => mix(spec.tagLength)(k, Slice.of(nonce), aad, payload))
+      val expected = key.material(k => mix(spec.tagLength)(k, Slice.of(nonce), aad, payload))
       if Slice.of(expected).constantTimeEquals(ct.drop(payload.length)) then Right(payload) else Left(AuthFailed)
 
-  private[kufuli] def aead[A <: AeadAlgorithm](spec: AeadSpec[A]): Aead[A] = new:
+  private[kufuli] def aead[A <: AeadAlgorithm](spec: AeadSpec[A]): AEAD[A] = new:
     private[kufuli] def seal(key: SecretKey[A], nonce: Nonce[A], aad: Slice, plaintext: Slice) =
-      EffIO.suspend(Slice.of(sealBytes(spec)(key, nonce.repr, aad, plaintext)))
+      Eff.suspend(Slice.of(sealBytes(spec)(key, nonce.repr, aad, plaintext)))
     private[kufuli] def open(key: SecretKey[A], nonce: Nonce[A], aad: Slice, ciphertext: Slice) =
-      EffIO.delay(openBytes(spec)(key, nonce.repr, aad, ciphertext))
+      Eff.delay(openBytes(spec)(key, nonce.repr, aad, ciphertext))
 
-  final private class StubEngine[A <: AeadAlgorithm](key: SecretKey[A], spec: AeadSpec[A]) extends Cipher.Engine[A]:
-    private[kufuli] def encrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Int =
-      val tag = key.read(k => mix(spec.tagLength)(k, nonce, aad, src))
-      val _ = src.copyInto(dst)
-      val _ = Slice.of(tag).copyInto(dst.drop(src.length))
-      src.length + spec.tagLength
-    private[kufuli] def decrypt(dst: Slice, src: Slice, aad: Slice, nonce: Slice): Either[AuthFailed, Int] =
-      val payload = src.take(src.length - spec.tagLength)
-      val expected = key.read(k => mix(spec.tagLength)(k, nonce, aad, payload))
-      if !Slice.of(expected).constantTimeEquals(src.drop(payload.length)) then Left(AuthFailed)
-      else
-        val _ = payload.copyInto(dst)
-        Right(payload.length)
-  end StubEngine
-
-  private[kufuli] def ciphering[A <: AeadAlgorithm](spec: AeadSpec[A]): Ciphering[A] = new:
-    private[kufuli] def engine(key: SecretKey[A]) = Resource.eval(IO(new StubEngine(key, spec)))
-
-  private[kufuli] def mac[H <: MacAlgorithm](spec: MacSpec[H]): Mac[H] = new:
+  private[kufuli] def mac[H <: MacAlgorithm](spec: MacSpec[H]): MAC[H] = new:
     private[kufuli] def sign(key: SecretKey[H], data: Slice) =
-      EffIO.suspend(Signature.unsafe(key.read(k => mix(spec.outLength)(k, data))))
+      Eff.suspend(Signature.unsafe(key.material(k => mix(spec.outLength)(k, data))))
 
-  private[kufuli] def signerOf[A <: SignatureAlgorithm](len: Int): Signer[A] = new:
+  private[kufuli] def signerOf[A <: SignatureAlgorithm](len: Int): Signing[A] = new:
     private[kufuli] def sign(key: PrivateKey[A], data: Slice, scheme: Scheme[A]) =
-      EffIO.suspend(Signature.unsafe[A](key.read(k => mix(len)(k, data, Slice.of(schemeTag(scheme))))))
-  private[kufuli] def verifierOf[A <: SignatureAlgorithm](len: Int): Verifier[A] = new:
+      Eff.suspend(Signature.unsafe[A](key.material(k => mix(len)(k, data, Slice.of(schemeTag(scheme))))))
+  private[kufuli] def verifierOf[A <: SignatureAlgorithm](len: Int): Verifying[A] = new:
     private[kufuli] def verify(key: PublicKey[A], data: Slice, sig: Signature[A], scheme: Scheme[A]) =
-      EffIO.defer {
+      Eff.defer {
         val expected = mix(len)(Slice.of(keyBytes(key.repr)), data, Slice.of(schemeTag(scheme)))
-        EffIO.raiseUnless(Slice.of(expected).constantTimeEquals(Slice.of(sig.repr)))(SignatureRejected)
+        Eff.raiseUnless(Slice.of(expected).constantTimeEquals(Slice.of(sig.repr)))(SignatureRejected)
       }
 
   // Stub keypairs carry pub == priv bytes so verify/agree/decapsulate can recompute.
   private[kufuli] def agreement[A <: AgreementAlgorithm]: Agreement[A] = new:
     private[kufuli] def agree(priv: PrivateKey[A], pub: PublicKey[A]) =
-      EffIO.suspend(SharedSecret.unsafe(priv.read(p => xorBytes(p, Slice.of(keyBytes(pub.repr))))))
-
-  private[kufuli] def kem[K <: KemAlgorithm](spec: KemSpec[K]): Kem[K] = new:
-    private[kufuli] def encapsulate(pub: PublicKey[K]) = EffIO.suspend {
-      val p = Slice.of(keyBytes(pub.repr))
-      val z = mix(32)(p, Slice.of(Array(101.toByte)))
-      val mask = mix(32)(p, Slice.of(Array(102.toByte)))
-      val ct = new Array[Byte](spec.ciphertextLength)
-      val _ = Slice.of(xorBytes(Slice.of(z), Slice.of(mask))).copyInto(Slice.of(ct))
-      Encapsulated(SharedSecret.unsafe(z), KemCiphertext.unsafe(ct))
-    }
-    private[kufuli] def decapsulate(priv: PrivateKey[K], ct: KemCiphertext[K]) = EffIO.suspend {
-      priv.read { p =>
-        val mask = mix(32)(p, Slice.of(Array(102.toByte)))
-        // FIPS 203 implicit rejection: any ciphertext yields a secret; a forged one a different one.
-        SharedSecret.unsafe(xorBytes(Slice.of(ct.repr).take(32), Slice.of(mask)))
-      }
-    }
+      Eff.suspend(SharedSecret.unsafe(priv.material(p => xorBytes(p, Slice.of(keyBytes(pub.repr))))))
 
   private[kufuli] def wrapOf[W <: WrapAlgorithm]: Wrap[W] = new:
     private[kufuli] def wrap(kek: SecretKey[W], target: Slice) =
-      EffIO.suspend {
-        kek.read { k =>
+      Eff.suspend {
+        kek.material { k =>
           val body = xorBytes(target, Slice.of(mix(target.length)(k)))
           val hdr = mix(8)(k, Slice.of(body))
           val out = new Array[Byte](8 + body.length)
@@ -156,294 +118,255 @@ private[kufuli] object stubs:
         }
       }
     private[kufuli] def unwrap(kek: SecretKey[W], wrapped: Slice) =
-      EffIO.defer {
-        kek.read { k =>
-          if wrapped.length < 8 then EffIO.fail(UnwrapFailed)
+      Eff.defer {
+        kek.material { k =>
+          if wrapped.length < 8 then Eff.fail(UnwrapFailed)
           else
             val body = wrapped.drop(8)
             val expected = mix(8)(k, body)
-            if !Slice.of(expected).constantTimeEquals(wrapped.take(8)) then EffIO.fail(UnwrapFailed)
-            else EffIO.succeed(Slice.of(xorBytes(body, Slice.of(mix(body.length)(k)))))
+            if !Slice.of(expected).constantTimeEquals(wrapped.take(8)) then Eff.fail(UnwrapFailed)
+            else Eff.succeed(Slice.of(xorBytes(body, Slice.of(mix(body.length)(k)))))
         }
       }
 
-  private[kufuli] def kdf: Kdf = new:
+  private[kufuli] def kdf: KDF = new:
     private[kufuli] def extract(hash: Sha2, salt: Slice, ikm: Slice) =
-      EffIO.suspend(Prk.unsafe(mix(hash.length)(salt, ikm)))
-    private[kufuli] def expand(hash: Sha2, prk: Prk, info: Slice, length: Int) =
-      EffIO.suspend(prk.read(p => Slice.of(mix(length)(p, info))))
+      Eff.suspend(PRK.unsafe(mix(hash.length)(salt, ikm)))
+    private[kufuli] def expand(hash: Sha2, prk: PRK, info: Slice, length: Int) =
+      Eff.suspend(prk.read(p => Slice.of(mix(length)(p, info))))
     private[kufuli] def pbkdf2(hash: Sha2, password: Slice, salt: Slice, iterations: Int, length: Int) =
-      EffIO.suspend(Slice.of(mix(length)(password, salt, Slice.of(Array(iterations.toByte)))))
+      Eff.suspend(Slice.of(mix(length)(password, salt, Slice.of(Array(iterations.toByte)))))
 
   private[kufuli] def hash[D <: HashAlgorithm](spec: HashSpec[D]): Hash[D] = new:
-    private[kufuli] def digest(data: Slice) = EffIO.suspend(Digest.unsafe(mix(spec.length)(data)))
-  private[kufuli] def hashing[D <: HashAlgorithm](spec: HashSpec[D]): Hashing[D] = new:
-    private[kufuli] def hasher = Resource.eval(IO {
-      new Hasher:
-        private val acc = ArrayBuffer.empty[Byte]
-        def update(data: Slice): Unit = acc.appendAll(data.toArray)
-        def digest: Digest = Digest.unsafe(mix(spec.length)(Slice.of(acc.toArray)))
-    })
+    private[kufuli] def digest(data: Slice) = Eff.suspend(Digest.unsafe(mix(spec.length)(data)))
 
-  private[kufuli] def oaep: Oaep = new:
-    private[kufuli] def encrypt(key: PublicKey[Rsa], plaintext: Slice, scheme: RsaOaep) = EffIO.suspend {
+  private[kufuli] def oaep: OAEP = new:
+    private[kufuli] def encrypt(key: PublicKey[RSA], plaintext: Slice, scheme: RsaOaep) = Eff.suspend {
       val hdr = mix(16)(Slice.of(keyBytes(key.repr)), Slice.of(Array(scheme.hash.length.toByte)))
       val out = new Array[Byte](16 + plaintext.length)
       val _ = Slice.of(hdr).copyInto(Slice.of(out))
       val _ = plaintext.copyInto(Slice.of(out).drop(16))
       Slice.of(out)
     }
-    private[kufuli] def decrypt(key: PrivateKey[Rsa], ciphertext: Slice, scheme: RsaOaep) = EffIO.defer {
-      key.read { k =>
+    private[kufuli] def decrypt(key: PrivateKey[RSA], ciphertext: Slice, scheme: RsaOaep) = Eff.defer {
+      key.material { k =>
         val hdr = mix(16)(k, Slice.of(Array(scheme.hash.length.toByte)))
         if ciphertext.length >= 16 && Slice.of(hdr).constantTimeEquals(ciphertext.take(16))
-        then EffIO.succeed(ciphertext.drop(16))
-        else EffIO.fail(AuthFailed)
+        then Eff.succeed(ciphertext.drop(16))
+        else Eff.fail(AuthFailed)
       }
     }
 
   private[kufuli] def random: Random = new:
-    private[kufuli] def bytes(n: Int) = EffIO.suspend(Slice.of(fresh("random")(n)))
-    private[kufuli] def fill(dst: Slice) = EffIO.suspend {
+    private[kufuli] def bytes(n: Int) = Eff.suspend(Slice.of(fresh("random")(n)))
+    private[kufuli] def fill(dst: Slice) = Eff.suspend {
       val _ = Slice.of(fresh("fill")(dst.length)).copyInto(dst)
     }
 
   // Key lifecycle stubs: pub == priv bytes; imports validate byte-faithfully; exports emit
-  // REAL encodings (RFC 8410 templates for Ed/X, Der-built SPKI/PKCS#8 for EC/RSA) so the shared
+  // REAL encodings (RFC 8410 templates for Ed/X, DER-built SPKI/PKCS#8 for EC/RSA) so the shared
   // peek round-trips executed blobs. Validation conventions: a 0xFF-led point is "off-curve"; an
-  // all-zero X25519 point is a weak point. `handleBacked = true` models WebCrypto: GENERATED keys
-  // carry a sentinel and refuse export (KeyNotExportable); IMPORTED keys always export.
+  // all-zero X25519 point is a weak point.
+  //
+  // Generated-key custody belongs to the platform (`keyGenerated`/`secretGenerated`), so the same
+  // instance bodies express WebCrypto's contract without a flag: a generated private key refuses
+  // export by arm, while its public key exports, and operations reach material through the door.
 
-  private val sentinel = Array[Byte]('H', 'N', 'D', 'L')
-  private def sentinelled(b: Array[Byte]): Array[Byte] = sentinel ++ b.drop(4)
-  private def isSentinel(b: Slice): Boolean =
-    b.length >= 4 && b.take(4).contentEquals(Slice.of(sentinel))
-  private def exportable[A](key: Slice, handleBacked: Boolean)(value: => A): EffIO[KeyNotExportable, A] =
-    if handleBacked && isSentinel(key) then EffIO.fail(KeyNotExportable) else EffIO.succeed(value)
-
-  final private[kufuli] class StubEdKeys(handleBacked: Boolean) extends EdKeys:
-    private[kufuli] def generate = EffIO.suspend {
+  final private[kufuli] class StubEdKeys extends EdKeys:
+    private[kufuli] def generate = Eff.suspend {
       val body = fresh("ed")(32)
       body(0) = (body(0) & 0x7f).toByte // never collide with the stub off-curve marker
-      val b = if handleBacked then sentinelled(body) else body
-      KeyPair(PublicKey.unsafe(keyRepr(b.clone)), PrivateKey.unsafe(b))
+      KeyPair(PublicKey.unsafe(keyGenerated(body.clone)), PrivateKey.unsafeRepr(secretGenerated(body)))
     }
-    private[kufuli] def fromRaw(bytes: Slice) = EffIO.delay {
-      if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
-      else if bytes(0) == -1 then Left(InvalidKey.NotOnCurve)
+    private[kufuli] def fromRaw(bytes: Slice) = Eff.delay {
+      if bytes(0) == -1 then Left(Refused) // the stub off-curve marker
       else Right(PublicKey.unsafe[Ed25519](keyRepr(bytes.toArray)))
     }
-    private[kufuli] def fromSpki(der: Slice) = EffIO.from(Der.payload(der, Der.edSpkiPrefix, 32)).flatMap(fromRaw)
+    private[kufuli] def fromSpki(der: Slice) =
+      Eff.from(DER.payload(der, DER.edSpkiPrefix, 32).left.map(_ => Refused)).flatMap(fromRaw)
     private[kufuli] def fromPkcs8(der: Slice) =
-      EffIO.delay(Der.payload(der, Der.edPkcs8Prefix, 32).map(s => PrivateKey.unsafe[Ed25519](s.toArray)))
-    private[kufuli] def raw(key: PublicKey[Ed25519]) =
-      val b = keyBytes(key.repr)
-      exportable(Slice.of(b), handleBacked)(IArray.from(b))
-    private[kufuli] def spki(key: PublicKey[Ed25519]) =
-      val b = keyBytes(key.repr)
-      exportable(Slice.of(b), handleBacked)(IArray.from(Der.edSpkiPrefix ++ b))
+      Eff.delay(DER.payload(der, DER.edPkcs8Prefix, 32).left.map(_ => Refused).map(s => PrivateKey.unsafe[Ed25519](s.toArray)))
+    private[kufuli] def raw(key: PublicKey[Ed25519]) = Eff.succeed(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def spki(key: PublicKey[Ed25519]) = Eff.succeed(IArray.from(DER.edSpkiPrefix ++ keyBytes(key.repr)))
     private[kufuli] def pkcs8(key: PrivateKey[Ed25519]) =
-      EffIO.defer(key.read(s => exportable(s, handleBacked)(IArray.from(Der.edPkcs8Prefix ++ s.toArray))))
+      Eff.defer(
+        if !key.exportable then Eff.fail(KeyNotExportable)
+        else key.material(s => Eff.succeed(IArray.from(DER.edPkcs8Prefix ++ s.toArray)))
+      )
   end StubEdKeys
 
-  final private[kufuli] class StubXKeys(handleBacked: Boolean) extends XKeys:
-    private[kufuli] def generate = EffIO.suspend {
-      val b = if handleBacked then sentinelled(fresh("x")(32)) else fresh("x")(32)
-      KeyPair(PublicKey.unsafe(keyRepr(b.clone)), PrivateKey.unsafe(b))
+  final private[kufuli] class StubXKeys extends XKeys:
+    private[kufuli] def generate = Eff.suspend {
+      val b = fresh("x")(32)
+      KeyPair(PublicKey.unsafe(keyGenerated(b.clone)), PrivateKey.unsafeRepr(secretGenerated(b)))
     }
-    private[kufuli] def fromRaw(bytes: Slice) = EffIO.delay {
-      if bytes.length != 32 then Left(InvalidKey.WrongLength(32, bytes.length))
-      else if bytes.toArray.forall(_ == 0) then Left(InvalidKey.WeakPoint)
-      else Right(PublicKey.unsafe[X25519](keyRepr(bytes.toArray)))
+    private[kufuli] def fromRaw(bytes: Slice) = Eff.delay {
+      Right(PublicKey.unsafe[X25519](keyRepr(bytes.toArray))): Either[Refused, PublicKey[X25519]]
     }
-    private[kufuli] def fromSpki(der: Slice) = EffIO.from(Der.payload(der, Der.xSpkiPrefix, 32)).flatMap(fromRaw)
+    private[kufuli] def fromSpki(der: Slice) =
+      Eff.from(DER.payload(der, DER.xSpkiPrefix, 32).left.map(_ => Refused)).flatMap(fromRaw)
     private[kufuli] def fromPkcs8(der: Slice) =
-      EffIO.delay(Der.payload(der, Der.xPkcs8Prefix, 32).map(s => PrivateKey.unsafe[X25519](s.toArray)))
-    private[kufuli] def raw(key: PublicKey[X25519]) =
-      val b = keyBytes(key.repr)
-      exportable(Slice.of(b), handleBacked)(IArray.from(b))
-    private[kufuli] def spki(key: PublicKey[X25519]) =
-      val b = keyBytes(key.repr)
-      exportable(Slice.of(b), handleBacked)(IArray.from(Der.xSpkiPrefix ++ b))
+      Eff.delay(DER.payload(der, DER.xPkcs8Prefix, 32).left.map(_ => Refused).map(s => PrivateKey.unsafe[X25519](s.toArray)))
+    private[kufuli] def raw(key: PublicKey[X25519]) = Eff.succeed(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def spki(key: PublicKey[X25519]) = Eff.succeed(IArray.from(DER.xSpkiPrefix ++ keyBytes(key.repr)))
     private[kufuli] def pkcs8(key: PrivateKey[X25519]) =
-      EffIO.defer(key.read(s => exportable(s, handleBacked)(IArray.from(Der.xPkcs8Prefix ++ s.toArray))))
+      Eff.defer(
+        if !key.exportable then Eff.fail(KeyNotExportable)
+        else key.material(s => Eff.succeed(IArray.from(DER.xPkcs8Prefix ++ s.toArray)))
+      )
   end StubXKeys
 
   final private[kufuli] class StubEcKeys[C <: EcCurve](
     spec: EcSpec[C],
     spkiPrefix: Array[Byte],
-    curveOid: Array[Byte],
-    handleBacked: Boolean
+    curveOid: Array[Byte]
   ) extends EcKeys[C]:
     private val pointLength = 1 + 2 * spec.fieldLength
-    private[kufuli] def generate = EffIO.suspend {
+    private[kufuli] def generate = Eff.suspend {
       val body = Array[Byte](4) ++ fresh("ec")(2 * spec.fieldLength)
       body(1) = (body(1) & 0x7f).toByte // never collide with the stub off-curve marker
-      val b = if handleBacked then sentinelled(body) else body
-      KeyPair(PublicKey.unsafe(keyRepr(b.clone)), PrivateKey.unsafe(b))
+      KeyPair(PublicKey.unsafe(keyGenerated(body.clone)), PrivateKey.unsafeRepr(secretGenerated(body)))
     }
-    private[kufuli] def fromSec1(point: Slice) = EffIO.delay {
-      if point.length != pointLength then Left(InvalidKey.WrongLength(pointLength, point.length))
-      else if point(0) != 4.toByte then Left(InvalidKey.Malformed)
-      else if point(1) == -1 then Left(InvalidKey.NotOnCurve)
+    private[kufuli] def fromSec1(point: Slice) = Eff.delay {
+      if point(1) == -1 then Left(Refused) // the stub off-curve marker
       else Right(PublicKey.unsafe[C](keyRepr(point.toArray)))
     }
-    private[kufuli] def fromSpki(der: Slice) = EffIO.from(Der.payload(der, spkiPrefix, pointLength)).flatMap(fromSec1)
-    private[kufuli] def fromPkcs8(der: Slice) = EffIO.delay {
-      val expected = Der.sequence(
-        Der.integer(Array.emptyByteArray),
-        Der.sequence(Der.objectId(Der.oidEcPublic), Der.objectId(curveOid)),
-        Der.octetString(new Array[Byte](pointLength))
+    private[kufuli] def fromSpki(der: Slice) =
+      Eff.from(DER.payload(der, spkiPrefix, pointLength).left.map(_ => Refused)).flatMap(fromSec1)
+    private[kufuli] def fromPkcs8(der: Slice) = Eff.delay {
+      val expected = DER.sequence(
+        DER.integer(Array.emptyByteArray),
+        DER.sequence(DER.objectId(DER.oidEcPublic), DER.objectId(curveOid)),
+        DER.octetString(new Array[Byte](pointLength))
       )
-      if der.length != expected.length then Left(InvalidKey.Malformed)
+      if der.length != expected.length then Left(Refused)
       else Right(PrivateKey.unsafe[C](der.drop(der.length - pointLength).toArray))
     }
-    private[kufuli] def sec1(key: PublicKey[C]) =
-      val b = keyBytes(key.repr)
-      exportable(Slice.of(b), handleBacked)(IArray.from(b))
-    private[kufuli] def spki(key: PublicKey[C]) =
-      val b = keyBytes(key.repr)
-      exportable(Slice.of(b), handleBacked)(IArray.from(spkiPrefix ++ b))
+    private[kufuli] def sec1(key: PublicKey[C]) = Eff.succeed(IArray.from(keyBytes(key.repr)))
+    private[kufuli] def spki(key: PublicKey[C]) = Eff.succeed(IArray.from(spkiPrefix ++ keyBytes(key.repr)))
     private[kufuli] def pkcs8(key: PrivateKey[C]) =
-      EffIO.defer(
-        key.read(s =>
-          exportable(s, handleBacked)(
-            IArray.from(
-              Der.sequence(
-                Der.integer(Array.emptyByteArray),
-                Der.sequence(Der.objectId(Der.oidEcPublic), Der.objectId(curveOid)),
-                Der.octetString(s.toArray)
+      Eff.defer(
+        if !key.exportable then Eff.fail(KeyNotExportable)
+        else
+          key.material(s =>
+            Eff.succeed(
+              IArray.from(
+                DER.sequence(
+                  DER.integer(Array.emptyByteArray),
+                  DER.sequence(DER.objectId(DER.oidEcPublic), DER.objectId(curveOid)),
+                  DER.octetString(s.toArray)
+                )
               )
             )
           )
-        )
       )
   end StubEcKeys
 
-  final private[kufuli] class StubRsaKeys(handleBacked: Boolean) extends RsaKeys:
-    // stub key layout: repr = modulus ++ exponent(3 bytes, 0x010001)
+  final private[kufuli] class StubRsaKeys extends RsaKeys:
+    // stub key layout: exponent length (2 octets, big-endian) ++ exponent ++ modulus. The length is
+    // carried rather than assumed, because the JWK `e` is minimal-width: 65537 is three octets but
+    // 3 is one and 2^64+1 is nine, and a fixed split would hand every such key back with octets of
+    // its modulus read as its exponent.
     private val e = Array[Byte](1, 0, 1)
-    private[kufuli] def generate(size: Rsa.Size) = EffIO.suspend {
-      val body = fresh("rsa")(size.bits / 8) ++ e
-      val b = if handleBacked then sentinelled(body) else body
-      KeyPair(PublicKey.unsafe(keyRepr(b.clone)), PrivateKey.unsafe(b))
+    private def pack(modulus: Array[Byte], exponent: Array[Byte]): Array[Byte] =
+      Array[Byte]((exponent.length >>> 8).toByte, exponent.length.toByte) ++ exponent ++ modulus
+    private def exponentLength(b: Array[Byte]): Int = ((b(0) & 0xff) << 8) | (b(1) & 0xff)
+    private def modulusOf(b: Array[Byte]): Array[Byte] = b.drop(2 + exponentLength(b))
+    private def exponentOf(b: Array[Byte]): Array[Byte] = b.slice(2, 2 + exponentLength(b))
+    private def wellFormed(b: Array[Byte]): Boolean = b.length > 2 && b.length > 2 + exponentLength(b)
+    private[kufuli] def generate(size: RSA.Size) = Eff.suspend {
+      val body = pack(fresh("rsa")(size.bits / 8), e)
+      KeyPair(PublicKey.unsafe(keyGenerated(body.clone)), PrivateKey.unsafeRepr(secretGenerated(body)))
     }
-    private[kufuli] def fromComponents(modulus: Slice, exponent: Slice) = EffIO.delay {
-      if modulus.isEmpty || exponent.isEmpty then Left(InvalidKey.Malformed)
-      else Right(PublicKey.unsafe[Rsa](keyRepr(modulus.toArray ++ exponent.toArray)))
+    private[kufuli] def fromComponents(modulus: Slice, exponent: Slice) = Eff.delay {
+      if modulus.isEmpty || exponent.isEmpty || exponent.length > 0xffff then Left(Refused)
+      else Right(PublicKey.unsafe[RSA](keyRepr(pack(modulus.toArray, exponent.toArray)))): Either[Refused, PublicKey[RSA]]
     }
-    private[kufuli] def fromSpki(der: Slice) = EffIO.delay {
-      // real parse via the bounded reader: SEQ { SEQ { oid, NULL }, BIT STRING { SEQ { INT n, INT e } } }
-      for
-        outer <- Der.read(der, 0, 0x30)
-        algId <- Der.read(der, outer.contentOff, 0x30)
-        bits <- Der.read(der, algId.next, 0x03)
-        inner <- Der.read(der, bits.contentOff + 1, 0x30)
-        n <- Der.read(der, inner.contentOff, 0x02)
-        ex <- Der.read(der, n.next, 0x02)
-      yield PublicKey.unsafe[Rsa](
-        keyRepr(
-          der.slice(n.contentOff + 1, n.next).toArray ++ der.slice(ex.contentOff + 1, ex.next).toArray
-        )
-      )
+    // A DER INTEGER carries a leading zero only to clear a set sign bit, so an exponent such as
+    // 65537 has none and its first content octet is magnitude.
+    private def magnitude(der: Slice, t: DER.Tlv): Array[Byte] =
+      val from = if t.contentLen > 1 && der(t.contentOff) == 0.toByte then t.contentOff + 1 else t.contentOff
+      der.slice(from, t.next).toArray
+    private[kufuli] def fromSpki(der: Slice) = Eff
+      .delay {
+        // real parse via the bounded reader: SEQ { SEQ { oid, NULL }, BIT STRING { SEQ { INT n, INT e } } }
+        (for
+          outer <- DER.read(der, 0, 0x30)
+          algId <- DER.within(der, outer.contentOff, 0x30, outer.next)
+          bits <- DER.within(der, algId.next, 0x03, outer.next)
+          inner <- DER.within(der, bits.contentOff + 1, 0x30, bits.next)
+          n <- DER.within(der, inner.contentOff, 0x02, inner.next)
+          ex <- DER.within(der, n.next, 0x02, inner.next)
+        yield (magnitude(der, n), magnitude(der, ex))).left.map(_ => Refused)
+      }
+      .flatMap((n, ex) => fromComponents(Slice.of(n), Slice.of(ex)))
+    private[kufuli] def fromPkcs8(der: Slice) = Eff.delay {
+      (for
+        outer <- DER.read(der, 0, 0x30)
+        v <- DER.read(der, outer.contentOff, 0x02)
+        algId <- DER.read(der, v.next, 0x30)
+        octets <- DER.read(der, algId.next, 0x04)
+        body = der.slice(octets.contentOff, octets.next)
+        _ <- if wellFormed(body.toArray) then Right(()) else Left(Refused)
+      yield PrivateKey.unsafe[RSA](body.toArray)).left.map(_ => Refused)
     }
-    private[kufuli] def fromPkcs8(der: Slice) = EffIO.delay {
-      for
-        outer <- Der.read(der, 0, 0x30)
-        v <- Der.read(der, outer.contentOff, 0x02)
-        algId <- Der.read(der, v.next, 0x30)
-        octets <- Der.read(der, algId.next, 0x04)
-      yield PrivateKey.unsafe[Rsa](der.slice(octets.contentOff, octets.next).toArray)
-    }
-    private[kufuli] def components(key: PublicKey[Rsa]) =
+    private[kufuli] def components(key: PublicKey[RSA]) =
       val b = keyBytes(key.repr)
-      exportable(Slice.of(b), handleBacked)(Rsa.Components(IArray.from(b.take(b.length - 3)), IArray.from(b.drop(b.length - 3))))
-    private[kufuli] def spki(key: PublicKey[Rsa]) =
+      Eff.succeed(RSA.Components(IArray.from(modulusOf(b)), IArray.from(exponentOf(b))))
+    private[kufuli] def spki(key: PublicKey[RSA]) =
       val b = keyBytes(key.repr)
-      exportable(Slice.of(b), handleBacked)(
+      Eff.succeed(
         IArray.from(
-          Der.sequence(
-            Der.sequence(Der.objectId(Der.oidRsa), Der.nullValue),
-            Der.bitString(Der.sequence(Der.integer(b.take(b.length - 3)), Der.integer(b.drop(b.length - 3))))
+          DER.sequence(
+            DER.sequence(DER.objectId(DER.oidRsa), DER.nullValue),
+            DER.bitString(DER.sequence(DER.integer(modulusOf(b)), DER.integer(exponentOf(b))))
           )
         )
       )
-    private[kufuli] def pkcs8(key: PrivateKey[Rsa]) =
-      EffIO.defer(
-        key.read(s =>
-          exportable(s, handleBacked)(
-            IArray.from(
-              Der.sequence(
-                Der.integer(Array.emptyByteArray),
-                Der.sequence(Der.objectId(Der.oidRsa), Der.nullValue),
-                Der.octetString(s.toArray)
+    private[kufuli] def pkcs8(key: PrivateKey[RSA]) =
+      Eff.defer(
+        if !key.exportable then Eff.fail(KeyNotExportable)
+        else
+          key.material(s =>
+            Eff.succeed(
+              IArray.from(
+                DER.sequence(
+                  DER.integer(Array.emptyByteArray),
+                  DER.sequence(DER.objectId(DER.oidRsa), DER.nullValue),
+                  DER.octetString(s.toArray)
+                )
               )
             )
           )
-        )
       )
   end StubRsaKeys
-
-  final private[kufuli] class StubKemKeys[K <: KemAlgorithm](spec: KemSpec[K]) extends KemKeys[K]:
-    private[kufuli] def generate = EffIO.suspend {
-      val b = fresh("kem")(spec.publicKeyLength)
-      KeyPair(PublicKey.unsafe(keyRepr(b.clone)), PrivateKey.unsafe(b))
-    }
-    private[kufuli] def fromRaw(bytes: Slice) = EffIO.delay {
-      if bytes.length != spec.publicKeyLength then Left(InvalidKey.WrongLength(spec.publicKeyLength, bytes.length))
-      else Right(PublicKey.unsafe[K](keyRepr(bytes.toArray)))
-    }
-    private[kufuli] def raw(key: PublicKey[K]) = EffIO.succeed(IArray.from(keyBytes(key.repr)))
-    private[kufuli] def fromSeed(seed: Slice) = EffIO.delay {
-      if seed.length != 64 then Left(InvalidKey.WrongLength(64, seed.length))
-      else
-        val b = mix(spec.publicKeyLength)(seed)
-        Right(KeyPair(PublicKey.unsafe[K](keyRepr(b.clone)), PrivateKey.unsafe[K](b)))
-    }
-  end StubKemKeys
 
   // Composable instance bundles: each per-unit platform trait extends exactly its backend's set.
 
   private[kufuli] trait AeadUniversal:
-    given Aead[AesGcm128] = aead(AesGcm128)
-    given Aead[AesGcm192] = aead(AesGcm192)
-    given Aead[AesGcm256] = aead(AesGcm256)
-    given Aead[A128CbcHs256] = aead(A128CbcHs256)
-    given Aead[A256CbcHs512] = aead(A256CbcHs512)
-  private[kufuli] trait AeadChaCha:
-    given Aead[ChaCha20Poly1305] = aead(ChaCha20Poly1305)
-  private[kufuli] trait AeadMisuseResistant:
-    given Aead[XChaCha20Poly1305] = aead(XChaCha20Poly1305)
-    given Aead[AesGcmSiv256] = aead(AesGcmSiv256)
-
-  private[kufuli] trait CipheringUniversal:
-    given Ciphering[AesGcm128] = ciphering(AesGcm128)
-    given Ciphering[AesGcm192] = ciphering(AesGcm192)
-    given Ciphering[AesGcm256] = ciphering(AesGcm256)
-  private[kufuli] trait CipheringChaCha:
-    given Ciphering[ChaCha20Poly1305] = ciphering(ChaCha20Poly1305)
-  private[kufuli] trait CipheringMisuseResistant:
-    given Ciphering[XChaCha20Poly1305] = ciphering(XChaCha20Poly1305)
-    given Ciphering[AesGcmSiv256] = ciphering(AesGcmSiv256)
-
+    given AEAD[AesGcm128] = aead(AesGcm128)
+    given AEAD[AesGcm192] = aead(AesGcm192)
+    given AEAD[AesGcm256] = aead(AesGcm256)
+    given AEAD[A128CbcHs256] = aead(A128CbcHs256)
+    given AEAD[A256CbcHs512] = aead(A256CbcHs512)
   private[kufuli] trait MacAll:
-    given Mac[HmacSha256] = mac(HmacSha256)
-    given Mac[HmacSha384] = mac(HmacSha384)
-    given Mac[HmacSha512] = mac(HmacSha512)
-    given Mac[HmacSha1] = mac(HmacSha1)
+    given MAC[HmacSha256] = mac(HmacSha256)
+    given MAC[HmacSha384] = mac(HmacSha384)
+    given MAC[HmacSha512] = mac(HmacSha512)
+    given MAC[HmacSha1] = mac(HmacSha1)
 
   private[kufuli] trait SignersAll:
-    given Signer[Ed25519] = signerOf(64)
-    given Signer[P256] = signerOf(64)
-    given Signer[P384] = signerOf(96)
-    given Signer[P521] = signerOf(132)
-    given Signer[Rsa] = signerOf(256)
+    given Signing[Ed25519] = signerOf(64)
+    given Signing[P256] = signerOf(64)
+    given Signing[P384] = signerOf(96)
+    given Signing[P521] = signerOf(132)
+    given Signing[RSA] = signerOf(256)
   private[kufuli] trait VerifiersAll:
-    given Verifier[Ed25519] = verifierOf(64)
-    given Verifier[P256] = verifierOf(64)
-    given Verifier[P384] = verifierOf(96)
-    given Verifier[P521] = verifierOf(132)
-    given Verifier[Rsa] = verifierOf(256)
+    given Verifying[Ed25519] = verifierOf(64)
+    given Verifying[P256] = verifierOf(64)
+    given Verifying[P384] = verifierOf(96)
+    given Verifying[P521] = verifierOf(132)
+    given Verifying[RSA] = verifierOf(256)
 
   private[kufuli] trait AgreementAll:
     given Agreement[X25519] = agreement
@@ -451,57 +374,33 @@ private[kufuli] object stubs:
     given Agreement[P384] = agreement
     given Agreement[P521] = agreement
 
-  private[kufuli] trait KemAll:
-    given Kem[MlKem768] = kem(MlKem768)
-    given Kem[MlKem1024] = kem(MlKem1024)
-  private[kufuli] trait KemKeysAll:
-    given KemKeys[MlKem768] = StubKemKeys(MlKem768)
-    given KemKeys[MlKem1024] = StubKemKeys(MlKem1024)
-
   private[kufuli] trait WrapKw:
     given Wrap[AesKw128] = wrapOf
     given Wrap[AesKw256] = wrapOf
-  private[kufuli] trait WrapKwp:
-    given Wrap[AesKwp128] = wrapOf
-    given Wrap[AesKwp256] = wrapOf
 
   private[kufuli] trait KdfDefault:
-    given Kdf = kdf
+    given KDF = kdf
 
   private[kufuli] trait HashAll:
     given Hash[Sha1] = hash(Sha1)
     given Hash[Sha256] = hash(Sha256)
     given Hash[Sha384] = hash(Sha384)
     given Hash[Sha512] = hash(Sha512)
-  private[kufuli] trait HashingSync:
-    given Hashing[Sha256] = hashing(Sha256)
-    given Hashing[Sha384] = hashing(Sha384)
-    given Hashing[Sha512] = hashing(Sha512)
 
   private[kufuli] trait OaepDefault:
-    given Oaep = oaep
+    given OAEP = oaep
 
   private[kufuli] trait RandomDefault:
     given Random = random
 
-  private[kufuli] trait EdKeysBytes:
-    given EdKeys = StubEdKeys(handleBacked = false)
-  private[kufuli] trait EdKeysHandles:
-    given EdKeys = StubEdKeys(handleBacked = true)
-  private[kufuli] trait XKeysBytes:
-    given XKeys = StubXKeys(handleBacked = false)
-  private[kufuli] trait XKeysHandles:
-    given XKeys = StubXKeys(handleBacked = true)
-  private[kufuli] trait EcKeysBytes:
-    given EcKeys[P256] = StubEcKeys(P256, Der.p256SpkiPrefix, Der.oidP256, handleBacked = false)
-    given EcKeys[P384] = StubEcKeys(P384, Der.p384SpkiPrefix, Der.oidP384, handleBacked = false)
-    given EcKeys[P521] = StubEcKeys(P521, Der.p521SpkiPrefix, Der.oidP521, handleBacked = false)
-  private[kufuli] trait EcKeysHandles:
-    given EcKeys[P256] = StubEcKeys(P256, Der.p256SpkiPrefix, Der.oidP256, handleBacked = true)
-    given EcKeys[P384] = StubEcKeys(P384, Der.p384SpkiPrefix, Der.oidP384, handleBacked = true)
-    given EcKeys[P521] = StubEcKeys(P521, Der.p521SpkiPrefix, Der.oidP521, handleBacked = true)
-  private[kufuli] trait RsaKeysBytes:
-    given RsaKeys = StubRsaKeys(handleBacked = false)
-  private[kufuli] trait RsaKeysHandles:
-    given RsaKeys = StubRsaKeys(handleBacked = true)
+  private[kufuli] trait EdKeysAll:
+    given EdKeys = StubEdKeys()
+  private[kufuli] trait XKeysAll:
+    given XKeys = StubXKeys()
+  private[kufuli] trait EcKeysAll:
+    given EcKeys[P256] = StubEcKeys(P256, DER.p256SpkiPrefix, DER.oidP256)
+    given EcKeys[P384] = StubEcKeys(P384, DER.p384SpkiPrefix, DER.oidP384)
+    given EcKeys[P521] = StubEcKeys(P521, DER.p521SpkiPrefix, DER.oidP521)
+  private[kufuli] trait RsaKeysAll:
+    given RsaKeys = StubRsaKeys()
 end stubs

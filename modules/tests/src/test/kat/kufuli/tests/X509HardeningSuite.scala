@@ -38,7 +38,7 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
       certs <- chain.traverse(i => parsed(i.der))
       root <- parsed(anchor.der)
       id <- serverId(host)
-      result <- x5.CertPath.verify(certs, x5.TrustAnchors(root), at, id).either
+      result <- x5.CertPath.verify(certs, x5.TrustAnchors(root), at, id).either.absolve
     yield result
 
   private def indexOf(haystack: Array[Byte], needle: Array[Byte]): Int =
@@ -127,7 +127,7 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
       spki <- spkiOf(kp.publicKey)
       tbs = tbsOf(2, "Root", "leaf", spki, notBefore, notAfter, List(endEntity))
       crafted = seq(tbs, seq(oid(edOid)), Array[Byte](0x03, 0x00))
-      result = x5.Certificate.fromDer(crafted)
+      result = x5.Certificate.parse(crafted)
       _ <- check(result == Left(Malformed), s"empty BIT STRING -> Malformed, got $result")
     yield ()
   }
@@ -136,7 +136,7 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
     for
       root <- selfSigned("Root", List(caTrue, certSign))
       leaf <- issuedBy(root, 2, "leaf", List(endEntity, san("example.com"), ext(oidEku, false, seq(tlv(0x02, Array[Byte](1))))))
-      _ <- check(x5.Certificate.fromDer(leaf.der).isLeft, "an unreadable EKU entry must not parse as an empty EKU list")
+      _ <- check(x5.Certificate.parse(leaf.der).isLeft, "an unreadable EKU entry must not parse as an empty EKU list")
     yield ()
   }
 
@@ -158,16 +158,16 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
     for
       root <- selfSigned("Root", List(caTrue, certSign))
       duplicated <- issuedBy(root, 2, "leaf", List(endEntity, san("example.com"), endEntity))
-      _ <- check(x5.Certificate.fromDer(duplicated.der).isLeft, "a repeated extension OID must not be last-wins")
+      _ <- check(x5.Certificate.parse(duplicated.der).isLeft, "a repeated extension OID must not be last-wins")
       leaf <- issuedBy(root, 3, "leaf", List(endEntity, san("example.com")))
-      _ <- check(x5.Certificate.fromDer(leaf.der ++ Array[Byte](0)).isLeft, "bytes after the outer SEQUENCE must be rejected")
-      roundTrip = x5.Certificate.fromDer(leaf.der).map(c => Array.from(c.der.iterator).sameElements(leaf.der))
+      _ <- check(x5.Certificate.parse(leaf.der ++ Array[Byte](0)).isLeft, "bytes after the outer SEQUENCE must be rejected")
+      roundTrip = x5.Certificate.parse(leaf.der).map(c => Array.from(c.der.iterator).sameElements(leaf.der))
       _ <- check(roundTrip == Right(true), s"der round-trips the accepted encoding, got $roundTrip")
       marker = Array[Byte](0x06, 0x03, 0x55, 0x1d, 0x11)
       pos = indexOf(leaf.der, marker)
       _ <- check(pos > 0, "the SAN extension is present in the fixture")
       overrun = leaf.der.updated(pos - 1, (leaf.der(pos - 1) + 8).toByte)
-      _ <- check(x5.Certificate.fromDer(overrun).isLeft, "an extension reaching past the extensions SEQUENCE must be rejected")
+      _ <- check(x5.Certificate.parse(overrun).isLeft, "an extension reaching past the extensions SEQUENCE must be rejected")
     yield ()
   }
 
@@ -183,10 +183,10 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
       spki <- spkiOf(kp.publicKey)
       _ <- List(notASequence, truncated, trailing).traverse_ { region =>
              val der = assemble(tbsWith(2, "Root", "leaf", spki, notBefore, notAfter, region), new Array[Byte](64))
-             check(x5.Certificate.fromDer(der).isLeft, "an unreadable extensions region must not parse as an extension-less certificate")
+             check(x5.Certificate.parse(der).isLeft, "an unreadable extensions region must not parse as an extension-less certificate")
            }
       intact = assemble(tbsWith(2, "Root", "leaf", spki, notBefore, notAfter, wellFormed), new Array[Byte](64))
-      names = x5.Certificate.fromDer(intact).map(_.subjectAltDns)
+      names = x5.Certificate.parse(intact).map(_.subjectAltDns)
       _ <- check(names == Right(List("example.com")), s"the well-formed region still parses, got $names")
     yield ()
   }
@@ -199,7 +199,7 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
       _ <- check(folded.isRight, s"ASCII case folds, got $folded")
       // U+212A KELVIN SIGN lower-cases to ASCII 'k' under Unicode folding, in every locale; the LDH
       // definition keeps it out of an identity before any comparison happens.
-      kelvin = x5.ServerId.of(s"${0x212a.toChar}.example.com")
+      kelvin = x5.ServerId.parse(s"${0x212a.toChar}.example.com")
       _ <- check(kelvin == Left(Malformed), s"U+212A is not an LDH label, got $kelvin")
       broad <- issuedBy(root, 3, "leaf", List(endEntity, san("*.com")))
       any <- verify(List(broad), root, "example.com")
@@ -224,23 +224,23 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
       spki <- spkiOf(kp.publicKey)
       _ <- rejected.traverse_ { from =>
              val der = assemble(tbsOf(2, "Root", "leaf", spki, from, notAfter, List(endEntity)), new Array[Byte](64))
-             check(x5.Certificate.fromDer(der).isLeft, s"notBefore $from must be rejected")
+             check(x5.Certificate.parse(der).isLeft, s"notBefore $from must be rejected")
            }
       good = assemble(tbsOf(2, "Root", "leaf", spki, notBefore, notAfter, List(endEntity)), new Array[Byte](64))
-      _ <- check(x5.Certificate.fromDer(good).isRight, "a Zulu window with in-range fields parses")
+      _ <- check(x5.Certificate.parse(good).isRight, "a Zulu window with in-range fields parses")
     yield ()
   }
 
   test("PEM decoding ignores text outside the boundaries and requires the CERTIFICATE label") {
     for
       root <- selfSigned("Root", List(caTrue, certSign))
-      pem = PEM.encode(PEM.Block("CERTIFICATE", IArray.from(root.der)))
+      pem = PEM.encode(PEM.Block.Certificate(IArray.from(root.der)))
       annotated = "Certificate:\n    Data:\n        Version: 3 (0x2)\n" + pem
-      _ <- check(x5.Certificate.fromPem(annotated).isRight, "explanatory text before the block is ignored")
-      mislabelled = PEM.encode(PEM.Block("PRIVATE KEY", IArray.from(root.der)))
-      _ <- check(x5.Certificate.fromPem(mislabelled).isLeft, "a certificate under another label is rejected")
+      _ <- check(x5.Certificate.parse(annotated).isRight, "explanatory text before the block is ignored")
+      mislabelled = PEM.encode(PEM.Block.PrivateKey(PKCS8(IArray.from(root.der))))
+      _ <- check(x5.Certificate.parse(mislabelled).isLeft, "a certificate under another label is rejected")
       bundle = "leaf:\n" + pem + "\nissuer:\n" + pem
-      _ <- check(x5.Certificate.chainFromPem(bundle).map(_.length) == Right(2), "text between blocks is ignored")
+      _ <- check(x5.Certificate.chain(bundle).map(_.length) == Right(2), "text between blocks is ignored")
     yield ()
   }
 
@@ -253,39 +253,37 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
       first <- parsed(retired.der)
       second <- parsed(current.der)
       host <- serverId("example.com")
-      result <- x5.CertPath.verify(List(cert), x5.TrustAnchors(first, second), at, host).either
+      result <- x5.CertPath.verify(List(cert), x5.TrustAnchors(first, second), at, host).either.absolve
       _ <- check(result.isRight, s"the second same-name anchor must be tried, got $result")
     yield ()
   }
 
-  private def gtime(value: String): Array[Byte] = tlv(0x18, ascii(value))
-  private val ocspBasicOid = oid(Array[Byte](0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01))
-  private val ocspCertId =
-    seq(oid(Array[Byte](0x2b, 0x0e, 0x03, 0x02, 0x1a)), tlv(0x04, Array[Byte](1)), tlv(0x04, Array[Byte](2)), tlv(0x02, Array[Byte](3)))
-
-  private def staple(status: Array[Byte], thisUpdate: String, nextUpdate: Option[String]): Array[Byte] =
-    val single = seq((List(ocspCertId, status, gtime(thisUpdate)) ++ nextUpdate.map(n => tlv(0xa0, gtime(n))))*)
-    val responseData = seq(tlv(0xa2, tlv(0x04, Array[Byte](1, 2, 3, 4))), gtime("20260101000000Z"), seq(single))
-    val basic = seq(responseData, seq(ocspBasicOid), tlv(0x03, Array[Byte](0, 0)))
-    seq(tlv(0x0a, Array[Byte](0)), tlv(0xa0, seq(ocspBasicOid, tlv(0x04, basic))))
-
-  test("a stapled response outside its own update window carries no Good verdict") {
-    val good = Array[Byte](0x80.toByte, 0x00)
-    val revoked = tlv(0xa1, gtime("20250601000000Z"))
+  test("the path walk spends its budget over the whole enumeration, not only over the candidates it finds") {
     for
-      root <- selfSigned("Root", List(caTrue, certSign))
-      cert <- parsed(root.der)
-      fresh <- x5.OCSP.verifyStapled(staple(good, "20260101000000Z", Some("20360101000000Z")), cert, cert, at).either
-      _ <- check(fresh == Right(x5.OCSP.Status.Good), s"a current Good staple is honoured, got $fresh")
-      expired <- x5.OCSP.verifyStapled(staple(good, "20200101000000Z", Some("20200102000000Z")), cert, cert, at).either
-      _ <- check(expired == Right(x5.OCSP.Status.Unknown), s"a Good staple past nextUpdate -> Unknown, got $expired")
-      early <- x5.OCSP.verifyStapled(staple(good, "20360101000000Z", None), cert, cert, at).either
-      _ <- check(early == Right(x5.OCSP.Status.Unknown), s"a Good staple before thisUpdate -> Unknown, got $early")
-      stale <- x5.OCSP.verifyStapled(staple(revoked, "20200101000000Z", Some("20200102000000Z")), cert, cert, at).either
-      _ <- check(stale.exists { case x5.OCSP.Status.Revoked(_) => true; case _ => false }, s"a stale Revoked still stands, got $stale")
+      unrelated <- selfSigned("Real Root", List(caTrue, certSign))
+      head <- selfSigned("Filler CA", List(caTrue, certSign))
+      leaf <- issuedBy(head, 2, "leaf", List(endEntity, san("example.com")))
+      // Every filler carries the leaf's issuer DN as its own subject and none reaches the anchor, so
+      // the walk produces no candidate at all - a ceiling on candidates never fills - while the
+      // orderings of fifteen certificates are more than any machine enumerates.
+      fillers <- (1 to 14).toList.traverse(_ => selfSigned("Filler CA", List(caTrue, certSign)))
+      result <- verify(leaf :: head :: fillers, unrelated, "example.com")
+      _ <- check(result == Left(x5.PathInvalid.LimitExceeded), s"the walk reports its own bound rather than running on, got $result")
     yield ()
     end for
   }
+
+  test("the budget does not cut a real chain short: same-DN decoys are walked past to the issuer that signed") {
+    for
+      root <- selfSigned("Root", List(caTrue, certSign))
+      decoys <- (3 to 8).toList.traverse(i => issuedBy(root, i, "Sub CA", List(caTrue, certSign)))
+      real <- issuedBy(root, 2, "Sub CA", List(caTrue, certSign))
+      leaf <- issuedBy(real, 9, "leaf", List(endEntity, san("example.com")))
+      result <- verify(leaf :: (decoys :+ real), root, "example.com")
+      _ <- check(result.isRight, s"the issuer that signed the leaf is reached past six same-DN decoys, got $result")
+    yield ()
+  }
+
   test("a certificate whose subject key kufuli cannot import still parses and says so") {
     // A DSA SubjectPublicKeyInfo (1.2.840.10040.4.1): well-formed X.509, outside kufuli's families.
     val dsaSpki =
@@ -293,14 +291,14 @@ class X509HardeningSuite extends munit.CatsEffectSuite:
     for
       kp <- Ed25519.generate.absolve
       der <- signed(tbsOf(9, "unsupported", "unsupported", dsaSpki, notBefore, notAfter, Nil), kp.privateKey)
-      cert <- IO.fromEither(x5.Certificate.fromDer(der).left.map(e => new AssertionError(s"parse: $e")))
-      _ <- check(cert.publicKey.swap.toOption.contains(InvalidKey.Unsupported),
-                 s"unsupported SPKI reports itself, got ${cert.publicKey.isRight}"
-           )
+      cert <- IO.fromEither(x5.Certificate.parse(der).left.map(e => new AssertionError(s"parse: $e")))
+      unsupported <- cert.publicKey.either.absolve
+      _ <- check(unsupported == Left(InvalidKey.Unsupported), s"unsupported SPKI reports itself, got $unsupported")
       _ <- check(cert.subjectAltDns.isEmpty && cert.der.length == der.length, "the certificate stays inspectable")
       mine <- selfSigned("ok.example", List(endEntity))
-      good <- IO.fromEither(x5.Certificate.fromDer(mine.der).left.map(e => new AssertionError(s"parse: $e")))
-      _ <- check(good.publicKey.isRight, "a supported SPKI yields its key")
+      good <- IO.fromEither(x5.Certificate.parse(mine.der).left.map(e => new AssertionError(s"parse: $e")))
+      supported <- good.publicKey.either.absolve
+      _ <- check(supported.isRight, s"a supported SPKI yields its key, got $supported")
     yield ()
     end for
   }

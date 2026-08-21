@@ -1,77 +1,85 @@
 # Contributing to kufuli
 
-## Build requirements
+## Requirements
 
-- JDK 25+.
-- sbt 2.x (pinned in `project/build.properties`).
-- Node.js 24+ (for the Scala.js targets).
-- A C toolchain for Scala Native: clang and, on Windows, the MSVC toolchain via `vcvarsall.bat`. The
-  native backend links aws-lc, provisioned by sbt-snx from `vendor/`.
-- Git, for the vendored submodules.
+- JDK 25 or newer. The build asserts it, because the JVM backend takes ML-KEM from the JDK's own
+  JCA provider (JEP 496).
+- sbt. The version is pinned in `project/build.properties`.
+- Node.js 24.7 or newer for the Scala.js rows. 24.7 is the floor for `crypto.argon2`.
+- clang, CMake and make for the Scala Native row. sbt-snx fetches aws-lc and libargon2 from git at
+  pinned commits and builds them locally; neither is vendored into the tree.
+- On Windows the Native row additionally needs the MSVC toolchain on PATH through `vcvarsall.bat`,
+  Ninja, and NASM on x86_64. sbt-snx never passes `-DCMAKE_C_COMPILER`, so the compiler it discovers
+  on PATH must itself be the MSVC one.
 
 ## First build
 
-Wycheproof test vectors and the PHC Argon2 reference C source are pinned as git submodules under
-`vendor/`. Clone with `--recursive`, or after a plain clone run:
+The Wycheproof vectors are a git submodule, and the build fails without them:
 
 ```
-git submodule update --init
+git submodule update --init vendor/wycheproof
 ```
 
-The per-platform aggregators run every module's tests on one target, as CI does:
+`vendor/phc-winner-argon2` records the libargon2 commit the Native backend is built against. No
+build step reads it, so it does not need initialising to build or test.
+
+## Running the tests
 
 ```
-sbt kufuli-jvm/test        # JVM
-sbt kufuli-js/test         # Node.js and browser
-sbt kufuli-native/test     # Scala Native
+sbt suites
 ```
 
-sbt caches test runs; use `<project>/testOnly *` to force a full re-run.
+One command, every suite, every row. Do not reach for `sbt test`: sbt resolves it through
+`testQuick`, which skips suites whose inputs have not changed and reports `Total 0` on a working
+tree.
 
-## Project structure
+Test sources are split by the rows that can run them:
+
+| directory         | rows                       |
+| ----------------- | -------------------------- |
+| `src/test/scala`  | JVM, Node, Native, browser |
+| `src/test/kat`    | JVM, Node, Native          |
+| `src/test/misuse` | Native                     |
+
+The browser row is stub-backed, so nothing reaching a provider is added to it. `misuse` is Native
+alone because aws-lc is the only backend carrying XChaCha20-Poly1305 and AES-256-GCM-SIV.
+
+## Gates
 
 ```
-modules/
-  core/       Primitives, recipes, key rotation, kufuli.unsafe. Shared source in scala/;
-              per-platform KeyRepr and capability aliases in scalajvm/, scalajs-node/,
-              scalajs-browser/, and scalanative/.
-  jose/       JWT/JWS/JWE/JWK(S), COSE key import.
-  password/   Argon2id and the PHC format.
-  x509/       Path validation and stapled-OCSP verification.
-  tests/      Cross-platform test suites (see below).
-
-project/
-  KufuliNative.scala           The aws-lc and libargon2 vendored-build recipes.
-  NativePlatformPlugin.scala   Native test-interface eviction, aws-lc/argon2 provisioning, static test linking.
-  WebCryptoAxis.scala          The virtual axis distinguishing the browser JS row from Node.
-  WycheproofPlugin.scala       Embeds Wycheproof JSON vectors as generated Scala source.
-
-vendor/
-  wycheproof/          Wycheproof test vectors (Apache-2.0).
-  phc-winner-argon2/   PHC Argon2 reference C source (CC0 1.0 / Apache-2.0).
+sbt format
 ```
 
-## Test structure
+`format` rewrites and validates in one pass (`scalafixAll; scalafmtAll; scalafmtSbt;
+headerCreateAll`). `check` is the read-only form CI runs, and additionally executes the
+capture-checking fixtures. Main and test sources compile under the same regime: `-Werror`,
+`-Yexplicit-nulls`, `-Wunused:all`.
 
-The `tests` module splits its suites by what the artifact under test can provide:
+### The release gate
 
-- `src/test/scala` runs on all four artifacts - JVM, Node, browser and Native - and holds the pure
-  value-layer checks, the structural misuse negatives, and the core round-trip flows.
-- `src/test/kat` runs on JVM, Node and Native, and holds the known-answer and adversarial vectors
-  against a real backend. The browser artifact is stub-backed, so it has no backend to answer them.
+kufuli publishes NIR and SJSIR, so the optimiser and the linker run in the consumer's build.
+`sbt suites` links the way you iterate, which is Scala Native in debug with no LTO and Scala.js
+through `fastLinkJS`. The release gate links the strongest way a consumer can:
 
-Conventions for new tests:
+```
+sbt shutdown
+KUFULI_RELEASE_GATE=true sbt suites
+```
 
-- Every public operation has at least one test.
-- Each algorithm carries an RFC or NIST known-answer vector and, where vectors exist, Wycheproof
-  adversarial coverage. When a standard's case is inapplicable (for example, a key below our
-  minimum), the exclusion is noted against the standard's reference.
-- A suite goes in the widest source set its dependencies allow.
+That selects Scala Native `release-full` with thin LTO, and Scala.js `fullLinkJS`. Two things to
+know before running it:
+
+- The variable is read when the build loads, so shut the server down first. One already running
+  ignores it and reports a pass that means nothing.
+- On Linux the gate links with `lld`, because GNU `ld` performs LTO only through `LLVMgold.so`,
+  which ships apart from clang and is absent on an ordinary LLVM install.
+
+No release is cut on a verdict from `sbt suites` alone; CI runs the release form on the publish
+path.
 
 ## Vendor submodules
 
-Each submodule is pinned to an exact upstream SHA by the parent commit, so the build is reproducible
-with no imperative checkout step. To update one:
+Each submodule is pinned to an exact upstream SHA by the parent commit. To move one:
 
 ```
 cd vendor/<name>
@@ -79,13 +87,6 @@ git fetch
 git checkout <new-sha>
 cd ../..
 git add vendor/<name>
-git commit -m "Bump <name> to <new-sha>"
 ```
 
-Then record the new SHA in `NOTICE`.
-
-## Code style
-
-Run `sbt format` before committing (`scalafixAll; scalafmtAll; scalafmtSbt; headerCreateAll`); `sbt
-check` is the read-only gate CI runs. Both main and test sources compile under the same strict
-regime: `-Werror`, `-Yexplicit-nulls`, and `-Wunused:all`.
+Record the new SHA in `NOTICE` in the same commit.

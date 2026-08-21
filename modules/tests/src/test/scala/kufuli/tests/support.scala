@@ -22,12 +22,12 @@ package kufuli.tests
 
 import scala.reflect.TypeTest
 
-import boilerplate.effect.EffIO
+import boilerplate.effect.Eff
 import cats.effect.IO
 
 object support:
-  def expectRight[E <: Throwable, A](label: String)(e: EffIO[E, A])(using TypeTest[Throwable, E]): IO[A] =
-    e.either.flatMap {
+  def expectRight[E <: Throwable, A](label: String)(e: Eff[E, A])(using TypeTest[Throwable, E]): IO[A] =
+    e.either.absolve.flatMap {
       case Right(a)  => IO.pure(a)
       case Left(err) => IO.raiseError(new AssertionError(s"$label: unexpected error $err"))
     }

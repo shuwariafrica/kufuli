@@ -24,8 +24,7 @@ import scala.scalanative.unsafe.*
 import scala.scalanative.unsigned.*
 
 import boilerplate.Slice
-import boilerplate.effect.EffIO
-import boilerplate.effect.UEffIO
+import boilerplate.effect.UEff
 import cats.effect.IO
 
 import kufuli.guard
@@ -44,11 +43,11 @@ private[password] object argon2ffi:
     hashLen: CSize): CInt = extern
 end argon2ffi
 
-private[password] trait Argon2Platform:
+private[kufuli] trait Argon2Platform:
   given Argon2 = new Argon2:
-    def hash(password: Slice, salt: Slice, params: Argon2Params): UEffIO[Array[Byte]] =
-      EffIO.liftF(guard(IO.blocking {
-        val out = new Array[Byte](32)
+    private[kufuli] def hash(password: Slice, salt: Slice, params: Argon2Params, length: Int): UEff[Array[Byte]] =
+      guard(IO.blocking {
+        val out = new Array[Byte](length)
         val rc = argon2ffi.argon2id_hash_raw(
           params.iterations.toUInt,
           params.memoryKib.toUInt,
@@ -58,11 +57,11 @@ private[password] trait Argon2Platform:
           salt.unsafePtr,
           salt.length.toCSize,
           Slice.of(out).unsafePtr,
-          32.toCSize
+          length.toCSize
         )
         // Inputs are pre-validated, so a non-zero return is an anomaly; guard sanitises the raise so
         // the password never surfaces.
         if rc != 0 then throw new IllegalStateException("argon2id primitive failed unexpectedly") // scalafix:ok DisableSyntax.throw
         out
-      }))
+      })
 end Argon2Platform

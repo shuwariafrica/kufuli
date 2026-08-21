@@ -21,7 +21,9 @@
 // Deliberately outside `kufuli.*`: `private[kufuli]` grants package access, so the same assertions
 // made from `kufuli.tests` would compile whether or not the backend primitives are sealed and would
 // prove nothing. Each negative is paired with the summon that reaches the same instance, so a
-// failure means the primitive became callable rather than the instance becoming unresolvable.
+// failure means the primitive became callable rather than the instance becoming unresolvable - which
+// is why a capability this artifact does not provide is asserted in the KAT tier instead, on the
+// lanes that provide it.
 package seamcheck
 
 import scala.compiletime.testing.typeChecks
@@ -35,45 +37,39 @@ class SeamSuite extends munit.FunSuite:
     assert(!typeChecks("summon[Random].bytes(32)"), "Random.bytes is sealed")
     assert(typeChecks("Random.bytes(32)"), "the companion wrapper is the public path")
 
-    assert(typeChecks("summon[Aead[AesGcm256]]"), "the Aead instance resolves")
-    assert(!typeChecks("summon[Aead[AesGcm256]].seal(???, ???, ???, ???)"), "Aead.seal is sealed")
-    assert(!typeChecks("summon[Aead[AesGcm256]].open(???, ???, ???, ???)"), "Aead.open is sealed")
+    assert(typeChecks("summon[AEAD[AesGcm256]]"), "the AEAD instance resolves")
+    assert(!typeChecks("summon[AEAD[AesGcm256]].seal(???, ???, ???, ???)"), "AEAD.seal is sealed")
+    assert(!typeChecks("summon[AEAD[AesGcm256]].open(???, ???, ???, ???)"), "AEAD.open is sealed")
     assert(typeChecks("AesGcm256.generate"), "generation goes through the spec object")
 
-    assert(typeChecks("summon[Mac[HmacSha256]]"), "the Mac instance resolves")
-    assert(!typeChecks("summon[Mac[HmacSha256]].sign(???, ???)"), "Mac.sign is sealed")
-    assert(!typeChecks("summon[Mac[HmacSha256]].prepared(???)"), "the default Mac.prepared is sealed with it")
+    assert(typeChecks("summon[MAC[HmacSha256]]"), "the MAC instance resolves")
+    assert(!typeChecks("summon[MAC[HmacSha256]].sign(???, ???)"), "MAC.sign is sealed")
+    assert(!typeChecks("summon[MAC[HmacSha256]].prepared(???)"), "the default MAC.prepared is sealed with it")
 
-    assert(typeChecks("summon[Signer[Ed25519]]") && typeChecks("summon[Verifier[Ed25519]]"), "the signing instances resolve")
-    assert(!typeChecks("summon[Signer[Ed25519]].sign(???, ???, EdDsa)"), "Signer.sign is sealed")
-    assert(!typeChecks("summon[Verifier[Ed25519]].verify(???, ???, ???, EdDsa)"), "Verifier.verify is sealed")
+    assert(typeChecks("summon[Signing[Ed25519]]") && typeChecks("summon[Verifying[Ed25519]]"), "the signing instances resolve")
+    assert(!typeChecks("summon[Signing[Ed25519]].sign(???, ???, Ed)"), "Signing.sign is sealed")
+    assert(!typeChecks("summon[Verifying[Ed25519]].verify(???, ???, ???, Ed)"), "Verifying.verify is sealed")
 
     assert(typeChecks("summon[Agreement[X25519]]"), "the Agreement instance resolves")
     assert(!typeChecks("summon[Agreement[X25519]].agree(???, ???)"), "Agreement.agree is sealed")
-
-    assert(!typeChecks("summon[Kem[MlKem768]].encapsulate(???)"), "Kem.encapsulate is sealed")
-    assert(!typeChecks("summon[Kem[MlKem768]].decapsulate(???, ???)"), "Kem.decapsulate is sealed")
 
     assert(typeChecks("summon[Wrap[AesKw256]]"), "the Wrap instance resolves")
     assert(!typeChecks("summon[Wrap[AesKw256]].wrap(???, ???)"), "the RFC 3394 length rule is unbypassable")
     assert(!typeChecks("summon[Wrap[AesKw256]].unwrap(???, ???)"), "Wrap.unwrap is sealed")
 
-    assert(typeChecks("summon[Kdf]"), "the Kdf instance resolves")
-    assert(!typeChecks("summon[Kdf].expand(Sha256, ???, ???, 100000)"), "the HKDF counter bound is unbypassable")
-    assert(!typeChecks("summon[Kdf].extract(Sha256, ???, ???)"), "Kdf.extract is sealed")
-    assert(!typeChecks("summon[Kdf].pbkdf2(Sha256, ???, ???, 1, 32)"), "Kdf.pbkdf2 is sealed")
+    assert(typeChecks("summon[KDF]"), "the KDF instance resolves")
+    assert(!typeChecks("summon[KDF].expand(Sha256, ???, ???, 100000)"), "the HKDF counter bound is unbypassable")
+    assert(!typeChecks("summon[KDF].extract(Sha256, ???, ???)"), "KDF.extract is sealed")
+    assert(!typeChecks("summon[KDF].pbkdf2(Sha256, ???, ???, 1, 32)"), "KDF.pbkdf2 is sealed")
     assert(typeChecks("HKDF.expand(Sha256, ???, ???, 32)"), "HKDF is the public path")
 
     assert(typeChecks("summon[Hash[Sha256]]"), "the Hash instance resolves")
     assert(!typeChecks("summon[Hash[Sha256]].digest(???)"), "Hash.digest is sealed")
-    assert(!typeChecks("summon[Hashing[Sha256]].hasher"), "Hashing.hasher is sealed")
     assert(typeChecks("Sha256.digest(???)"), "the spec object is the public path")
 
-    assert(typeChecks("summon[Oaep]"), "the Oaep instance resolves")
-    assert(!typeChecks("summon[Oaep].encrypt(???, ???, RsaOaep(Sha256))"), "Oaep.encrypt is sealed")
-    assert(!typeChecks("summon[Oaep].decrypt(???, ???, RsaOaep(Sha256))"), "Oaep.decrypt is sealed")
-
-    assert(!typeChecks("summon[Ciphering[AesGcm256]].engine(???)"), "an unbudgeted record engine is unobtainable")
+    assert(typeChecks("summon[OAEP]"), "the OAEP instance resolves")
+    assert(!typeChecks("summon[OAEP].encrypt(???, ???, RsaOaep(Sha256))"), "OAEP.encrypt is sealed")
+    assert(!typeChecks("summon[OAEP].decrypt(???, ???, RsaOaep(Sha256))"), "OAEP.decrypt is sealed")
 
     assert(typeChecks("summon[EdKeys]") && typeChecks("summon[XKeys]"), "the key-lifecycle instances resolve")
     assert(!typeChecks("summon[XKeys].fromRaw(???)"), "the X25519 blocklist is unbypassable")
@@ -81,12 +77,12 @@ class SeamSuite extends munit.FunSuite:
     assert(!typeChecks("summon[EdKeys].generate"), "EdKeys.generate is sealed")
     assert(!typeChecks("summon[EdKeys].fromPkcs8(???)"), "EdKeys.fromPkcs8 is sealed")
     assert(!typeChecks("summon[EdKeys].raw(???)"), "EdKeys.raw is sealed")
+    assert(typeChecks("summon[EcKeys[P256]]") && typeChecks("summon[RsaKeys]"), "the EC and RSA lifecycle instances resolve")
     assert(!typeChecks("summon[EcKeys[P256]].fromSec1(???)"), "EcKeys.fromSec1 is sealed")
     assert(!typeChecks("summon[RsaKeys].fromComponents(???, ???)"), "RsaKeys.fromComponents is sealed")
-    assert(!typeChecks("summon[KemKeys[MlKem768]].fromSeed(???)"), "the seed import has no public surface")
     assert(typeChecks("Ed25519.generate"), "generation goes through the algorithm object")
-    assert(typeChecks("PublicKey.fromRaw(X25519)(???)"), "the blocklisted import is the public path")
-    assert(typeChecks("PublicKey.fromSpki(X25519)(???)"), "the typed SPKI import is the public path")
+    assert(typeChecks("PublicKey.parse(X25519)(??? : Raw)"), "the blocklisted import is the public path")
+    assert(typeChecks("PublicKey.parse(X25519)(??? : SPKI)"), "the typed SPKI import is the public path")
 
     assert(typeChecks("(??? : Signature.Signer[Ed25519]).sign(???)"), "a prepared signer stays callable")
     assert(typeChecks("(??? : Hasher).digest"), "a hasher handle stays callable")

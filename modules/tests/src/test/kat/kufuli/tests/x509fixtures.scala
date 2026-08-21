@@ -139,7 +139,7 @@ object x509fixtures:
     seq(tbs, seq(oid(edOid)), tlv(0x03, Array[Byte](0) ++ signature))
 
   def spkiOf(key: PublicKey[Ed25519]): IO[Array[Byte]] =
-    expectRight("spki")(key.spki).map(a => Array.from(a.iterator))
+    expectRight("spki")(key.spki).map(a => Array.from(a.bytes.iterator))
 
   def signed(tbs: Array[Byte], key: PrivateKey[Ed25519]): IO[Array[Byte]] =
     key.sign(Slice.of(tbs)).absolve.map(s => assemble(tbs, Array.from(s.bytes.iterator)))
@@ -168,12 +168,12 @@ object x509fixtures:
     yield der
 
   def parsed(der: Array[Byte]): IO[x5.Certificate] =
-    x5.Certificate.fromDer(der) match
+    x5.Certificate.parse(der) match
       case Right(c) => IO.pure(c)
       case Left(e)  => IO.raiseError(new AssertionError(s"expected a parsable certificate, got $e"))
 
   def serverId(text: String): IO[x5.ServerId] =
-    x5.ServerId.of(text) match
+    x5.ServerId.parse(text) match
       case Right(i) => IO.pure(i)
       case Left(e)  => IO.raiseError(new AssertionError(s"identity $text: $e"))
 end x509fixtures

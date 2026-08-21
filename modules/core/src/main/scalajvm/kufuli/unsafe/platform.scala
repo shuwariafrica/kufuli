@@ -26,13 +26,29 @@ import javax.crypto.spec.SecretKeySpec
 
 import boilerplate.Slice
 
-private[unsafe] def aesBlockEncrypt(key: Array[Byte], src: Slice, dst: Slice): Unit =
-  val cipher = Cipher.getInstance("AES/ECB/NoPadding")
-  cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"))
-  val _ = Slice.of(cipher.doFinal(src.take(16).toArray)).copyInto(dst)
+private[unsafe] def aesBlockEngine(key: Array[Byte]): AesBlockEngine =
+  new AesBlockEngine:
+    private val kb = key.clone
+    private val cipher = Cipher.getInstance("AES/ECB/NoPadding")
+    cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(kb, "AES"))
+    // ECB with no padding leaves the engine in its post-init state after each `doFinal`, so one
+    // instance serves the connection: the provider lookup and key schedule do not repeat per packet.
+    def encrypt(src: Slice, dst: Slice): Unit =
+      val _ = cipher.doFinal(src.unsafeArray, src.unsafeOffset, 16, dst.unsafeArray, dst.unsafeOffset)
+    def release(): Unit = Slice.of(kb).wipe()
 
-private[unsafe] def chacha20Keystream(key: Array[Byte], dst: Slice, nonce: Slice, counter: Int): Unit =
-  // A fresh instance each call: JCA rejects re-initialising its ChaCha20 engine with a repeated key+nonce.
-  val cipher = Cipher.getInstance("ChaCha20")
-  cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "ChaCha20"), new ChaCha20ParameterSpec(nonce.toArray, counter))
-  val _ = Slice.of(cipher.doFinal(new Array[Byte](dst.length))).copyInto(dst)
+private[unsafe] def chacha20Engine(key: Array[Byte]): ChaCha20Engine =
+  new ChaCha20Engine:
+    private val kb = key.clone
+    private val jk = new SecretKeySpec(kb, "ChaCha20")
+    // A fresh instance each call, unlike the AES engine above: JCA refuses to re-initialise its
+    // ChaCha20 engine with the key, nonce and counter it was last given, and a keystream is a pure
+    // function of those - a receiver unmasking a header its sender masked recomputes exactly that.
+    // The provider lookup therefore stays per call here; header protection under the AES suites,
+    // which is the default, does not pay it.
+    def keystream(dst: Slice, nonce: Slice, counter: Int): Unit =
+      val cipher = Cipher.getInstance("ChaCha20")
+      cipher.init(Cipher.ENCRYPT_MODE, jk, new ChaCha20ParameterSpec(nonce.toArray, counter))
+      val zeros = new Array[Byte](dst.length)
+      val _ = cipher.doFinal(zeros, 0, zeros.length, dst.unsafeArray, dst.unsafeOffset)
+    def release(): Unit = Slice.of(kb).wipe()

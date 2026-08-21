@@ -23,160 +23,43 @@ package kufuli
 import scala.annotation.tailrec
 
 import boilerplate.Slice
-
-/** RFC 4648 section 5 base64url, UNPADDED - the JOSE and web-token alphabet. `decode` admits only
-  * the one canonical encoding of an octet string: padding, `+`, `/`, any non-alphabet character, an
-  * impossible length (4k+1), or a short final group whose unused low bits are set is [[Malformed]].
-  */
-object Base64Url:
-  def encode(bytes: Array[Byte]): String = Base64.encode(bytes, Base64.urlAlphabet, pad = false)
-  def decode(text: String): Either[Malformed, Array[Byte]] = Base64.decode(text, Base64.urlInverse, padded = false)
-
-/** RFC 4648 section 6 base32, UNPADDED upper case - the alphabet `otpauth://` enrolment URIs and
-  * authenticator apps carry a shared secret in. `decode` admits only the one canonical encoding:
-  * lower case, `=` padding, any character outside `A-Z2-7`, a length of 1, 3 or 6 modulo 8, or a
-  * final symbol whose unused low bits are set is [[Malformed]]. Table-driven, so NOT constant time:
-  * an enrolment secret is transcribed once by a human, never compared on a request path.
-  */
-object Base32:
-  private val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-  private val inverse: Array[Int] =
-    val t = Array.fill(128)(-1)
-    for i <- 0 until alphabet.length do t(alphabet.charAt(i).toInt) = i
-    t
-
-  def encode(bytes: Array[Byte]): String =
-    val out = new StringBuilder((bytes.length * 8 + 4) / 5)
-    @tailrec def go(i: Int, acc: Int, bits: Int): Unit =
-      if bits >= 5 then
-        val _ = out.append(alphabet((acc >>> (bits - 5)) & 0x1f))
-        go(i, acc & ((1 << (bits - 5)) - 1), bits - 5)
-      else if i < bytes.length then go(i + 1, (acc << 8) | (bytes(i) & 0xff), bits + 8)
-      else if bits > 0 then
-        val _ = out.append(alphabet((acc << (5 - bits)) & 0x1f))
-        ()
-    go(0, 0, 0)
-    out.toString
-  end encode
-
-  def decode(text: String): Either[Malformed, Array[Byte]] =
-    val residue = text.length % 8
-    // 5 bits per symbol: 1, 3 and 6 symbols carry 5, 15 and 30 bits, none of which completes an
-    // octet count that 8 fewer symbols could not encode - so no octet string produces them.
-    if residue == 1 || residue == 3 || residue == 6 then Left(Malformed)
-    else
-      val out = new Array[Byte](text.length / 8 * 5 + residue * 5 / 8)
-      @tailrec def go(i: Int, acc: Int, bits: Int, o: Int): Either[Malformed, Array[Byte]] =
-        if i >= text.length then
-          // The final symbol's low bits reach no octet; unless they are zero one secret has many
-          // spellings, and an enrolment record keyed on the string no longer identifies the secret.
-          if acc != 0 then Left(Malformed) else Right(out)
-        else
-          val c = text.charAt(i).toInt
-          val v = if c < 128 then inverse(c) else -1
-          if v < 0 then Left(Malformed)
-          else
-            val a = (acc << 5) | v
-            val b = bits + 5
-            if b >= 8 then
-              out(o) = ((a >>> (b - 8)) & 0xff).toByte
-              go(i + 1, a & ((1 << (b - 8)) - 1), b - 8, o + 1)
-            else go(i + 1, a, b, o)
-      go(0, 0, 0, 0)
-    end if
-  end decode
-end Base32
-
-private[kufuli] object Base64:
-  private[kufuli] val urlAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-  private[kufuli] val stdAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-  private def inverse(alphabet: String): Array[Int] =
-    val t = Array.fill(128)(-1)
-    for i <- 0 until alphabet.length do t(alphabet.charAt(i).toInt) = i
-    t
-  private[kufuli] val urlInverse = inverse(urlAlphabet)
-  private[kufuli] val stdInverse = inverse(stdAlphabet)
-
-  private[kufuli] def encode(bytes: Array[Byte], alphabet: String, pad: Boolean): String =
-    val out = new StringBuilder((bytes.length + 2) / 3 * 4)
-    @tailrec def full(i: Int): Int =
-      if i + 3 <= bytes.length then
-        val n = ((bytes(i) & 0xff) << 16) | ((bytes(i + 1) & 0xff) << 8) | (bytes(i + 2) & 0xff)
-        val _ = out
-          .append(alphabet((n >> 18) & 0x3f))
-          .append(alphabet((n >> 12) & 0x3f))
-          .append(alphabet((n >> 6) & 0x3f))
-          .append(alphabet(n & 0x3f))
-        full(i + 3)
-      else i
-    val i = full(0)
-    bytes.length - i match
-      case 1 =>
-        val n = (bytes(i) & 0xff) << 16
-        val _ = out.append(alphabet((n >> 18) & 0x3f)).append(alphabet((n >> 12) & 0x3f))
-        if pad then out.append("==")
-      case 2 =>
-        val n = ((bytes(i) & 0xff) << 16) | ((bytes(i + 1) & 0xff) << 8)
-        val _ = out.append(alphabet((n >> 18) & 0x3f)).append(alphabet((n >> 12) & 0x3f)).append(alphabet((n >> 6) & 0x3f))
-        if pad then out.append('=')
-      case _ => ()
-    out.toString
-  end encode
-
-  private[kufuli] def encode(bytes: Array[Byte]): String = encode(bytes, stdAlphabet, pad = true)
-
-  private[kufuli] def decode(text: String, table: Array[Int], padded: Boolean): Either[Malformed, Array[Byte]] =
-    def stripped: Either[Malformed, String] =
-      if !padded then Right(text)
-      else if text.length % 4 != 0 then Left(Malformed)
-      else
-        val padding = text.length - text.lastIndexWhere(_ != '=') - 1
-        if padding > 2 then Left(Malformed) else Right(text.dropRight(padding))
-    stripped.flatMap { body =>
-      if body.length % 4 == 1 then Left(Malformed)
-      else
-        // length/4*3, not length*3/4: the latter overflows Int past 715,827,882 characters and throws
-        // a negative array size out of a total Either.
-        val out = new Array[Byte](body.length / 4 * 3 + math.max(body.length % 4 - 1, 0))
-        @tailrec def go(i: Int, o: Int): Either[Malformed, Array[Byte]] =
-          if i >= body.length then Right(out)
-          else
-            val chunk = math.min(4, body.length - i)
-            if chunk < 2 then Left(Malformed)
-            else
-              val values = (0 until chunk).map { j =>
-                val c = body.charAt(i + j).toInt
-                if c < 128 then table(c) else -1
-              }
-              val acc = values.foldLeft(0)((a, v) => (a << 6) | (v & 0x3f)) << (6 * (4 - chunk))
-              // A short final group carries bits below its last octet that no byte receives; unless
-              // they are zero one octet string has many encodings, defeating any defence keyed on the
-              // encoded string - a replay cache, a denylist, a unique-token column.
-              if values.exists(_ < 0) || (acc & ((1 << (8 * (4 - chunk))) - 1)) != 0 then Left(Malformed)
-              else
-                out(o) = ((acc >> 16) & 0xff).toByte
-                if chunk >= 3 then out(o + 1) = ((acc >> 8) & 0xff).toByte
-                if chunk == 4 then out(o + 2) = (acc & 0xff).toByte
-                go(i + chunk, o + chunk - 1)
-            end if
-        go(0, 0)
-    }
-  end decode
-
-  private[kufuli] def decode(text: String): Either[Malformed, Array[Byte]] = decode(text, stdInverse, padded = true)
-end Base64
+import boilerplate.codec
 
 /** PEM textual encoding (RFC 7468): labelled base64 DER blocks. Pure value layer. `decode` reads
   * the first block; `decodeAll` reads every block (fullchain files); `encode` wraps at 64 columns.
   */
 object PEM:
-  final case class Block(label: String, der: IArray[Byte])
-  object Block:
-    given CanEqual[Block, Block] = CanEqual.derived
+  /** The reader CLASSIFIES by label, so the operator-facing mistake - a certificate where a key was
+    * expected - is an exhaustively-checkable match at the file boundary rather than a parse failure
+    * at a door. Arms carry the format types the import doors take, so the classification happens
+    * ONCE. `Other` keeps every label kufuli has no opinion about READABLE as data (a PEM file is a
+    * container: `ENCRYPTED PRIVATE KEY`, `RSA PRIVATE KEY`, `X509 CRL`, ...), never an error, with
+    * the label preserved verbatim for the consumer's own dispatch. Traditional-format (PKCS#1/SEC1)
+    * and passphrase-encrypted keys have no kufuli import door; `Other`'s preserved label is what
+    * lets a consumer tell an operator to convert the file.
+    */
+  enum Block:
+    case Certificate(der: IArray[Byte])
+    case PrivateKey(key: PKCS8)
+    case PublicKey(key: SPKI)
+    case Other(label: String, der: IArray[Byte])
+
+  private def payload(block: Block): (String, IArray[Byte]) = block match
+    case Block.Certificate(der)  => ("CERTIFICATE", der)
+    case Block.PrivateKey(key)   => ("PRIVATE KEY", key.bytes)
+    case Block.PublicKey(key)    => ("PUBLIC KEY", key.bytes)
+    case Block.Other(label, der) => (label, der)
+
+  private def classify(label: String, der: IArray[Byte]): Block = label match
+    case "CERTIFICATE" => Block.Certificate(der)
+    case "PRIVATE KEY" => Block.PrivateKey(PKCS8(der))
+    case "PUBLIC KEY"  => Block.PublicKey(SPKI(der))
+    case other         => Block.Other(other, der)
 
   def encode(block: Block): String =
-    val body = Base64.encode(Array.from(block.der.iterator)).grouped(64).mkString("\n")
-    s"-----BEGIN ${block.label}-----\n$body\n-----END ${block.label}-----"
+    val (label, der) = payload(block)
+    val body = codec.Base64.encode(Array.from(der.iterator)).grouped(64).mkString("\n")
+    s"-----BEGIN $label-----\n$body\n-----END $label-----"
 
   def decode(text: String): Either[Malformed, Block] =
     decodeAll(text).flatMap(_.headOption.toRight(Malformed))
@@ -192,8 +75,8 @@ object PEM:
           val (body, remainder) = tail.span(_ != footer)
           remainder match
             case `footer` :: after =>
-              Base64.decode(body.mkString) match
-                case Right(der) => go(after, Block(label, IArray.from(der)) :: acc)
+              codec.Base64.decode(body.mkString) match
+                case Right(der) => go(after, classify(label, IArray.from(der)) :: acc)
                 case Left(_)    => Left(Malformed)
             case _ => Left(Malformed)
         case _ => Left(Malformed)
@@ -207,9 +90,9 @@ end PEM
   * EVP_parse_*). A wire parser over untrusted bytes: every read is bounds-checked, lengths accept
   * only definite short/1/2-byte long forms, and no recursion occurs.
   */
-private[kufuli] object Der:
+private[kufuli] object DER:
   enum Alg derives CanEqual:
-    case Ed, X, EcP256, EcP384, EcP521, OfRsa
+    case Ed, X, EcP256, EcP384, EcP521, Rsa
 
   // OID content bytes (verified against the aws-lc object registry / RFC 8410 / RFC 5480 / RFC 8017).
   private val oidEd = Array[Byte](0x2b, 0x65, 0x70) // 1.3.101.112
@@ -247,6 +130,13 @@ private[kufuli] object Der:
         else Right(Tlv(start, len, start + len))
       }
 
+  /** As [[read]], additionally bounding the TLV by the structure that contains it - the core reader
+    * bounds only by the whole buffer, so a child claiming a length past its parent would otherwise
+    * count bytes the parent does not carry.
+    */
+  private[kufuli] def within(der: Slice, off: Int, tag: Int, limit: Int): Either[InvalidKey, Tlv] =
+    read(der, off, tag).filterOrElse(_.next <= limit, InvalidKey.Malformed)
+
   private def oidAt(der: Slice, off: Int): Either[InvalidKey, (Slice, Int)] =
     read(der, off, 0x06).map(t => (der.slice(t.contentOff, t.next), t.next))
 
@@ -257,7 +147,7 @@ private[kufuli] object Der:
       oidAt(der, algId.contentOff).flatMap { (oid, next) =>
         if matches(oid, oidEd) then Right(Alg.Ed)
         else if matches(oid, oidX) then Right(Alg.X)
-        else if matches(oid, oidRsa) then Right(Alg.OfRsa)
+        else if matches(oid, oidRsa) then Right(Alg.Rsa)
         else if matches(oid, oidEcPublic) then
           oidAt(der, next).flatMap { (curve, _) =>
             if matches(curve, oidP256) then Right(Alg.EcP256)
@@ -437,4 +327,4 @@ private[kufuli] object Der:
     if der.length == prefix.length + payloadLen && der.take(prefix.length).contentEquals(Slice.of(prefix))
     then Right(der.drop(prefix.length))
     else Left(InvalidKey.Malformed)
-end Der
+end DER
