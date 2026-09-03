@@ -22,7 +22,7 @@ initialize := {
 
 formattingSettings
 
-def scala3 = "3.8.4"
+def scala3 = "3.9.0"
 val boilerplate: ModuleID = "africa.shuwari" %% "boilerplate" % "0.11.0"
 val boilerplateEffect: ModuleID = "africa.shuwari" %% "boilerplate-effect" % "0.11.0"
 val jsoniter: ModuleID = "com.github.plokhotnyuk.jsoniter-scala" %% "jsoniter-scala-core" % "2.40.1"
