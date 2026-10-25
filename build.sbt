@@ -28,7 +28,7 @@ val boilerplateEffect: ModuleID = "africa.shuwari" %% "boilerplate-effect" % "0.
 val jsoniter: ModuleID = "com.github.plokhotnyuk.jsoniter-scala" %% "jsoniter-scala-core" % "2.40.1"
 val bouncycastle: ModuleID = "org.bouncycastle" % "bcprov-jdk18on" % "1.85.2"
 val munit: ModuleID = "org.scalameta" %% "munit" % "1.3.5"
-val `munit-cats-effect`: ModuleID = "org.typelevel" %% "munit-cats-effect" % "2.2.0"
+val `munit-cats-effect`: ModuleID = "org.typelevel" %% "munit-cats-effect" % "2.2.1"
 
 def stubPublishGuard: List[Setting[?]] = List(publish / skip := true)
 
